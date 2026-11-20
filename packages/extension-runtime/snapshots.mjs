@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {selectedWechat} from '../dsh-social-bridge-plugin/ui-selection-policy.mjs';
 
 // Content is read only when file identity/metadata changes. Atomic replacement
 // is detected through inode + ctime, even when byte length stays unchanged.
@@ -26,7 +27,9 @@ export class PolicySnapshots {
     try {
       const extensions=this.read('config/extensions.json',{version:1,extensions:{}},value=>{if(value?.version!==1||!value.extensions||typeof value.extensions!=='object'||Array.isArray(value.extensions))throw Error('EXTENSION_CONFIG_INVALID');});
       const project=this.read('config/wechatagent.json',null,value=>{if(value!==null && (!value||typeof value!=='object'||Array.isArray(value)))throw Error('PROJECT_CONFIG_INVALID');});
-      this.extensions=extensions.extensions;this.project=project;this.wechat=project?.wechat ?? {};
+      this.extensions=extensions.extensions;this.project=project;this.wechat=selectedWechat(this.root,project?.wechat ?? {});
+      const selectionKey=JSON.stringify(this.wechat.whitelist);
+      if(selectionKey!==this.selectionKey){this.selectionKey=selectionKey;this.epoch++;}
       if(old!==this.epoch)this.allowed=new Set(['private','group'].flatMap(kind=>(this.wechat.whitelist?.[kind==='group'?'groups':'private']??[]).map(id=>`wechat:${kind}:${id}`)));
       this.failure=null;
     } catch(error){this.failure=error;this.extensions={};this.wechat={};this.allowed=new Set();}

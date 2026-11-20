@@ -1,0 +1,12 @@
+{
+  "dshRoot": "D:\\DeepSeek Harness",
+  "wechatExecutable": "D:\\Weixin\\Weixin.exe",
+  "gptSovitsRoot": "D:\\GPT-SoVITS",
+  "voicePython": "D:\\GPT-SoVITS\\runtime\\python.exe",
+  "gptWeights": "GPT_SoVITS/dania-e15.ckpt",
+  "sovitsWeights": "GPT_SoVITS/dania_e16_s2192.pth",
+  "refAudio": "output/slicer_opt/output.wav_0009342720_0009558400.wav",
+  "promptText": "怎么啊？如果有你在也不放心，那就干脆给我也装个限制器或者炸弹喽。",
+  "promptLang": "zh",
+  "textLang": "zh"
+}

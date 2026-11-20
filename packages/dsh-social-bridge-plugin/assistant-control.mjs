@@ -5,8 +5,9 @@ import {assistantAdministrator,assistantSenderAllowed,assistantGroupChatAllowed}
 import {conversationAccess,conversationWorkMode} from './conversation-policy.mjs';
 import {dshCatalog} from './dsh-access.mjs';
 import {taskFault,liveTask,assistantHelp,formatAssistantTask} from './assistant-tasks.mjs';
+import {verifyUiSelectionScope} from './ui-selection-policy.mjs';
 
-export function createAssistantControl({ctx,root,tasks,accountReady,sessionGroups,mappings,profiles,pending,notifications,beforeSubmit=async()=>{}}){
+export function createAssistantControl({ctx,root,tasks,accountReady,sessionGroups,mappings,profiles,pending,notifications}){
   const confirmations=new Map(),approvals=new Map(),questions=new Map();
   const settings=()=>JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat;
   const allowed=(body,w=settings())=>{
@@ -14,11 +15,12 @@ export function createAssistantControl({ctx,root,tasks,accountReady,sessionGroup
     if(body.localControl!==true&&!assistantSenderAllowed(w,body.conversationKey,body.senderWxid))throw taskFault(assistantGroupChatAllowed(w,body.conversationKey,body.senderWxid)?'ASSISTANT_ADMIN_REQUIRED':'ASSISTANT_SENDER_DENIED',403);
     return w;
   };
-  const own=(body,w,job)=>{if(!job||job.key!==body.conversationKey)throw taskFault('ASSISTANT_TASK_NOT_FOUND',404);if(body.localControl!==true&&!assistantAdministrator(w,body.senderWxid)&&job.sender!==body.senderWxid)throw taskFault('ASSISTANT_TASK_NOT_ALLOWED',403);return job;};
+  const currentOrigin=job=>job?.request?.uiSelectionScope===undefined||verifyUiSelectionScope(root,job.request.uiSelectionScope,job.key);
+  const own=(body,w,job)=>{if(!job||job.key!==body.conversationKey)throw taskFault('ASSISTANT_TASK_NOT_FOUND',404);if(!currentOrigin(job))throw taskFault('UI_SELECTION_SCOPE_REVOKED',403);if(body.localControl!==true&&!assistantAdministrator(w,body.senderWxid)&&job.sender!==body.senderWxid)throw taskFault('ASSISTANT_TASK_NOT_ALLOWED',403);return job;};
   const prune=()=>{for(const [id,item]of confirmations)if(item.expiresAt<Date.now())confirmations.delete(id);};
   const disposeApproval=ctx.on('approval/request',async(req,next)=>{
     const sid=String(req.agent?.session?.id??''),turn=pending.get(sid),job=tasks.get(turn?.taskId);
-    if(!job||!accountReady()||conversationAccess(settings(),job.key).remoteApproval!==true)return next();
+    if(!job||!currentOrigin(job)||!accountReady()||conversationAccess(settings(),job.key).remoteApproval!==true)return next();
     const w=settings();if(!assistantSenderAllowed(w,job.key,job.sender)||!assistantAdministrator(w,job.sender))return next();
     // An approval always names the actual native tool call. Oversized or
     // unavailable actions stay in DSH rather than approving an unseen command.
@@ -38,7 +40,7 @@ export function createAssistantControl({ctx,root,tasks,accountReady,sessionGroup
   const disposeQuestions=ctx.on('user-questions/request',async(req,next)=>{
     const sid=String(req.agent?.session?.id??''),job=tasks.get(pending.get(sid)?.taskId);
     // Native confirmation intents retain their own reviewed approval flow.
-    if(!job||!accountReady()||!assistantSenderAllowed(settings(),job.key,job.sender)||!Array.isArray(req.questions)||!req.questions.length||req.questions.length>5||req.questions.some(q=>q.intent))return next();
+    if(!job||!currentOrigin(job)||!accountReady()||!assistantSenderAllowed(settings(),job.key,job.sender)||!Array.isArray(req.questions)||!req.questions.length||req.questions.length>5||req.questions.some(q=>q.intent))return next();
     const text=req.questions.map(q=>`${q.id}：${q.question}${q.detail?'\n'+q.detail:''}${q.options?.length?'\n选项：'+q.options.map(o=>o.label).join(' / '):''}`).join('\n\n');if(text.length>4500)return next();
     const id='Q'+crypto.randomBytes(8).toString('hex');
     return new Promise((resolve,reject)=>{
@@ -55,10 +57,7 @@ export function createAssistantControl({ctx,root,tasks,accountReady,sessionGroup
       if(body.localControl===true)throw taskFault('ASSISTANT_SENDER_REQUIRED',400);
       if(body.assistantSender!==body.senderWxid)throw taskFault('ASSISTANT_SENDER_DENIED',403);
       if(typeof body.message!=='string'||!body.message.trim()||body.message.length>18000)throw taskFault('invalid_request',400);
-      const exists=[...tasks.jobs.values()].some(job=>job.key===key&&job.sender===body.assistantSender&&job.batchId===body.batchId);
-      if(!exists)await beforeSubmit(key);
-      const current=allowed(body);
-      if(body.assistantParentId){const parent=own(body,current,tasks.get(body.assistantParentId));if(parent.sessionId&&mappings[key]!==parent.sessionId)throw taskFault('ASSISTANT_WORKSPACE_CHANGED');}
+      if(body.assistantParentId){const parent=own(body,w,tasks.get(body.assistantParentId));if(parent.sessionId&&mappings[key]!==parent.sessionId)throw taskFault('ASSISTANT_WORKSPACE_CHANGED');}
       return {ok:true,task:tasks.submit(body)};
     }
     const list=()=>tasks.list(key,body.senderWxid,{admin});
@@ -67,6 +66,7 @@ export function createAssistantControl({ctx,root,tasks,accountReady,sessionGroup
     if(['status','result','cancel'].includes(action)){
       const jobs=list(),job=body.taskId?own(body,w,tasks.get(body.taskId)):tasks.get(jobs.find(liveTask)?.id??(action==='result'?jobs[0]?.id:undefined));
       if(!job)return {ok:true,running:false,task:null,text:formatAssistantTask(null)};
+      if(!currentOrigin(job))throw taskFault('UI_SELECTION_SCOPE_REVOKED',403);
       if(action==='cancel')tasks.cancel(job.id);
       return {ok:true,running:liveTask(job),task:tasks.view(job,{result:action==='result'}),text:formatAssistantTask(job)};
     }

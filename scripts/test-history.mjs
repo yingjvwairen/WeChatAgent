@@ -13,6 +13,48 @@ const key='wechat:private:123',other='wechat:group:456',policy={...HISTORY_DEFAU
 function fixture(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'wechat-history-')),stores=[];t.after(()=>{for(const store of stores)store.close();fs.rmSync(root,{recursive:true,force:true});});const open=(scope='a'.repeat(64))=>{const store=new HistoryStore(root,scope);stores.push(store);return store;};return {root,open};}
 const row=(n,text='消息'+n)=>({id:'row-'+n,platform:'wechat',kind:'private',conversation_id:'123',sender_id:'789',sender_name:'好友',message_id:String(n),timestamp:1000+n,text,images:[]});
 
+test('history lookup exposes only per-turn quote labels for retrieved native incoming text',async t=>{
+ const f=fixture(t),store=f.open(),text='桂花面的约定',eventId='a'.repeat(64);
+ const id=store.append(key,{...row(1,text),message_id:eventId,outgoing:false});
+ store.append(key,{...row(2,text),message_id:'b'.repeat(64),outgoing:true});
+ store.append(other,{...row(3,text),message_id:'c'.repeat(64),outgoing:false});
+ store.append(key,{...row(4,text),message_id:'d'.repeat(64),outgoing:false},{source:'legacy-context'});
+ fs.mkdirSync(path.join(f.root,'config'));
+ fs.writeFileSync(path.join(f.root,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:['123']},history:{enabled:true}}}));
+ let def,turn={controller:new AbortController()};
+ bindHistory({tools:{register:d=>{def=d;return ()=>{};}}},store,f.root,key,()=>turn,()=>true);
+ const search=async()=>JSON.parse((await def.execute({query:'桂花面'})).content);
+ assert((await search()).matches.every(row=>!row.quoteRef));assert.equal(turn.historyQuoteRefs,undefined);
+ turn={controller:new AbortController(),allowHistoryQuote:true};
+ const result=await search(),label='H'+id;
+ assert.deepEqual(result.matches.flatMap(m=>m.quoteRef?[m.quoteRef]:[]),[label]);
+ assert(!JSON.stringify(result).includes(eventId));assert.deepEqual(turn.historyQuoteRefs,{[label]:{id:eventId,timestamp:1001}});
+ assert.equal((await search()).reused,true);
+ const detail=JSON.parse((await def.execute({mode:'message',messageId:id})).content);
+ assert.equal(detail.matches[0].quoteRef,label);
+});
+
+test('archived rich sources are selectable by type after backfill; notices have no quote reference',async t=>{
+ const f=fixture(t),store=f.open();let def;
+ const sources=[['图片',{images:[{id:'a'.repeat(64)}]}],['语音',{media:[{kind:'audio',id:'b'.repeat(64)}]}],
+   ['合并转发聊天记录',{forwardedRecord:{title:'旅行',items:[]}}],['文件',{quoteKind:'file'}],['链接',{quoteKind:'link'}],
+   ['表情',{images:[{kind:'sticker',id:'c'.repeat(64)}]}],['视频',{media:[{kind:'video',id:'d'.repeat(64)}]}],
+   ['引用回复',{quoteReply:{reply:'好',reference:{text:'前文'}}}],['卡片',{quoteKind:'card'}]];
+ let turn;
+ fs.mkdirSync(path.join(f.root,'config'));
+ fs.writeFileSync(path.join(f.root,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:['123']},history:{enabled:true}}}));
+ bindHistory({tools:{register:d=>{def=d;return ()=>{};}}},store,f.root,key,()=>turn,()=>true);
+ const ids=sources.map(([label,attrs],index)=>store.append(key,{...row(index+1,label),...attrs,outgoing:false,message_id:String(index+1).padStart(64,'0')}));
+ const notice=store.append(key,{...row(90,'通知'),outgoing:false,contextOnly:true,message_id:'f'.repeat(64)});
+ const read=async (id,allowRichHistoryQuote=true)=>{turn={controller:new AbortController(),allowHistoryQuote:true,allowRichHistoryQuote};return JSON.parse((await def.execute({mode:'message',messageId:id})).content).matches[0];};
+ assert.equal((await read(ids[0],false)).quoteRef,undefined);
+ for(const [i,id] of ids.entries()){
+   const m=await read(id);assert.equal(m.quoteRef,'H'+id);assert.equal(m.type,sources[i][0]);
+   assert.equal(turn.historyQuoteRefs[m.quoteRef].id,String(i+1).padStart(64,'0'));
+ }
+ assert.equal((await read(notice)).quoteRef,undefined);
+});
+
 test('legacy installations gain bounded cache defaults without overwriting explicit history choices',()=>{
  const legacy={wechat:{whitelist:{private:['123'],groups:[]}},persona:{default:'原人格'}};
  assert(migrateHistorySettings(legacy));assert.equal(legacy.wechat.history.mode,'window');assert.equal(legacy.wechat.history.windowStrategy,'append');assert.equal(legacy.wechat.history.recentMessages,8);assert.equal(legacy.wechat.history.recentChars,4000);validateHistorySettings(legacy.wechat.history);assert.equal(legacy.persona.default,'原人格');

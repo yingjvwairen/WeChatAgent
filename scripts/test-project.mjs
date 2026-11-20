@@ -6,23 +6,28 @@ import { fileURLToPath } from 'node:url';
 import { prepare, validateConfig, projectRoot } from './project-config.mjs';
 const example = JSON.parse(fs.readFileSync(path.join(projectRoot, 'config', 'wechatagent.example.json'), 'utf8'));
 validateConfig(example);
+validateConfig({...example,runtime:{...example.runtime,sender:'wechat-ui'}});
 assert.deepEqual(example.wechat.whitelist, { groups: [], private: [] });
 assert.throws(() => validateConfig({ ...example, ports: { ...example.ports, onebot: example.ports.weflow } }), /distinct/);
 assert.throws(() => validateConfig({ ...example, persona: { default: '../bad' } }), /persona/);
-assert.throws(() => validateConfig({ ...example, hook: { ...example.hook, baseUrl: 'http://0.0.0.0:30001' } }), /loopback/);
-assert.throws(() => validateConfig({ ...example, hook: { ...example.hook, expectedVersion: '4.1.15.56' } }), /matching/);
+assert.equal(example.runtime.sender, 'wechat-ui');
+assert.equal(Object.hasOwn(example, 'hook'), false);
 const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'WeChatAgent portable '));
 try {
   fs.mkdirSync(path.join(fixture, 'config')); fs.mkdirSync(path.join(fixture, 'roles'));
   fs.copyFileSync(path.join(projectRoot, 'config', 'wechatagent.example.json'), path.join(fixture, 'config', 'wechatagent.example.json'));
   fs.writeFileSync(path.join(fixture, 'roles', `${example.persona.default}.md`), '# Test role');
   const fixturePlugin=path.join(fixture,'packages/dsh-social-bridge-plugin');fs.mkdirSync(fixturePlugin,{recursive:true});
-  for(const file of ['plugin-catalog.mjs','work-modes.mjs','assistant-preset.mjs','image-input.mjs','deadline.mjs','local-policy.mjs'])fs.copyFileSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin',file),path.join(fixturePlugin,file));
-  for(const file of ['cordis.patch.yml','native-context.mjs','session-groups.mjs','prompt-context.mjs','member-memory.mjs','member-memory-policy.mjs','meme-library.mjs','meme-library-policy.mjs','model-search.mjs','dsh-access.mjs','file-tools.mjs','file-transfers.mjs','assistant-policy.mjs','conversation-policy.mjs','dsh-bundled.mjs','sticker-pool-review.mjs','dsh-migration.mjs','dsh-search.mjs','search-provider.mjs','search-budget.mjs','search-policy.mjs','weather-query.mjs','weather-source.mjs','social-tool-policy.mjs','social-tool-restrict.mjs','context-policy.mjs','history-policy.mjs','history-store.mjs','history-runtime.mjs','usage-summary.mjs','request-window.mjs'])fs.copyFileSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin',file),path.join(fixturePlugin,file));
+  for(const file of ['plugin-catalog.mjs','work-modes.mjs','assistant-preset.mjs','image-input.mjs','media-input.mjs','reader-media-access.mjs','deadline.mjs','local-policy.mjs'])fs.copyFileSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin',file),path.join(fixturePlugin,file));
+  for(const file of ['cordis.patch.yml','native-context.mjs','session-groups.mjs','prompt-context.mjs','member-memory.mjs','member-memory-policy.mjs','meme-library.mjs','meme-library-policy.mjs','model-search.mjs','dsh-access.mjs','file-tools.mjs','file-transfers.mjs','assistant-policy.mjs','conversation-policy.mjs','dsh-bundled.mjs','sticker-pool-review.mjs','dsh-migration.mjs','dsh-search.mjs','search-provider.mjs','search-budget.mjs','search-policy.mjs','weather-query.mjs','weather-source.mjs','social-tool-policy.mjs','social-tool-restrict.mjs','context-policy.mjs','history-policy.mjs','native-quote-source.mjs','history-store.mjs','history-runtime.mjs','usage-summary.mjs','request-window.mjs'])fs.copyFileSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin',file),path.join(fixturePlugin,file));
   for(const file of ['web-reader.mjs','web-reader-policy.mjs','web-reader-fetch.mjs','web-reader-content.mjs','web-reader-zxsj.mjs'])fs.copyFileSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin',file),path.join(fixturePlugin,file));
   fs.cpSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin/skills'),path.join(fixturePlugin,'skills'),{recursive:true});
   for(const file of fs.readdirSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin')))if(file.endsWith('.mjs'))fs.copyFileSync(path.join(projectRoot,'packages/dsh-social-bridge-plugin',file),path.join(fixturePlugin,file));
-  prepare(fixture);
+  const legacy = { ...example, runtime: { ...example.runtime, sender: 'wechat-hook' }, hook: {wechatExecutable:'state/hook/obsolete/Weixin.exe'} };
+  fs.writeFileSync(path.join(fixture,'config','wechatagent.json'),JSON.stringify(legacy));
+  const migrated=prepare(fixture);
+  assert.equal(migrated.runtime.sender,'wechat-ui');assert.equal(Object.hasOwn(migrated,'hook'),false);
+  assert.deepEqual(migrated.wechat.whitelist, example.wechat.whitelist);
   const firstPluginPatch=fs.readFileSync(path.join(fixturePlugin,'cordis.patch.yml'),'utf8');
   assert(firstPluginPatch.includes('file:///')&&firstPluginPatch.includes('?wechatagent='));
   const assertPluginEntry = patch => {
@@ -68,7 +73,16 @@ try {
   prepare(fixture);
   assert.equal(fs.readFileSync(settingsFile, 'utf8'), settings, 'database configuration must remain untouched');
   assert.equal(JSON.parse(fs.readFileSync(path.join(fixture, 'state', 'wechat-io-config.json'), 'utf8')).reader_token, io.reader_token);
-  assert.throws(() => validateConfig({ ...config, runtime: { ...config.runtime, sender: 'uia' } }), /removed/);
+  assert.throws(() => validateConfig({ ...config, runtime: { ...config.runtime, sender: 'uia' } }), /sender must be/);
+  for(const obsolete of [0,0.1,1,'invalid-old-value']){
+    const legacy=structuredClone(config);legacy.wechat.groupReplyProbability=obsolete;
+    validateConfig(legacy);
+    fs.writeFileSync(configFile,JSON.stringify(legacy));prepare(fixture);
+    const migrated=JSON.parse(fs.readFileSync(configFile,'utf8'));
+    assert.equal(Object.hasOwn(migrated.wechat,'groupReplyProbability'),false);
+    assert.equal(migrated.wechat.wake_mode,config.wechat.wake_mode);
+  }
+
 } finally { fs.rmSync(fixture, { recursive: true, force: true }); }
 for (const file of ['components/qq-bridge/src/social-bridge.js','packages/dsh-social-bridge-plugin/native-context.mjs','components/qq-bridge/LICENSE','components/weflow-cli/LICENSE']) assert(fs.existsSync(path.join(projectRoot, file)), `Missing source/license: ${file}`);
 console.log('Project config, portable paths, shared token preservation, and component completeness checks passed.');

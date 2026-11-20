@@ -12,7 +12,7 @@ test('the real session CLI keeps the same key and persona after a group changes 
   for(const folder of ['scripts','config','state','roles','components/qq-bridge/src'])fs.mkdirSync(path.join(root,folder),{recursive:true});
   const source=path.resolve('scripts/manage-dsh-sessions.mjs');fs.copyFileSync(source,path.join(root,'scripts/manage-dsh-sessions.mjs'));
   fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
-  fs.writeFileSync(path.join(root,'scripts/hook-onebot.mjs'),'export {conversationId} from '+JSON.stringify(pathToFileURL(path.resolve('scripts/hook-onebot.mjs')).href)+';');
+  fs.writeFileSync(path.join(root,'scripts/onebot-identity.mjs'),'export {conversationId} from '+JSON.stringify(pathToFileURL(path.resolve('scripts/onebot-identity.mjs')).href)+';');
   fs.writeFileSync(path.join(root,'components/qq-bridge/src/role-card.js'),'export {selectRoleText} from '+JSON.stringify(pathToFileURL(path.resolve('components/qq-bridge/src/role-card.js')).href)+';');
   fs.writeFileSync(path.join(root,'roles/fixture.md'),'# 测试人格\n只用于离线验证。');
   const server=http.createServer(async(req,res)=>{

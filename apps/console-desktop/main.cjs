@@ -26,14 +26,6 @@ let preferences = {};
 try { preferences = JSON.parse(fs.readFileSync(preferenceFile, 'utf8')); } catch {}
 const appearanceStore = createAppearanceStore(dataDirectory, nativeImage);
 let window, tray, consoleApp, origin; let quitting = false, quitApproved=false, quitCheck=null;
-// 窗口按钮叠加层：背景透明，让控制台的玻璃顶栏从按钮下方透出；高度与桌面模式顶栏（56px）一致，
-// 只有图标颜色随主题变化。悬停底色与关闭键红色由系统绘制。
-// 主题预设（预设名、主看板布局、进入方舟预设前的明暗）：只接受简单的标识符，其余字段丢弃
-const presetOf = value => {
-  const id = item => (typeof item === 'string' && /^[a-z][a-z0-9-]{0,23}$/.test(item) ? item : null);
-  return { name: id(value?.name), layout: id(value?.layout), prevTheme: ['light', 'dark'].includes(value?.prevTheme) ? value.prevTheme : null };
-};
-const titleBarOverlay = theme => ({ color: 'rgba(0,0,0,0)', symbolColor: theme === 'dark' ? '#e5ebe7' : '#26332e', height: 56 });
 const savePreferences = () => {
   const temp = preferenceFile + '.tmp'; fs.writeFileSync(temp, JSON.stringify(preferences, null, 2)); fs.renameSync(temp, preferenceFile);
 };
@@ -108,7 +100,8 @@ else {
     consoleApp = createConsole({ root, port: 0, nodeExecutable: runtimeNode,
       onQuit: () => app.quit(),
       filePicker: async kind => {
-        const result = await dialog.showOpenDialog(window, { title: kind === 'workspace' ? '选择工作区目录' : kind === 'folder' ? '选择微信数据库目录' : '选择程序', properties: ['folder','workspace'].includes(kind) ? ['openDirectory'] : ['openFile'], ...(kind === 'exe' ? { filters: [{ name: '程序', extensions: ['exe'] }] } : {}) });
+        bringForward();
+        const result = await dialog.showOpenDialog(window, { title: kind === 'workspace' ? '选择工作区目录' : kind === 'folder' ? '选择文件夹' : '选择程序', properties: ['folder','workspace'].includes(kind) ? ['openDirectory'] : ['openFile'], ...(kind === 'exe' ? { filters: [{ name: '程序', extensions: ['exe'] }] } : {}) });
         return result.canceled ? '' : result.filePaths[0];
       },
     });
@@ -120,13 +113,13 @@ else {
     const savedBounds = preferences.bounds;
     const area = savedBounds && Number.isFinite(savedBounds.x) && Number.isFinite(savedBounds.y) ? screen.getDisplayNearestPoint({ x: savedBounds.x, y: savedBounds.y }).workArea : screen.getPrimaryDisplay().workArea;
     window = new BrowserWindow({ ...windowPlacement(savedBounds, area), minWidth: Math.min(900, area.width), minHeight: Math.min(620, area.height), title: 'WeChatAgent', icon: iconPath, show: false,
-      titleBarStyle: 'hidden', titleBarOverlay: titleBarOverlay(theme),
-      backgroundColor: theme === 'dark' ? '#121815' : '#ecf2ee',
+      titleBarStyle: 'hidden', titleBarOverlay: { color: theme === 'dark' ? '#222a25' : '#ffffff', symbolColor: theme === 'dark' ? '#e5ebe7' : '#26332e', height: 48 },
+      backgroundColor: theme === 'dark' ? '#181e1b' : '#f3f5f4',
       webPreferences: { preload: path.join(__dirname, 'preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, devTools: false, spellcheck: false },
     });
     const trusted = event => event.sender === window.webContents && safeNavigation(event.senderFrame?.url ?? '', origin);
     ipcMain.on('desktop:unsaved-answer',(event,id,value)=>{if(trusted(event)&&quitCheck?.id===id&&typeof value==='boolean')quitCheck.answer(value);});
-    ipcMain.on('desktop:initial', event => { event.returnValue = event.sender === window.webContents ? { theme: preferences.theme ?? theme, appearance:appearanceStore.read(preferences.appearance), preset: presetOf(preferences.preset) } : {}; });
+    ipcMain.on('desktop:initial', event => { event.returnValue = event.sender === window.webContents ? { theme: preferences.theme ?? theme, appearance:appearanceStore.read(preferences.appearance) } : {}; });
     ipcMain.handle('desktop:appearance-choose', async event => {
       if (!trusted(event)) throw new Error('不允许此窗口修改背景。');
       const result = await dialog.showOpenDialog(window,{title:'选择背景图片',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg']}]});
@@ -145,11 +138,7 @@ else {
     ipcMain.handle('desktop:theme', (event, value) => {
       if (!trusted(event) || !['light', 'dark'].includes(value)) return;
       preferences.theme = value; savePreferences();
-      window.setTitleBarOverlay(titleBarOverlay(value));
-    });
-    ipcMain.handle('desktop:preset', (event, value) => {
-      if (!trusted(event)) return;
-      preferences.preset = presetOf(value); savePreferences();
+      window.setTitleBarOverlay({ color: value === 'dark' ? '#222a25' : '#ffffff', symbolColor: value === 'dark' ? '#e5ebe7' : '#26332e', height: 48 });
     });
     ipcMain.handle('desktop:export-log', async (event, payload) => {
       if (!trusted(event) || typeof payload?.text !== 'string' || payload.text.length > 250000) throw new Error('日志内容无效。');

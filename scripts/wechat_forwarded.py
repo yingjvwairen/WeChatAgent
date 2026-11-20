@@ -75,10 +75,17 @@ def parse_forwarded_record(value):
                 heading = child_text(item, 'datatitle', 200)
                 if kind == '1':
                     text = desc or heading or '[空文字消息]'
+                    reference = item.find('refermsgitem')
+                    if reference is not None:
+                        reference_kind = child_text(reference, 'type', 16)
+                        label = {'1':'文字','3':'图片','47':'表情','34':'语音','43':'视频','62':'视频'}.get(reference_kind,'消息')
+                        text += '\n[此条包含对原'+label+'的引用；媒体内容以附带附件为准]'
+                        if len(text)>801:
+                            text=text[:800]+'…';truncated=True
                 elif kind == '14':
                     text = '[嵌套聊天记录]' + (' ' + heading if heading else '')
                 else:
-                    label = {'2': '图片，未提供图片内容', '3': '语音，未转写', '4': '视频，未提供视频内容',
+                    label = {'2': '图片，未提供图片内容', '3': '语音，未转写', '4': '视频，未提供视频内容', '37': '表情，未提供表情内容',
                              '5': '链接', '6': '位置', '8': '文件，未读取文件内容', '7': '音乐'}.get(kind, '未支持的消息')
                     text = '[' + label + ']' + (' ' + (heading or desc) if heading or desc else '')
                 cost = len(name) + len(clock) + len(text) + 12

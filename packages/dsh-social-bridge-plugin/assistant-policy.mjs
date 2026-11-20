@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import {uiSelectionDecision} from './ui-selection-policy.mjs';
 
 export const ASSISTANT_ACCESS = Symbol.for('wechatagent.assistant-access.v1');
 export const validWechatIdentity = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
@@ -18,14 +19,14 @@ export const assistantAdministrator = (wechat,wxid) => validWechatIdentity(wxid)
 export function assistantSenderAllowed(wechat,key,wxid) {
   validateAssistantSettings(wechat);
   const match = /^wechat:(private|group):([1-9]\d{0,15})$/.exec(key);
-  if (!match || !Number.isSafeInteger(Number(match[2])) || !(wechat?.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).some(id => String(id) === match[2])) return false;
+  if (!match || !Number.isSafeInteger(Number(match[2])) || !(uiSelectionDecision(key)??(wechat?.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).some(id => String(id) === match[2]))) return false;
   return assistantAdministrator(wechat,wxid);
 }
 // A missing trusted identity may chat in an allowed group, but can never work.
 export function assistantGroupChatAllowed(wechat,key,wxid='') {
   validateAssistantSettings(wechat);
   const match=/^wechat:group:([1-9]\d{0,15})$/.exec(key);
-  return !!match&&Number.isSafeInteger(Number(match[1]))&&(wechat?.whitelist?.groups??[]).some(id=>String(id)===match[1])&&(wxid===''||validWechatIdentity(wxid));
+  return !!match&&Number.isSafeInteger(Number(match[1]))&&(uiSelectionDecision(key)??(wechat?.whitelist?.groups??[]).some(id=>String(id)===match[1]))&&(wxid===''||validWechatIdentity(wxid));
 }
 // The authenticated reader supplies this identity. Never derive it from text,
 // a nickname, a quoted author or the model's claimed identity.

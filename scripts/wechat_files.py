@@ -63,10 +63,10 @@ def hashes(path):
     return md5.hexdigest(), sha.hexdigest()
 
 class FileCatalog:
-    def __init__(self, root, account, active=lambda: True):
+    def __init__(self, root, account, active=lambda: True, index_file=None):
         self.root, self.account, self.active = pathlib.Path(root), pathlib.Path(account).resolve(), active
         self.lock = threading.RLock()
-        self.index_file = self.root / 'state/files/incoming.json'
+        self.index_file = pathlib.Path(index_file) if index_file is not None else self.root / 'state/files/incoming.json'
         self.records = {}
         if self.index_file.is_file() and self.index_file.stat().st_size <= 2 * 1024 * 1024:
             value = json.loads(self.index_file.read_text(encoding='utf-8-sig'))

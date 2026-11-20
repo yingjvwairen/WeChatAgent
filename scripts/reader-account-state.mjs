@@ -8,7 +8,7 @@ const write = (file, value) => {
   const temp = file + '.' + process.pid + '.tmp';
   fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 }); fs.renameSync(temp, file);
 };
-const stateFiles = ['voices','files','social-messages.json', 'sticker-delivery-pending.json', 'text-deliveries', 'proactive', 'search', 'media'];
+const stateFiles = ['files','social-messages.json', 'sticker-delivery-pending.json', 'text-deliveries', 'proactive', 'search', 'media'];
 const chatFeatures = ['stickers', 'search', 'proactive', 'context', 'memeLibrary', 'memberMemory', 'fishNotebook'];
 const protectedKey = key => typeof key === 'string' && /^userdpapi:[A-Za-z0-9+/=]+$/.test(key);
 
@@ -63,7 +63,7 @@ function assertNoLinks(file) {
   if (stat.isDirectory()) for (const name of fs.readdirSync(file)) assertNoLinks(path.join(file, name));
 }
 
-export function applyReaderAccount(root, previousReader, nextReader, config) {
+export function applyReaderAccount(root, previousReader, nextReader, config, { writeConfig = false } = {}) {
   const previousId = readerAccountId(root, previousReader), nextId = readerAccountId(root, nextReader);
   if (!nextId || !protectedKey(nextReader.decryptKey)) throw Error('READER_ACCOUNT_STATE_INVALID');
   const changed = !!previousId && previousId !== nextId;
@@ -113,7 +113,7 @@ export function applyReaderAccount(root, previousReader, nextReader, config) {
     }
     store.entries[nextId] = { reader: selectedReader, chats: accountChatSettings(selectedConfig) };
     write(storeFile, store); write(readerFile, selectedReader);
-    if (changed) write(configFile, selectedConfig);
+    if (changed || writeConfig) write(configFile, selectedConfig);
     if (changed && fs.existsSync(ioFile)) write(ioFile, { ...read(ioFile), self_wxid: '' });
     const legacyId = currentIdentity.legacyId || (!currentIdentity.id && previousId ? previousId : '');
     write(identityFile, { id: nextId, legacyId });

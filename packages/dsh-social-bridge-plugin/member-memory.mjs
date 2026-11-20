@@ -1,3 +1,4 @@
+import {selectedWechat} from './ui-selection-policy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -13,7 +14,7 @@ export function memberObservations(key,rows){
 }
 export function createMemberMemory({root,accountScope,isAllowed=()=>true,now=Date.now}){
   root=path.resolve(root);
-  const policy=()=>JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,'' )).wechat;
+  const policy=()=>selectedWechat(root,JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,'' )).wechat);
   const allowed=key=>{try{return HEX.test(accountScope??'')&&isAllowed()&&memberMemoryEnabled(policy(),key);}catch{return false;}};
   const fileFor=key=>{
     if(!allowed(key))throw Error('MEMBER_MEMORY_NOT_ALLOWED');

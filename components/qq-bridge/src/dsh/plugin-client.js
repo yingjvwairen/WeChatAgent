@@ -1,5 +1,6 @@
 import {formatAssistantTask} from '../../../../packages/dsh-social-bridge-plugin/assistant-tasks.mjs';
 import crypto from 'node:crypto';
+import {validSelectionScope} from '../core/selection-scope.js';
 import path from 'node:path';
 import {MAX_RPC_BYTES} from '../../../../packages/dsh-social-bridge-plugin/local-policy.mjs';
 
@@ -33,30 +34,28 @@ export class DshPluginClient {
 
   async modelSearchReady(){await this.searchReady();return this.modelSearchSupported===true;}
 
-  async recognizeVoice(conversationKey,voice,senderWxid,{signal}={}){
-    const response=await fetch(this.url+'/voice-input',{method:'POST',headers:{authorization:'Bearer '+this.token,'content-type':'application/json'},
-      body:JSON.stringify({conversationKey,id:voice.id,senderWxid}),signal:AbortSignal.any([AbortSignal.timeout(34000),...(signal?[signal]:[])])});
-    const body=await response.json();
-    if(!response.ok)return {ok:false,code:/^VOICE_[A-Z0-9_]+$/.test(body.code??'')?body.code:'VOICE_INPUT_UNAVAILABLE'};
-    return body;
-  }
-
   async followup(conversationKey, message, metadata = {}, {busyRetries=0}={}) {
     // The server reads the owner's persona locally. Send only its digest to
     // detect stale settings without duplicating up to 60 KB in every RPC.
-    const {persona,...requestMetadata}=metadata;
+    const {persona,localReplyBinding,...requestMetadata}=metadata;
+    delete requestMetadata.historyQuoteRefs;
+    delete metadata.historyQuoteRefs;
+    if(localReplyBinding?.ui_selection_required!==undefined||localReplyBinding?.ui_reply_scope!==undefined){
+      if(localReplyBinding.ui_selection_required!==true||!validSelectionScope(localReplyBinding.ui_reply_scope))throw Object.assign(Error('UI_SELECTION_SCOPE_REQUIRED'),{code:'UI_SELECTION_SCOPE_REQUIRED',admitted:false});
+      requestMetadata.uiSelectionScope=localReplyBinding.ui_reply_scope;
+    }
     if(persona!==undefined&&typeof persona!=='string')throw Object.assign(Error('DSH plugin: invalid_persona'),{admitted:false});
     const requestBody=JSON.stringify({...requestMetadata,...(persona===undefined?{}:{personaDigest:crypto.createHash('sha256').update(persona).digest('hex')}),conversationKey,message});
     if(Buffer.byteLength(requestBody,'utf8')>MAX_RPC_BYTES)throw Object.assign(Error('DSH plugin: request_too_large (REQUEST_TOO_LARGE)'),{code:'REQUEST_TOO_LARGE',admitted:false,limitBytes:MAX_RPC_BYTES});
     if(metadata.fishNotebookRequest){
-      try{const question=await fetch(this.url+'/diary-question',{method:'POST',headers:{authorization:'Bearer '+this.token,'content-type':'application/json'},body:requestBody,signal:AbortSignal.timeout(45000)});if(question.status!==404){const result=await question.json();if(!question.ok)return 'RESPOND: 小本本这页暂时没有整理好，稍后再来看看吧。';if(result.handled){metadata.fishNotebookDocument=result.document===true;return String(result.text);}}}
+      try{const question=await fetch(this.url+'/fish-notebook/ask',{method:'POST',headers:{authorization:'Bearer '+this.token,'content-type':'application/json'},body:requestBody,signal:AbortSignal.timeout(45000)});if(question.status!==404){const result=await question.json();if(!question.ok)return 'RESPOND: 小本本这页暂时没有整理好，稍后再来看看吧。';if(result.handled){metadata.fishNotebookDocument=result.document===true;return String(result.text);}}}
       catch{return 'RESPOND: 小本本这页还在整理，稍后再来看看吧。';}
     }
     const chatOnly=metadata.workMode==='assistant'&&metadata.assistantChatOnly===true;
     const remoteAssistant=metadata.workMode==='assistant'&&!chatOnly&&await this.controllerReady();
     const response = remoteAssistant ? await this.assistantFollowup(requestBody,metadata) : await fetch(`${this.url}/${chatOnly?'assistant-chat':'followup'}`, {
       method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
-      body: requestBody, signal: AbortSignal.timeout((metadata.workMode==='assistant'&&!chatOnly?Math.max(this.timeoutMs,605000):this.timeoutMs) + (metadata.images?.length ? 80000 : 0)),
+      body: requestBody, signal: AbortSignal.timeout((metadata.workMode==='assistant'&&!chatOnly?Math.max(this.timeoutMs,605000):this.timeoutMs) + (metadata.images?.length ? 80000 : 0) + (metadata.media?.length ? 150000 : 0)),
     });
     const body = await response.json();
     if(!response.ok&&body.error==='agent_unavailable'&&body.detail==='session_busy'&&busyRetries>0){
@@ -73,6 +72,7 @@ export class DshPluginClient {
       const fallbackMetadata={...metadata,images:[],...(metadata.batchId?{batchId:crypto.createHash('sha256').update(metadata.batchId+'\0without-images-v1').digest('hex')}:{})};
       if(rejectedVision){delete fallbackMetadata.searchTicket;delete fallbackMetadata.searchContext;fallbackMetadata.searchOptOut=true;fallbackMetadata.memeLibraryDisabled=true;}
       const output=await this.followup(conversationKey,message.replace(/\n<sticker_label_request>[\s\S]*?<\/sticker_label_request>/g,'')+notice,fallbackMetadata,{busyRetries:rejectedVision?10:0});
+      if(fallbackMetadata.historyQuoteRefs)metadata.historyQuoteRefs=fallbackMetadata.historyQuoteRefs;
       return output.split(/STICKER_LABELS:/)[0].trim();
     }
     if (!response.ok || body.error) {
@@ -81,6 +81,11 @@ export class DshPluginClient {
       throw Object.assign(new Error(`DSH plugin: ${body.error ?? response.status}${detail}`),{admitted:body.admitted===true});
     }
     if(Array.isArray(body.memeChoices))metadata.memeChoices=body.memeChoices.filter(item=>item?.source==='dsh-meme'&&/^[a-f0-9]{64}$/.test(item.id??'')&&typeof item.description==='string'&&item.description.length<=120&&Array.isArray(item.tags)&&item.tags.length<=6&&item.tags.every(tag=>typeof tag==='string'&&tag.length<=16)).slice(0,1);
+    if(metadata.allowHistoryQuote===true&&requestMetadata.uiSelectionScope&&body.historyQuoteRefs&&typeof body.historyQuoteRefs==='object'){
+      metadata.historyQuoteRefs=Object.fromEntries(Object.entries(body.historyQuoteRefs).slice(0,12)
+        .filter(([label,ref])=>/^H[1-9]\d{0,11}$/.test(label)&&typeof ref?.id==='string'&&/^[a-f0-9]{64}$/.test(ref.id)&&Number.isSafeInteger(ref.timestamp)&&ref.timestamp>0)
+        .map(([label,ref])=>[label,{id:ref.id,timestamp:ref.timestamp}]));
+    }
     return String(body.text ?? '');
   }
 
@@ -100,10 +105,10 @@ export class DshPluginClient {
       }
       if(Date.now()>deadline)throw Object.assign(Error('ASSISTANT_RESULT_WAIT_EXPIRED'),{admitted:false});
       await new Promise(resolve=>setTimeout(resolve,this.taskPollMs??1000));
-      result=await this.assistantTask(body.conversationKey,'result',{senderWxid:body.senderWxid,taskId:job.id});job=result.task;
+      result=await this.assistantTask(body.conversationKey,'result',{senderWxid:body.senderWxid,taskId:job.id,uiSelectionScope:body.uiSelectionScope});job=result.task;
     }
     if(!job)throw Error('ASSISTANT_TASK_NOT_FOUND');
-    if(job.state==='completed'&&!job.output)job=(await this.assistantTask(body.conversationKey,'result',{senderWxid:body.senderWxid,taskId:job.id})).task;
+    if(job.state==='completed'&&!job.output)job=(await this.assistantTask(body.conversationKey,'result',{senderWxid:body.senderWxid,taskId:job.id,uiSelectionScope:body.uiSelectionScope})).task;
     if(this.feedback)await notify(job);
     if(job.state==='completed')return new Response(JSON.stringify(job.output??{text:'RESPOND: 任务已完成。'}),{status:200});
     // Native vision failures still use the existing one-time text recovery.

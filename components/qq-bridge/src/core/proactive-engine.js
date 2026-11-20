@@ -72,6 +72,9 @@ export class ProactiveEngine {
         const policy=proactivePolicy(wechat,key);
         let item=this.state.chats[key];const now=this.now(),signature=proactivePolicyKey(policy);
         if(this.finishRecorded(key,item))continue;
+        // Once submitted, expiry or a policy change cannot prove cancellation.
+        // Resolve the persisted operation by read-only query before any new job.
+        if(item?.job?.dispatching){await this.social.withConversationLock(key,async()=>this.run(key,policy,item));continue;}
         if(!policy.enabled){if(item&&item.signature!==signature){if(item.job&&!item.job.dispatching){this.notice(key,item.job.id);item.job=null;}item.signature=signature;this.save();}continue;}
         if(!item){item=this.state.chats[key]={nextAt:nextProactiveAt(now,policy,this.random),cycles:0,history:[],signature};this.save();continue;}
         if(item.signature!==signature&&!item.job?.dispatching){item.signature=signature;item.nextAt=nextProactiveAt(now,policy,this.random);item.job=null;this.save();continue;}
@@ -122,18 +125,26 @@ export class ProactiveEngine {
     if ([job.text, ...(job.textParts ?? [])].some(text=>hasStickerControl(text)||hasReasoningControl(text)||hasReplyProtocolControl(text))) {
       this.notice(key,job.id); item.job=null; this.save(); this.log(`[Proactive] ${key} skipped invalid_sticker_reference`); return;
     }
-    const fresh=await this.settingsFor(),current=proactivePolicy(fresh.wechat??fresh,key),livePersona=await this.personaFor(key);
-    if(!this.eligible(key,current,this.now())||proactivePolicyKey(current)!==item.signature||hash(JSON.stringify([livePersona.personaName,livePersona.persona]))!==job.personaDigest||conversationSnapshot(this.buffer.recent(key,this.buffer.maxPerChat))!==job.snapshot){
-      this.notice(key,job.id);item.job=null;this.save();this.log(`[Proactive] ${key} cancelled_context_changed`);return;
+    if(!job.dispatching){
+      const fresh=await this.settingsFor(),current=proactivePolicy(fresh.wechat??fresh,key),livePersona=await this.personaFor(key);
+      if(!this.eligible(key,current,this.now())||proactivePolicyKey(current)!==item.signature||hash(JSON.stringify([livePersona.personaName,livePersona.persona]))!==job.personaDigest||conversationSnapshot(this.buffer.recent(key,this.buffer.maxPerChat))!==job.snapshot){
+        this.notice(key,job.id);item.job=null;this.save();this.log(`[Proactive] ${key} cancelled_context_changed`);return;
+      }
     }
+    const receiptOnly=job.dispatching===true;
     job.dispatching=true;this.save();
     let delivery;
-    try{delivery=await this.send(job.message,job.text,{deliveryId:job.id,source:'proactive',contextId:job.snapshot});}
+    try{delivery=await this.send(job.message,job.text,{deliveryId:job.id,source:'proactive',contextId:job.snapshot,receiptOnly,selfId:job.message.self_id});}
     catch(error){
-      if(['PROACTIVE_NOT_ALLOWED','PROACTIVE_CONTEXT_CHANGED','CONVERSATION_NOT_ALLOWED'].includes(error.code)){this.notice(key,job.id);item.job=null;}
+      if(error.attempted===false||error.data?.attempted===false&&error.data?.rejected===true||['PROACTIVE_NOT_ALLOWED','PROACTIVE_CONTEXT_CHANGED','CONVERSATION_NOT_ALLOWED'].includes(error.code)){this.notice(key,job.id);item.job=null;}
       this.save();this.log(`[Proactive] ${key} send_pending code=${error.code??'unknown'}`);return;
     }
-    const at=this.now(),status=delivery?.delivered==='unconfirmed'?'unconfirmed':'confirmed';
+    if(delivery?.protocol==='durable-ui-v1'&&delivery.deliveryId===job.id&&delivery.pending===true){this.save();return;}
+    if(delivery?.protocol==='durable-ui-v1'&&delivery.deliveryId===job.id&&['cancelled','failed'].includes(delivery.state)){this.notice(key,job.id);item.job=null;this.save();return;}
+    const confirmed=delivery?.protocol==='durable-ui-v1'?
+      delivery.deliveryId===job.id&&delivery.state==='confirmed'&&delivery.confirmed===true&&delivery.pending!==true:
+      delivery?.pending!==true&&(delivery?.state===undefined||delivery.state==='confirmed')&&(delivery?.confirmed===true||delivery?.delivered==='database-confirmed');
+    const at=this.now(),status=confirmed?'confirmed':'unconfirmed';
     this.buffer.completeReply(key,{deliveryId:job.id,throughId:'proactive-'+job.id,noticeId:job.noticeId},{...job.message,sender_id:job.message.self_id,text:job.text,
       timestamp:at/1000,delivery_status:status,proactive:true});
     this.social.noteOutgoing(key,at);item.history.push({at,text:job.text,mode:job.mode,topicDigest:job.topicDigest,deliveryId:job.id});item.history=item.history.slice(-12);

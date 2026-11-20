@@ -4,35 +4,21 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { DSH_SDK_VERSION,DSH_INSTALL_URL } from '../public/console/dsh-install.mjs';
 import { spawnSync } from 'node:child_process';
+import {prepareInstallerRuntime} from './prepare-installer-runtime.mjs';
 import { buildIcons, embedExecutableIcon } from './build-icons.mjs';
 import { singleDirectoryTemplate } from './installer-directory-page.mjs';
 import { projectRoot as root } from './project-config.mjs';
-import { verifyHookBuild,verifyWeChatClient } from './hook-build-policy.mjs';
-import {assertPluginHost} from './plugin-host-check.mjs';
-import {BUNDLED_PLUGINS} from '../packages/plugin-api/bundled.mjs';
-import {releaseIdentity} from './release-version.mjs';
-
-await assertPluginHost(root);
-const wechatVersion=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.example.json'),'utf8')).hook.expectedVersion;
-const clientSource=path.join(root,'state/hook/wechat-'+wechatVersion);
-verifyWeChatClient(clientSource,wechatVersion);
-const legacyBuild=wechatVersion==='4.1.10.27'?verifyHookBuild(path.join(root,'state/hook/native')):null;
-const currentBuild=['4.1.15.13','4.2.0.12'].includes(wechatVersion)?verifyHookBuild(path.join(root,'state/hook/native-'+wechatVersion),wechatVersion):null;
-
-const {version,packageVersion,buildVersion}=releaseIdentity(JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')));
+const version = JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version;
 const stage = path.join(root, 'state', 'installer-stage');
 const appDir = path.join(stage, 'app');
 const project = path.join(stage, 'project');
 const vendor = path.join(stage, 'vendor');
-const bundledPython=path.join(stage,'runtime/python/python.exe');
-const inputProbe=spawnSync(bundledPython,['-B','-c','import psutil,win32api,win32clipboard,win32gui,win32process'],{windowsHide:true,encoding:'utf8',timeout:30000});
-if(inputProbe.status!==0)throw new Error('Bundled foreground input dependencies are unavailable. Run prepare-installer-runtime.mjs first. '+(inputProbe.stderr||''));
 const require = createRequire(path.join(root, 'package.json'));
 const pluginPackage = JSON.parse(fs.readFileSync(path.join(root,'packages/dsh-social-bridge-plugin/package.json'),'utf8'));
 const sdkPackage = JSON.parse(fs.readFileSync(path.join(root,'packages/dsh-social-bridge-plugin/node_modules/@deepseek-ai/dsh-llm/package.json'),'utf8'));
 if (pluginPackage.dependencies['@deepseek-ai/dsh-llm'] !== DSH_SDK_VERSION || sdkPackage.version !== DSH_SDK_VERSION) throw new Error('Installed plugin SDK must match the declared DSH compatibility version.');
 console.log('DSH desktop is external; only the bridge plugin and SDK '+DSH_SDK_VERSION+' are included.');
-for (const dir of [appDir, project, vendor]) {
+for (const dir of [appDir, project, vendor, path.join(stage, 'runtime')]) {
   const resolved = path.resolve(dir);
   if (!resolved.startsWith(path.resolve(stage) + path.sep)) throw new Error('Invalid release staging directory');
   fs.rmSync(resolved, { recursive:true, force:true, maxRetries:5, retryDelay:100 });
@@ -55,11 +41,10 @@ function addTree(relative, allow) {
 }
 
 for (const name of ['package.json','main.cjs','preload.cjs','shutdown.cjs','storage-location.cjs', 'desktop-policy.cjs','deployment.cjs','appearance.cjs', 'loading-preload.cjs','loading.html','loading.css','loading.js']) copyFile(path.join(root, 'apps/console-desktop', name), path.join(appDir, name));
-fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ name: 'wechatagent', productName: 'WeChatAgent', version:packageVersion, releaseVersion:version, description: 'WeChatAgent desktop console', main: 'main.cjs', author: 'WeChatAgent contributors', license: 'SEE THIRD-PARTY-NOTICES.txt' }, null, 2));
+fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ name: 'wechatagent', productName: 'WeChatAgent', version, description: 'WeChatAgent desktop console', main: 'main.cjs', author: 'WeChatAgent contributors', license: 'SEE THIRD-PARTY-NOTICES.txt' }, null, 2));
 await buildIcons(root, appDir, require('sharp'));
 for (const name of ['LICENSE','LICENSES.md']) add(name);
 for (const name of ['README.md','RELEASE_NOTES.md']) add(name);
-add('docs/releases/'+version+'.md');
 addTree('docs', (name, directory) => directory || name.endsWith('.md'));
 add('config/wechatagent.example.json');
 for(const name of ['SESSION_RECOVERY.md','SEND_QUEUE_RECOVERY.md','MEDIA_RECOVERY.md','GROUP_REJOIN.md'])add('docs/'+name);
@@ -70,7 +55,6 @@ add('scripts/wechat_sticker_manager.py');
 add('docs/STICKER_MANAGER.md');
 add('docs/EXIT_SHUTDOWN.md');
 add('docs/DATA_STORAGE.md');
-add('docs/HOOK_STARTUP_RECOVERY.md');
 add('docs/PORT_STARTUP_RECOVERY.md');
 add('docs/REPLY_PROTOCOL.md');
 add('docs/PROMPT_POLICY.md');
@@ -85,13 +69,42 @@ add('docs/PERSONA_CATEGORIES.md');
 add('scripts/memory-console.mjs');
 add('scripts/memory-console-worker.mjs');
 add('docs/MEMORY_VIEW.md');
+add('scripts/fish-notebook-console.mjs');
 add('docs/FISH_NOTEBOOK.md');
-add('scripts/hook-client-health.ps1');
-for (const name of ['hook-profiles.mjs','wechat-client-selection.mjs','hook-build-policy.mjs','build-hook-current.ps1','load-hook-current.ps1','build-hook-42012.ps1','load-hook-42012.ps1']) add('scripts/'+name);
 add('scripts/stop-legacy-services.ps1');
-const scriptNames = ['wechat_files.py','file-delivery-worker.mjs','project-config.mjs','extension-status.mjs','bundled-extensions.mjs','update-check.mjs','migrate-io-config.mjs','manage.ps1','console-server.mjs','console-process.mjs','console-powershell.ps1','console-native.ps1','sync-weflow.cjs','hook-onebot.mjs','reader-api.py','reader-requirements.txt','wechat_media.py','wechat_sticker.py','wechat_sticker_send.py','wechat_forwarded.py','resolve-wechat-image.py','list-friend-ids.mjs','manage-dsh-sessions.mjs','launch-hook-wechat.ps1','pin-hook-client.ps1','launch-dsh.ps1','check-runtime.ps1','setup.ps1','build-hook.ps1'];
-for (const name of [...scriptNames, 'wechat_group_bindings.py', 'dsh-configuration.mjs', 'process-recovery.mjs', 'process-recovery.ps1', 'check-runtime.py', 'wechat_meme_library.py', 'wechat_sticker_labels.py', 'wechat_image_normalize.py', 'wechat_sticker_collection.py', 'wechat_quote.py', 'text-delivery-store.mjs', 'reader-setup.mjs', 'reader_setup.py', 'reader-account-state.mjs','wechat-account-check.mjs']) add('scripts/' + name);
-addTree('scripts/native-hook');
+const scriptNames = ['wechat_files.py','project-config.mjs','extension-status.mjs','bundled-extensions.mjs','update-check.mjs','migrate-io-config.mjs','manage.ps1','console-server.mjs','console-process.mjs','console-powershell.ps1','console-native.ps1','reader-api.py','reader-requirements.txt','wechat_media.py','wechat_sticker.py','wechat_sticker_send.py','wechat_forwarded.py','resolve-wechat-image.py','list-friend-ids.mjs','manage-dsh-sessions.mjs','launch-dsh.ps1','check-runtime.ps1','setup.ps1'];
+for (const name of [...scriptNames, 'wechat_mentions.py', 'wechat_group_bindings.py', 'dsh-configuration.mjs', 'process-recovery.mjs', 'process-recovery.ps1', 'check-runtime.py', 'wechat_meme_library.py', 'wechat_sticker_labels.py', 'wechat_image_normalize.py', 'wechat_sticker_collection.py', 'wechat_quote.py', 'wechat_extra_card.py', 'wechat_quote_source.py', 'reader-setup.mjs', 'reader_setup.py', 'reader-account-state.mjs']) add('scripts/' + name);
+// UIA/OCR and local Reader sources.
+for (const name of [
+  'account-probe.mjs', 'bot-controls.mjs', 'speech-provider-settings.mjs', 'speech-provider-check.mjs', 'fixtures/speech-service-test.wav', 'plugin-config-ui.mjs', 'contact-identity.mjs', 'delivery-archive.mjs',
+  'foreground-timing.mjs', 'local-ocr-client.mjs', 'prepare-reader-component.mjs',
+  'qt-auto-layout.mjs', 'qt-layout-profiles.mjs', 'qt-visual-driver.mjs', 'qt-quote-ocr.mjs',
+  'reader-local-setup.mjs', 'reader-target-service.mjs', 'reply-preferences.mjs',
+  'runtime-interaction-policy.mjs', 'secondary-pc-audio-preflight.mjs', 'target-selection.mjs',
+  'ui-reader-recovery.mjs', 'ui-reply-outbox.mjs', 'ui-runtime-controls.mjs', 'visual-probe.mjs',
+  'voice-interruption-evidence.mjs', 'voice-operator-recovery.mjs', 'voice-profiles.mjs',
+  'voice-recording-layout.mjs', 'voice-synthesis.mjs', 'wechat_av.py',
+  'wechat_nested_media.py', 'wechat_voice_receipt.py', 'wechat_reference_media.py',
+  'reader-target-service.py', 'reader-local-api.py', 'receipt_connections.py', 'contact-identity.py',
+  'local-media-worker.py', 'local-asr-service.mjs', 'local-asr-worker.py', 'local_asr_runtime.py', 'prepare-local-media.mjs', 'local-ocr.py',
+  'locate-wechat-layout.py', 'qt-auto-layout-image.py', 'qt_search_popup.py',
+  'wechat-layout-templates.json', 'wechat-navigation-templates.json',
+
+  'background-controls.mjs', 'uia-mode.mjs', 'uia-mode-runtime.mjs', 'uia-offscreen.mjs', 'uia-offscreen-mode.mjs',
+  'build-accessibility-gate.ps1', 'build-background-controls.ps1',
+  'build-uia-background-probe.ps1', 'build-uia-offscreen-probe.ps1', 'build-uia-offscreen-host.ps1', 'build-offscreen-focus.ps1',
+  'managed-voice-service.mjs', 'cloud-speech.mjs', 'cloud-speech-wav.mjs', 'dania-server.mjs', 'dania-start.mjs',
+  'reply-image-format.mjs', 'reply-media-catalog.mjs', 'ui-delivery-controls.mjs',
+  'ui-image-outbox.mjs', 'ui-image-reader-receipts.mjs', 'ui-file-outbox.mjs', 'ui_file_receipts.py',
+  'ui-onebot.mjs', 'ui-service.mjs', 'ui-text-outbox.mjs',
+  'native-voice-outbox.mjs', 'native-voice-transport.mjs',
+  'ui-reader-stream.mjs', 'ui-incoming-content.mjs', 'ui-reader-receipts.mjs', 'ui-host-client.mjs',
+  'ui-reader-media-proxy.mjs', 'ui-voice-reader-receipts.mjs',
+  'cable-player.mjs', 'timed-voice-preview.mjs', 'voice-warm-monitor.mjs', 'draft-probe.mjs',
+]) add('scripts/' + name);
+for (const name of ['onebot-identity.mjs','installed-ui-runtime.mjs','reader-local-prepare.mjs','prepare-ui-dependencies.mjs','prepare-ui-components.ps1','requirements-ocr.txt','prepare-local-ocr-model.mjs','ui-runtime.ps1','ui-runtime-args.mjs','ui-preview.mjs','frame-probe.mjs','voice-preview.mjs','qt-calibrate.mjs','secondary-setup.mjs','secondary-computer.ps1','build-qt-actions.ps1','build-account-probe.ps1','build-voice-probe.ps1','build-audio-probe.ps1','build-visual-probe.ps1','build-frame-capture.ps1','build-draft-probe.ps1','build-ui-host.ps1']) add('scripts/'+name);
+addTree('scripts/native-audio', (name,directory)=>directory||name.endsWith('.cs'));
+addTree('scripts/native-ui', (name,directory)=>directory||/\.(?:cs|json)$/.test(name));
 for (const name of ['nt_decrypt.py','nt_common.py']) add('components/weflow-cli/scripts/' + name);
 add('components/weflow-cli/LICENSE');
 add('components/weflow-cli/resources/key/win32/x64/wx_key.dll');
@@ -102,58 +115,54 @@ add('components/qq-bridge/src/safe-fetch.js');
 addTree('packages/extension-runtime', (name, dir) => dir || /\.(mjs|md)$/.test(name));
 addTree('packages/plugin-api', (name, dir) => dir || /\.(mjs|md)$/.test(name));
 add('docs/PLUGIN_DEVELOPMENT.md');
-add('scripts/plugin-host-check.mjs');
-add('scripts/plugin-settings-actions.mjs');add('scripts/voice-host-status.mjs');
-add('scripts/plugin-config-ui.mjs');
-add('scripts/plugin-ui.mjs');
-add('scripts/pack-bundled-plugins.mjs');
-add('docs/VOICE_INPUT.md');
-for(const name of ['wechat_voice_input.py','decode-wechat-voice.py','decode-wechat-voice.mjs','voice-send.mjs','voice-synthesis.mjs','realtime-reply.mjs','input-sender.mjs','input-worker.py','input-requirements.txt','setup-input.ps1','wechat_voice_output.py','voice-requirements.txt'])add('scripts/'+name);
-for(const file of ['package.json','LICENSE','PROVENANCE.json','lib/index.mjs','lib/silk.wasm'])add('packages/voice-codec/silk-wasm/'+file);
 add('scripts/pack-plugin.mjs');
-for (const name of ['__init__.py','plugin.json']) add('extensions/wechatagent_voice/'+name);
-for(const bundle of BUNDLED_PLUGINS){
-  for(const file of bundle.files)add(bundle.source+'/'+file);
-  if(bundle.zip){add(bundle.zip);add(bundle.zip+'.sha256');}
-}
-const builtinPlugins=BUNDLED_PLUGINS.filter(bundle=>bundle.builtin===true).map(bundle=>bundle.id);
+addTree('examples/plugins/chat-notes',(name,dir)=>dir||/\.(mjs|json|md)$/.test(name));
+addTree('optional-extensions/fish-notebook',(name,dir)=>dir||/\.(mjs|json|md)$/.test(name));
+add('optional-extensions/packages/fish-notebook-1.0.0.zip');
+add('optional-extensions/packages/fish-notebook-1.0.0.zip.sha256');
 add('optional-extensions/packages/README.md');
 addTree('extensions/skills/meme-search', (name, dir) => dir || /\.(js|json|md)$/.test(name));
 fs.writeFileSync(path.join(project, 'components/qq-bridge/package.json'), JSON.stringify({ name:'wechatagent-social-bridge', type:'module', private:true, license:'MIT' })); files.push('components/qq-bridge/package.json');
 const bridgeFile = path.join(project, 'components/qq-bridge/src/social-bridge.js');
 fs.writeFileSync(bridgeFile, fs.readFileSync(bridgeFile, 'utf8').replace('这是蓝色大肥鱼的 AI 接入测试。', '这是微信助手的 AI 接入测试。'));
 addTree('packages/dsh-social-bridge-plugin', (name, dir) => name !== '.git' && name !== '.bin' && (dir || /\.(mjs|js|json|yml|yaml|md|txt|ts|map)$/.test(name) || /^LICENSE|^NOTICE/.test(name)));
-addTree('components/WeChat-Hook', (name, dir) => !['.git','x64','Debug','Release','防止微信自动更新','运行库'].includes(name) && (dir || !/\.(exe|dll|pdb|zip|7z|log)$/i.test(name)));
-const provenance = {};
-for (const file of files.filter(name => name.startsWith('components/WeChat-Hook/'))) provenance[file.slice('components/WeChat-Hook/'.length)] = sha(fs.readFileSync(path.join(project, file)));
-fs.writeFileSync(path.join(project, 'components/WeChat-Hook/UPSTREAM.json'), JSON.stringify({ commit:'e905d07ade50d2c6472e4eb3bd4f3fe19cf662c6', files:provenance }, null, 2)); files.push('components/WeChat-Hook/UPSTREAM.json');
-fs.writeFileSync(path.join(project, 'package.json'), JSON.stringify({ name:'wechatagent-runtime', version:packageVersion, releaseVersion:version, type:'module', private:true }, null, 2)); files.push('package.json');
-await assertPluginHost(project,{compareRoot:root});
+fs.writeFileSync(path.join(project, 'package.json'), JSON.stringify({ name:'wechatagent-runtime', version, type:'module', private:true, scripts:{'media:prepare':'node scripts/prepare-local-media.mjs --download','media:check':'node scripts/prepare-local-media.mjs'} }, null, 2)); files.push('package.json');
 
-copyFile(process.execPath, path.join(stage, 'runtime/node.exe'));
-if (!fs.existsSync(path.join(stage, 'runtime/python/python.exe'))) throw new Error('Run prepare-installer-runtime.mjs first.');
-copyFile(path.join(clientSource, 'Weixin.exe'), path.join(vendor, 'wechat/Weixin.exe'));
-copyTree(path.join(clientSource, wechatVersion), path.join(vendor, 'wechat',wechatVersion), name => !/\.disabled$|\.log$|\.token$/.test(name));
-if(legacyBuild)for (const name of ['version.dll','build.json']) copyFile(path.join(root, 'state/hook/native', name), path.join(vendor, 'hook', name));
-if(currentBuild)for(const name of ['wechatagent-text-'+wechatVersion+'.dll','wechatagent-text-loader.exe','build.json'])copyFile(path.join(root,'state/hook/native-'+wechatVersion,name),path.join(vendor,'hook-current',name));
-const bundledVersionDirectories=fs.readdirSync(path.join(vendor,'wechat'),{withFileTypes:true}).filter(item=>item.isDirectory()).map(item=>item.name);
-if(bundledVersionDirectories.length!==1||bundledVersionDirectories[0]!==wechatVersion||currentBuild&&fs.existsSync(path.join(vendor,'hook')))throw new Error('Installer contains another WeChat client or legacy sender.');
+const runtimeRevision=prepareInstallerRuntime(path.join(stage,'runtime'));
+// Build native helpers inside the staging tree, using the reviewed sources.
+const helpers = [
+  ['qt-actions','ui-host/WechatQtActions.exe'], ['account-probe','ui-host/WechatAccountProbe.exe'],
+  ['voice-probe','ui-host/WechatVoicePreview.exe'], ['audio-probe','audio-probe/AudioRouteProbe.exe'],
+  ['visual-probe','ui-host/WechatVisualProbe.exe'], ['frame-capture','ui-host/WechatFrameCapture.exe'],
+  ['draft-probe','ui-host/WechatDraftProbe.exe'], ['ui-host','ui-host/WechatUiHost.exe'],
+  ['accessibility-gate','ui-host/WechatAccessibilityGate.exe'], ['background-controls','ui-host/WechatBackgroundControls.exe'],
+  ['uia-offscreen-host','ui-host/WechatUiaOffscreenHost.exe'], ['offscreen-focus','ui-host/WechatOffscreenFocus.exe'],
+];
+const nativeFiles = {};
+for (const [buildName,relative] of helpers) {
+  const built=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',path.join(project,'scripts','build-'+buildName+'.ps1')],{windowsHide:true,cwd:project,stdio:'inherit'});
+  if(built.status!==0)throw Error('Failed to build UI component: '+buildName);
+  const file=path.join(project,'state',relative);
+  copyFile(file,path.join(vendor,'ui',relative));
+  nativeFiles[relative]=sha(fs.readFileSync(file));
+}
+const scratch=path.resolve(project,'state');
+if(path.dirname(scratch)!==path.resolve(project))throw Error('Invalid native staging path.');
+fs.rmSync(scratch,{recursive:true,force:true});
 const pluginTemplate = path.join(project, 'packages/dsh-social-bridge-plugin/cordis.patch.yml');
 fs.writeFileSync(pluginTemplate, fs.readFileSync(pluginTemplate, 'utf8')
   .replace(/file:\/\/\/[^"'\r\n]*\/dsh-social-bridge-plugin\/([A-Za-z0-9_-]+\.mjs)(?:\?[^"'\r\n]*)?/g, 'dsh-social-bridge-plugin/$1'));
 const fileList = [...new Set(files)].sort();
 const sourceHashes = Object.fromEntries(fileList.map(file => [file, sha(fs.readFileSync(path.join(project,file)))]));
 const desktopHashes = Object.fromEntries(fs.readdirSync(appDir).filter(file=>fs.statSync(path.join(appDir,file)).isFile()).sort().map(file=>[file,sha(fs.readFileSync(path.join(appDir,file)))]));
-const runtimeRevision = sha(Buffer.from(JSON.stringify({node:sha(fs.readFileSync(process.execPath)),python:fs.readFileSync(path.join(stage,'runtime/python/DEPENDENCIES.json'),'utf8')}))).slice(0,12);
-const buildId = sha(Buffer.from(JSON.stringify({sourceHashes,desktopHashes,builtinPlugins,runtimeRevision,hook:legacyBuild?.sha256??null,currentHook:currentBuild?.sha256??null,currentLoader:currentBuild?.loaderSha256??null}))).slice(0,16);
-fs.writeFileSync(path.join(project, 'deployment.json'), JSON.stringify({ version, packageVersion, buildId, builtAt:new Date().toISOString(), runtimeRevision, foregroundInputRuntime:true, wechatVersion, bundledWechatVersions:[wechatVersion], nativeProfile:currentBuild?.profile??null, sourceHashes, files:fileList, builtinPlugins, presets:presetNames.map(name=>name.slice(0,-3)), node:process.version, python:'3.13.16', dshBundled:false,dshSdkVersion:DSH_SDK_VERSION,dshInstallUrl:DSH_INSTALL_URL, privateAccountDataIncluded:false, authorization:'Maintainer confirmed redistribution authorization for all currently used components and requested all current role files as bundled presets on 2026-10-05.' }, null, 2));
+const buildId = sha(Buffer.from(JSON.stringify({sourceHashes,desktopHashes,runtimeRevision,nativeFiles}))).slice(0,16);
+fs.writeFileSync(path.join(project, 'deployment.json'), JSON.stringify({ version, buildId, builtAt:new Date().toISOString(), runtimeRevision, sourceHashes, nativeFiles, files:fileList, presets:presetNames.map(name=>name.slice(0,-3)), node:process.version,  dshBundled:false,dshSdkVersion:DSH_SDK_VERSION,dshInstallUrl:DSH_INSTALL_URL, privateAccountDataIncluded:false, authorization:'Maintainer confirmed redistribution authorization for all currently used components and requested all current role files as bundled presets on 2026-10-05.' }, null, 2));
 // No personal data can enter the deployment template or vendor programs.
 for (const file of fs.readdirSync(project, { recursive:true })) {
   const relative = String(file).replaceAll('\\','/');
   if (/^state\/|(^|\/)wechatagent\.json$|social-dsh-token|native-token|\.env$|WeFlow-config\.json$/.test(relative)) throw new Error('Private file entered the release: ' + relative);
 }
-for (const file of fs.readdirSync(vendor, { recursive:true })) if (/wechatagent-hook\.token|native-token|social-messages|WeFlow-config\.json|^.*\/\.dsh\//.test(String(file).replaceAll('\\','/'))) throw new Error('Private vendor file entered the release: ' + file);
-const notices = 'WeChatAgent '+version+'\n\nRedistribution authorization for the bundled WeChat client and WeChat-Hook components was confirmed by the maintainer on 2026-10-05. This statement does not replace their respective license terms.\n\nBundled components: Electron, Node.js, Python 3.13.16, SQLCipher Python binding, cryptography, zstandard, pycryptodome, Pillow, imageio-ffmpeg, cffi, pycparser, MIT weflow-cli NT reader sources, MIT Social Bridge sources and the local DSH bridge plugin/SDK. The DSH desktop program is installed separately by the user.\n\nPython and wheel licenses are retained in runtime/python and its site-packages/*.dist-info directories. Electron/Chromium and vendor notices are retained with their programs. Refer to project/LICENSES.md for source attribution and license boundaries. No account, credential, chat or whitelist data is included. Maintainer-authorized persona files are included as presets.\n';
+const notices = 'WeChatAgent '+version+'\n\nBundled components: Electron, Node.js, desktop UI helpers, MIT weflow-cli NT reader sources and the WeFlow reader component, MIT Social Bridge sources and the DSH bridge plugin/SDK. WeChat and DSH are installed separately.\n\nElectron/Chromium and vendor notices are retained with their programs. Refer to project/LICENSES.md for attribution.\n';
 fs.writeFileSync(path.join(appDir, 'THIRD-PARTY-NOTICES.txt'), notices);
 copyFile(path.join(root, 'LICENSE'), path.join(appDir, 'LICENSE.txt'));
 const { build, Platform, Arch } = require('electron-builder');
@@ -189,8 +198,8 @@ process.env.ELECTRON_BUILDER_CACHE = path.join(root, 'state', 'installer-cache',
 process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
 process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL ??= '1';
 await build({ targets:Platform.WINDOWS.createTarget('nsis', Arch.x64), config: {
-  appId:'local.wechatagent.desktop', productName:'WeChatAgent', artifactName:'WeChatAgent-Setup-'+version+'-${arch}.${ext}',
-  buildVersion,
+  appId:'local.wechatagent.desktop', productName:'WeChatAgent', artifactName:'WeChatAgent-Setup-${version}-${arch}.${ext}',
+  buildVersion:version.endsWith('-fix')?version.replace(/-fix$/,'.1'):undefined,
   directories:{app:appDir, output:path.join(root,'release','installer'), buildResources:appDir},
   electronDist:path.join(root,'node_modules/electron/dist'), electronVersion:'41.1.1',
   asar:false, npmRebuild:false, buildDependenciesFromSource:false, files:['**/*'],

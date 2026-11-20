@@ -37,14 +37,26 @@ from wechat_image_normalize import normalize_image, decode_image_source
 
 
 def resolve(descriptor):
-    reader = reader_api.Reader(ROOT, metadata_readonly=True)
+    # A scoped Reader stores its credentials in a private session folder. This
+    # local-only field is added by the parent worker, never by a message payload.
+    reader_root = pathlib.Path(descriptor.get('_readerRoot', ROOT)).absolute()
+    for item in (reader_root, *reader_root.parents):
+        if item.is_symlink() or getattr(item, 'is_junction', lambda: False)():
+            raise RuntimeError('IMAGE_READER_ROOT_INVALID')
+    reader_root = reader_root.resolve()
+    reader = reader_api.Reader(reader_root, metadata_readonly=True)
+    if reader.account.name != descriptor.get('account'):
+        raise RuntimeError('IMAGE_ACCOUNT_MISMATCH')
     talker = descriptor['talker']
     if not reader.image_talker_allowed(talker):
         raise RuntimeError('IMAGE_CONVERSATION_NOT_ALLOWED')
+    if 'forwardAttachment' in descriptor:
+        from wechat_nested_media import resolve_forward_image
+        return resolve_forward_image(reader,descriptor)
     row = reader.image_row(talker, descriptor)
     content = row['imageXml']
     if row['localType'] == 47:
-        project = reader_api.read_json(ROOT / 'config' / 'wechatagent.json')
+        project = reader_api.read_json(reader_root / 'config' / 'wechatagent.json')
         return resolve_sticker(reader.account, content, normalize_image,
             allow_cdn=project.get('wechat', {}).get('media', {}).get('allowStickerCdn', False) is True,
             allow_cdn_alias=project.get('wechat', {}).get('media', {}).get('allowStickerCdnAlias', False) is True)
@@ -136,14 +148,6 @@ def image_error_code(error):
     return 'IMAGE_RESOLUTION_FAILED'
 
 
-def image_failure_payload(error):
-    result = {'success': False, 'error': image_error_code(error),
-              'exceptionType': type(error).__name__}
-    if result['error'] == 'IMAGE_STICKER_LOCAL_COPY_UNAVAILABLE' and getattr(error, 'reason', None) == 'STICKER_CDN_DISABLED':
-        result.update(reason='STICKER_CDN_DISABLED', setting='wechat.media.allowStickerCdn')
-    return result
-
-
 if __name__ == '__main__':
     try:
         if sys.argv[1:] == ['--check-runtime']:
@@ -152,5 +156,6 @@ if __name__ == '__main__':
             descriptor = json.loads(sys.stdin.read(16384))
             print(json.dumps({'success': True, **resolve(descriptor)}))
     except Exception as error:
-        print(json.dumps(image_failure_payload(error)), file=sys.stderr)
+        print(json.dumps({'success': False, 'error': image_error_code(error),
+                         'exceptionType': type(error).__name__}), file=sys.stderr)
         sys.exit(1)

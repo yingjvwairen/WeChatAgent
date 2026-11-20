@@ -1,4 +1,0 @@
-{
-  "version": 1,
-  "settings": {"entry": "settings.html", "height": 640, "actions": ["models", "check", "validate"]}
-}

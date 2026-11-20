@@ -7,6 +7,7 @@ import {memeLibraryPolicy,validateMemeLibrarySettings} from '../packages/dsh-soc
 import {memberMemoryEnabled,validateMemberMemory} from '../packages/dsh-social-bridge-plugin/member-memory-policy.mjs';
 
 export const BUILTIN_FEATURES = Object.freeze([
+  {id:'native-speech',name:'语音服务',description:'将收到的语音转成文字，将回复合成为语音。识别和合成可分别选择本地或云端服务。',settingsPage:'speech',defaultEnabled:true,chatMode:'all'},
   {id:'native-member-memory',name:'群友记忆',feature:'memberMemory',description:'按稳定成员 ID 保存群友互动倾向，积累多条证据后形成标签，需要时查询。同一账号内按群隔离。',host:'dsh',defaultEnabled:true,chatMode:'override',groupOnly:true,category:'记忆与上下文'},
   {id:'dsh-meme',name:'dsh-meme',feature:'memeLibrary',description:'连接 DSH 原版表情图库，按关键词选图并发送至微信。支持按聊天授权，可选联网补图入库。',host:'dsh',defaultEnabled:false,chatMode:'override',category:'表情与素材',repository:'https://github.com/yyh-001/dsh-meme',author:'yyh-001',requiresInstall:true},
   {id:'native-web-reader',name:'网页阅读',feature:'webReader',description:'读取本轮提供的公开网页正文，供模型总结和分析。',host:'dsh',defaultEnabled:true,chatMode:'all'},
@@ -46,23 +47,31 @@ export function extensionPresentation(item,config,runtimeConnected) {
     featureState:descriptor?{name:descriptor.name,globalEnabled,effectiveCount:effective.length,totalCount:keys.length,feature:descriptor.feature}:null};
 }
 
-export function builtinCatalog(config,revision,runtimeConnected=false) {
-  return {apiVersion:1,revision,canImport:false,runtimeConnected,extensions:BUILTIN_FEATURES.map(feature=>extensionPresentation({
-    ...feature,builtin:true,kind:'skills',format:'code',version:feature.version??'1.0.0',apiVersion:1,management:'project',
-    // These controls edit the existing feature settings, rather than a second gate.
-    enabled:config.wechat?.[feature.feature]?.enabled ?? feature.defaultEnabled,featureSettings:structuredClone(config.wechat?.[feature.feature] ?? {}),
-    chats:null,settings:{},configSchema:{},requestedPermissions:[],permissions:[],reason:runtimeConnected?'按功能条件生效':'设置已保存，等待服务连接',
-  },config,runtimeConnected))};
+export function builtinCatalog(config,revision,runtimeConnected=false,speechProviders=null) {
+  const extensions=BUILTIN_FEATURES.map(feature=>{
+    if(feature.settingsPage==='speech'){
+      const modes=speechProviders?{asr:speechProviders.asr.mode,tts:speechProviders.tts.mode}:null;
+      return extensionPresentation({...feature,builtin:true,management:'project',enabled:feature.defaultEnabled,
+        chats:null,providerModes:modes},config,runtimeConnected);
+    }
+    return extensionPresentation({
+      ...feature,builtin:true,kind:'skills',format:'code',version:feature.version??'1.0.0',apiVersion:1,management:'project',
+      // These controls edit the existing feature settings, rather than a second gate.
+      enabled:config.wechat?.[feature.feature]?.enabled ?? feature.defaultEnabled,featureSettings:structuredClone(config.wechat?.[feature.feature] ?? {}),
+      chats:null,settings:{},configSchema:{},requestedPermissions:[],permissions:[],reason:runtimeConnected?'按功能条件生效':'设置已保存，等待服务连接',
+    },config,runtimeConnected);
+  });
+  return {apiVersion:1,revision,canImport:false,runtimeConnected,extensions};
 }
 
-export function applyBuiltinUpdate(config,id,body) {
+export function applyBuiltinUpdate(config,id,body,{chatKeys=allowedKeys(config)}={}) {
   const descriptor=BUILTIN_FEATURES.find(item=>item.id===id);
-  if(!descriptor || typeof body.enabled!=='boolean')throw Error('内置扩展或开关无效。');
+  if(!descriptor?.feature || typeof body.enabled!=='boolean')throw Error('内置扩展或开关无效。');
   const next=structuredClone(config),settings=next.wechat[descriptor.feature] ??= {};
   settings.enabled=body.enabled;
   if(id==='dsh-meme'&&body.settings!==undefined){if(!body.settings||Object.keys(body.settings).some(key=>key!=='allowImport')||typeof body.settings.allowImport!=='boolean')throw Error('图库补图设置无效。');settings.allowImport=body.settings.allowImport;}
   if(descriptor.chatMode!=='all') {
-    const keys=allowedKeys(next).filter(key=>!descriptor.groupOnly||key.startsWith('wechat:group:')),patch=body.chatSettings;
+    const keys=chatKeys.filter(key=>!descriptor.groupOnly||key.startsWith('wechat:group:')),patch=body.chatSettings;
     if(!patch || typeof patch!=='object' || Array.isArray(patch) || Object.keys(patch).some(key=>!keys.includes(key)))throw Error('聊天范围无效，请重新打开扩展设置。');
     settings.chats ??= {};
     for(const [key,value] of Object.entries(patch)) {

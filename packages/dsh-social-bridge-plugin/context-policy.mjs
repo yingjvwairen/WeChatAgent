@@ -1,3 +1,4 @@
+import {uiSelectionDecision} from './ui-selection-policy.mjs';
 import crypto from 'node:crypto';
 
 export const CONTEXT_DEFAULTS = Object.freeze({ enabled: false, maxTokens: 100000, idleSeconds: 60 });
@@ -18,7 +19,7 @@ export function contextPolicy(wechat, key) {
   validateContextSettings(settings);
   const limit = settings.chats?.[key] ?? settings.maxTokens ?? CONTEXT_DEFAULTS.maxTokens;
   const match = chatKey.exec(key);
-  const allowed = match && (wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(key.split(':')[2]);
+  const allowed = match && (uiSelectionDecision(key) ?? (wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(key.split(':')[2]));
   return { enabled: !!allowed && settings.enabled === true && limit !== 0, maxTokens: limit, idleSeconds: settings.idleSeconds ?? CONTEXT_DEFAULTS.idleSeconds };
 }
 

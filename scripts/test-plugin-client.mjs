@@ -35,6 +35,21 @@ async function fixture(t, results) {
   return {requests,logs,client:new DshPluginClient({url:`http://127.0.0.1:${server.address().port}`,token:'fixture-token',timeoutMs:1000},line=>logs.push(line))};
 }
 
+test('followup accepts history reference bindings only from a scoped response to this turn',async t=>{
+  const source={id:'1'.repeat(64),timestamp:1234};
+  const body={text:'RESPOND: fixture',historyQuoteRefs:{H9:source,Q1:source,H01:source,H2:{...source,timestamp:-1}}};
+  const {requests,client}=await fixture(t,[{status:200,body}]);
+  const scope={version:1,accountRef:'a'.repeat(64),account:'fixture-account',target:'fixture-target',eventId:'e'.repeat(64),selectionVersion:1,grantId:'b'.repeat(64),token:'c'.repeat(64)};
+  const metadata={allowHistoryQuote:true,localReplyBinding:{ui_selection_required:true,ui_reply_scope:scope},historyQuoteRefs:{H5:source}};
+  await client.followup('wechat:private:123','test',metadata);
+  assert.equal(requests[0].historyQuoteRefs,undefined);
+  assert.equal(requests[0].allowHistoryQuote,true);
+  assert.deepEqual(metadata.historyQuoteRefs,{H9:source});
+  delete metadata.localReplyBinding;
+  await client.followup('wechat:private:123','test',metadata);
+  assert.equal(metadata.historyQuoteRefs,undefined);
+});
+
 test('reader preparation failure falls back once with explicit unavailable-image notice and preserves the safe cause',async t=>{
   const f=await fixture(t,[{status:503,body:{error:'agent_unavailable',detail:'IMAGE_READER_NOT_READY',imageError:'IMAGE_DEPENDENCY_MISSING'}},{status:200,body:{text:'RESPOND: fixture'}}]);
   const meta={images:[{id:'a'.repeat(64)}],batchId:'b'.repeat(64),persona:'fixture'};

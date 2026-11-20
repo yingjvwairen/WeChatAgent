@@ -1,3 +1,4 @@
+import {selectedWechat} from './ui-selection-policy.mjs';
 import fs from 'node:fs';import path from 'node:path';import crypto from 'node:crypto';
 import {searchPolicy} from './search-policy.mjs';
 import {memeLibraryPolicy,MEME_LIBRARY_POLICY} from './meme-library-policy.mjs';
@@ -26,7 +27,7 @@ export function memeImageRoute(value){
   return value;
 }
 export function createMemeLibrary({ctx,root,fetchImpl=fetch,download=safeDownload,readPage=async(url,options)=>(await import('./web-reader-fetch.mjs')).fetchWebPage(url,options),isAllowed=()=>true}){
-  const settings=()=>JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));
+  const settings=()=>{const config=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));return {...config,wechat:selectedWechat(root,config.wechat)};};
   const check=key=>{if(!isAllowed()||!memeLibraryPolicy(settings().wechat,key).enabled)throw Error('MEME_LIBRARY_NOT_ALLOWED');};
   const origin=()=>{const web=ctx.get?.('webServer')??ctx.webServer;if(!web||!Number.isInteger(web.port)||web.port<1||web.port>65535)throw Error('MEME_DSH_WEB_UNAVAILABLE');return 'http://127.0.0.1:'+web.port;};
   async function request(route,body,signal,timeoutMs=5000){
@@ -100,7 +101,7 @@ export function createMemeLibrary({ctx,root,fetchImpl=fetch,download=safeDownloa
   return {status,search,searchPage,select,importUrl,check};
 }
 export function bindMemeLibrary(agentCtx,library,root,key,turnFor,{isAllowed=()=>true}={}){
-  const policy=()=>{try{const w=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,'')).wechat;return {...memeLibraryPolicy(w,key),network:searchPolicy(w,key).enabled};}catch{return {enabled:false,allowImport:false,network:false};}};
+  const policy=()=>{try{const w=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,'')).wechat;return {...memeLibraryPolicy(selectedWechat(root,w),key),network:searchPolicy(selectedWechat(root,w),key).enabled};}catch{return {enabled:false,allowImport:false,network:false};}};
   const active=()=>isAllowed()&&!!turnFor()&&!turnFor().disabled&&!turnFor().controller.signal.aborted&&policy().enabled;
   const output={schema:{type:'object',properties:{content:{type:'string'},isError:{type:'boolean'}},required:['content','isError'],additionalProperties:false},render:(_args,value)=>[{type:'text',text:value.content}]};
   const definitions=[

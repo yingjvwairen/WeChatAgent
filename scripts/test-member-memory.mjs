@@ -1,7 +1,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';import os from 'node:os';
 import {createMemberMemory,bindMemberMemory,memberObservations} from '../packages/dsh-social-bridge-plugin/member-memory.mjs';
 import {memberMemoryEnabled,validateMemberMemory,MEMBER_MEMORY_POLICY} from '../packages/dsh-social-bridge-plugin/member-memory-policy.mjs';
-import {HookOneBot} from './hook-onebot.mjs';import{normalizeOneBotEvent}from'../components/qq-bridge/src/onebot/normalize.js';import{MessageBuffer}from'../components/qq-bridge/src/core/message-buffer.js';
+import {UiOneBotBackend} from './ui-onebot.mjs';import{normalizeOneBotEvent}from'../components/qq-bridge/src/onebot/normalize.js';import{MessageBuffer}from'../components/qq-bridge/src/core/message-buffer.js';
 import{applyBuiltinUpdate,builtinCatalog}from'./extension-status.mjs';
 const group='wechat:group:123',otherGroup='wechat:group:456',member='a'.repeat(64),other='b'.repeat(64),account='c'.repeat(64);
 function fixture(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'wechat-member-memory-'));t.after(()=>{assert(path.resolve(root).startsWith(path.resolve(os.tmpdir())+path.sep));fs.rmSync(root,{recursive:true,force:true});});fs.mkdirSync(path.join(root,'config'));let clock=Date.now(),active=true;
@@ -10,9 +10,9 @@ const make=scope=>createMemberMemory({root,accountScope:scope,isAllowed:()=>acti
 const row=(n,id=member,name='同名群友')=>({memberId:id,senderId:id===member?'111':'222',name,evidenceId:n.toString(16).padStart(32,'0'),text:'这里是本人的实际发言 '+n,at:clock-100});
 const turn=(rows,key=group)=>memory.openTurn(key,rows,new AbortController());return {root,config,save,memory,make,row,turn,file:path.join(root,'state/member-memory',account,'123.json'),advance:ms=>clock+=ms,revoke:()=>active=false};}
 test('stable full member identifiers survive renaming and are preserved through OneBot and buffering',t=>{
- const f=fixture(t),host={reload(){},allowed:()=>true,ownWxid:'wxid_self',project:{account:{nicknames:[]}}};
+ const f=fixture(t),host={selfId:'1',policy:{accountWxid:'wxid_self'},seen:new Map(),currentPolicy:()=>({targets:[{kind:'group',id:'123',wxid:'group@chatroom'}]})};
  const payload={event:'message.new',type:1,sessionId:'group@chatroom',talkerId:'wxid_user_a',content:'你好',rawid:'first',sourceName:'原昵称'};
- const first=HookOneBot.prototype.incoming.call(host,payload),renamed=HookOneBot.prototype.incoming.call(host,{...payload,rawid:'second',sourceName:'新昵称'}),different=HookOneBot.prototype.incoming.call(host,{...payload,talkerId:'wxid_user_b'});
+ const first=UiOneBotBackend.prototype.incoming.call(host,payload),renamed=UiOneBotBackend.prototype.incoming.call(host,{...payload,rawid:'second',sourceName:'新昵称'}),different=UiOneBotBackend.prototype.incoming.call(host,{...payload,rawid:'third',talkerId:'wxid_user_b'});
  assert.equal(first.wechatagent.memberId,renamed.wechatagent.memberId);assert.notEqual(first.wechatagent.memberId,different.wechatagent.memberId);
  const normalized=normalizeOneBotEvent('wechat','wechat-onebot',first),buffer=new MessageBuffer(path.join(f.root,'messages.json'));buffer.append(normalized);
  assert.equal(buffer.recent('wechat:group:'+first.group_id)[0].sender_key,first.wechatagent.memberId);

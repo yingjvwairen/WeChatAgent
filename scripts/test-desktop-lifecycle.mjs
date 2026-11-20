@@ -22,7 +22,7 @@ async function fixture(t,options={}){
         state.messages.push([name,value]);if(name==='desktop:check-unsaved')setImmediate(()=>ipcMain.emit('desktop:unsaved-answer',{sender:this.webContents,senderFrame:{url:'http://127.0.0.1:12341/'}},value,state.dirty));
       }});
     }
-    setMenu(){}setTitleBarOverlay(){}setTitle(){}show(){this.hidden=false;}hide(){this.hidden=true;}focus(){}isMinimized(){return false;}restore(){}isMaximized(){return false;}getBounds(){return{x:0,y:0,width:900,height:620};}isDestroyed(){return this.destroyed;}
+    setMenu(){}setTitleBarOverlay(){}setTitle(){}show(){this.hidden=false;}hide(){this.hidden=true;}focus(){this.focused=true;}isMinimized(){return this.minimized===true;}restore(){this.minimized=false;this.restored=true;}isMaximized(){return false;}getBounds(){return{x:0,y:0,width:900,height:620};}isDestroyed(){return this.destroyed;}
     async loadURL(){this.loaded=true;this.emit('ready-to-show');}
     async loadFile(){this.loading=true;}
     destroy(){this.destroyed=true;}
@@ -32,19 +32,19 @@ async function fixture(t,options={}){
     }
   }
   class Tray extends EventEmitter{setToolTip(){}setContextMenu(menu){state.trayMenu=menu;}isDestroyed(){return false;}destroy(){state.trayDestroyed=true;}}
-  const dialog={showMessageBoxSync:(_window,prompt)=>{state.prompts.push(prompt);return prompt.title==='迁移旧版数据'?options.migrationAnswer??0:prompt.title==='保留旧 DSH 数据'?options.fallbackAnswer??0:state.answer;},showMessageBox:async()=>({response:0}),showErrorBox:(title,message)=>state.errors.push([title,message])};
+  const dialog={showMessageBoxSync:(_window,prompt)=>{state.prompts.push(prompt);return prompt.title==='迁移旧版数据'?options.migrationAnswer??0:prompt.title==='保留旧 DSH 数据'?options.fallbackAnswer??0:state.answer;},showMessageBox:async()=>({response:0}),showErrorBox:(title,message)=>state.errors.push([title,message]),showOpenDialog:async(owner,options)=>{state.fileDialogs??=[];state.fileDialogs.push({owner,options});return{canceled:true,filePaths:[]};}};
   ipcMain.handle=()=>{};
   const electron={app,BrowserWindow:Window,Menu:{setApplicationMenu(){},buildFromTemplate:items=>items},Tray,nativeImage:{createFromPath:()=>({resize(){return this;}})},dialog,ipcMain,screen:{getPrimaryDisplay:()=>({workArea:{x:0,y:0,width:1280,height:720}})},shell:{}};
   const consoleApp={start:async()=>({port:12341}),isBusy:()=>false,shutdown:async()=>{state.stops++;await state.stop();},close:()=>{state.closed++;}};
   let code=fs.readFileSync(path.join(source,'main.cjs'),'utf8');
   const importExpression="await import(pathToFileURL(path.join(root, 'scripts/console-server.mjs')).href)";
-  assert(code.includes(importExpression));code=code.replace(importExpression,'({createConsole:()=>fixtureConsole})');
+  assert(code.includes(importExpression));code=code.replace(importExpression,'({createConsole:fixtureCreateConsole})');
   code=code.replace("await import(pathToFileURL(path.join(root, 'scripts/project-config.mjs')).href)",'({prepare(){}})');
   const storage=load('./storage-location.cjs'),fakeStorage={...storage,resolveStorageLocation:()=>location,migrationPlan:()=>plan,stopLegacyServices:async()=>{state.legacyStops++;},prepareDataHome:async current=>{
     state.migrations.push({...current});if(options.migrationError&&state.migrations.length===1)throw options.migrationError;
     return {migrated:true,report:{version:1,source:current.source,managedDsh:current.managedDsh,oldDshHome:current.oldDshHome,dshCopied:current.migrateDsh,...(current.dshRetained?{dshRetained:true}:{})}};
   }};
-  const context={fixtureConsole:consoleApp,process:{pid:process.pid,resourcesPath:root,env:{WECHATAGENT_NODE_EXECUTABLE:process.execPath}},__dirname:source,setTimeout,clearTimeout,console,
+  const context={fixtureCreateConsole:options=>{state.consoleOptions=options;return consoleApp;},process:{pid:process.pid,resourcesPath:root,env:{WECHATAGENT_NODE_EXECUTABLE:process.execPath}},__dirname:source,setTimeout,clearTimeout,console,
     require:id=>id==='electron'?electron:id==='./desktop-policy.cjs'?{projectDirectory:()=>root,safeNavigation:()=>true,externalWebUrl:()=>null,windowPlacement:()=>({width:900,height:620})}:id==='./appearance.cjs'?{createAppearanceStore:()=>({read:()=>({})}),strengthOf:x=>x}:options.packaged&&id==='./storage-location.cjs'?fakeStorage:options.packaged&&id==='./deployment.cjs'?{bootstrapDeployment:async(_resources,dataHome,_progress,settings)=>{state.deployments.push({...settings});return {node:process.execPath,root:path.join(dataHome,'workspace')};}}:load(id)};
   vm.runInNewContext(code,context,{filename:path.join(source,'main.cjs')});await until(()=>state.windows.some(window=>window.loaded)||state.exited);
   return {...state,get stops(){return state.stops;},get exited(){return state.exited;},get closed(){return state.closed;},state,app,plan,window:state.windows.find(window=>window.loaded)||state.windows[0]};
@@ -84,4 +84,13 @@ test('a DSH external-link failure offers retention, while other failures never s
   else {assert(f.exited);assert.equal(f.state.migrations.length,1);assert.equal(f.state.deployments.length,0);assert.equal(f.state.errors.length,mode==='unrelated'?1:0);}
   assert.equal(f.state.prompts.length,mode==='unrelated'?1:2);
  }
+});
+
+test('desktop file selection restores the actual owner before presenting a modal chooser',async t=>{
+  const f=await fixture(t);
+  f.window.hidden=true;f.window.minimized=true;
+  assert.equal(await f.state.consoleOptions.filePicker('folder'),'');
+  assert.equal(f.window.hidden,false);assert.equal(f.window.restored,true);assert.equal(f.window.focused,true);
+  const shown=f.state.fileDialogs[0];assert.equal(shown.owner,f.window);assert.equal(shown.options.title,'选择文件夹');assert.deepEqual(Array.from(shown.options.properties),['openDirectory']);
+  assert.equal(f.stops,0);assert.equal(f.exited,false);
 });

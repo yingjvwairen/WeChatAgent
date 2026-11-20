@@ -14,6 +14,7 @@ export function windowRecord(row){
   return {id:row.archiveSeq,at:row.timestamp,speaker:row.outgoing?'AI':row.sender_name||row.sender_id,
     ...(row.kind==='group'?{memberId:row.sender_key||row.sender_id}:{}),
     text:row.text,...(row.outgoing?{delivery:row.delivery_status??'unverified'}:{}),
+    ...(row.offline_replay==='context'?{contextOnly:true}:{}),
     ...(quote?{quote:{speaker:quote.reference?.senderName,text:quote.reference?.text,at:quote.reference?.time},reply:quote.reply}:{}),
     ...(forward?{forwarded:{title:forward.title,items:forward.items,truncated:forward.truncated}}:{}),
     ...(row.images?.length?{attachments:'历史附件仅有引用，未重新提供图片'}:{}),...(row.sticker_id?{sticker:'历史表情'}:{}),...(row.truncated?{truncated:true}:{})};
@@ -122,21 +123,6 @@ const readOnlySource='近期窗口不是完整历史，窗口之外的旧消息�
 
 export function fixedWindowPrefix(profile){
   return ['WeChatAgent 当前人格与规则：',profile.persona,profile.instructions,readOnlySource].filter(Boolean).join('\n');
-}
-
-// DSH may append a new system snapshot in history rather than replace its
-// protected head. Only the latest nonempty system snapshot is authoritative;
-// an old matching head or a quoted user message cannot validate a stale tail.
-export function inspectWindowSystemPrefix(messages,profile){
-  let text='',index=-1;
-  for(let i=messages.length-1;i>=0;i--){
-    if(messages[i]?.role!=='system')continue;
-    const content=messages[i].content;
-    const candidate=Array.isArray(content)?content.filter(block=>block?.type==='text').map(block=>String(block.text??'')).join(''):'';
-    if(candidate.trim()){text=candidate;index=i;break;}
-  }
-  const expected=fixedWindowPrefix(profile);
-  return {text,index,matches:index>=0&&text.includes(expected),expectedDigest:digest(expected),actualDigest:digest(text)};
 }
 
 // Register through the agent's scoped service. DSH renders this section into

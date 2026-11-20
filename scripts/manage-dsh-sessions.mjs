@@ -1,8 +1,9 @@
+import {selectedWechat} from '../packages/dsh-social-bridge-plugin/ui-selection-policy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectRoleText } from '../components/qq-bridge/src/role-card.js';
-import { conversationId } from './hook-onebot.mjs';
+import { conversationId } from './onebot-identity.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const fail=(message,code=1)=>{console.error('WeChatAgent 会话管理：'+message);process.exitCode=code;};
 const read=(file,missing)=>{
@@ -24,6 +25,7 @@ async function main(){
   const usage='用法：node scripts/manage-dsh-sessions.mjs [configure|compact|status] [wechat:private:id 或 wechat:group:id]。configure 初始化或同步会话名称，compact 在同一会话内压缩上下文，status 输出 /sessions 结果。';
   if(!['configure','compact','status'].includes(action))throw Object.assign(new Error(usage),{friendly:true});
   const config=read('config/wechatagent.json','尚未完成首次配置：请先在控制台完成设置并启动一次服务，生成本机配置后再运行此命令。');
+  config.wechat=selectedWechat(root,config.wechat);
   const io=read('state/wechat-io-config.json','读取连接尚未准备：请先在控制台启动服务，生成本机连接配置后再运行此命令。');
   const tokenFile=path.join(root,'state/social-dsh-token.txt');
   if(!fs.existsSync(tokenFile))throw Object.assign(new Error('DSH 插件尚未加载：请完整退出并重开 DSH，确认已启用本项目插件。'),{friendly:true});

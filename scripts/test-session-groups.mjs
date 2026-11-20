@@ -56,3 +56,30 @@ test('console groups proxy requires local CSRF, checks plugin ownership and forw
   assert.equal((await(await fetch(base+'/api/browse',{method:'POST',headers,body:JSON.stringify({kind:'workspace'})})).json()).path,root);
   for(const asset of ['session-groups.js','session-groups.css'])assert.equal((await fetch(base+'/'+asset)).status,200);
 });
+
+test('console admits one owned file chooser at a time and releases it after cancellation',async t=>{
+  const root=fixture(t),opened=[];
+  let finish;
+  const app=createConsole({root,port:0,filePicker:kind=>{
+    opened.push(kind);return new Promise(resolve=>{finish=resolve;});
+  }});
+  await app.start();
+  t.after(async()=>{finish?.('');app.server.closeAllConnections();if(app.server.listening)await new Promise(resolve=>app.server.close(resolve));});
+  const base='http://127.0.0.1:'+app.server.address().port;
+  const info=await fetch(base+'/api/info').then(r=>r.json());
+  const pick=kind=>fetch(base+'/api/browse',{method:'POST',headers:{'X-Console-Token':info.token,'Content-Type':'application/json'},body:JSON.stringify({kind})});
+  const first=pick('folder');
+  while(!finish)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(app.isBusy(),true);
+  assert.equal((await pick('workspace')).status,409);
+  assert.deepEqual(opened,['folder']);
+  finish('');
+  assert.deepEqual(await (await first).json(),{path:''});
+  assert.equal(app.isBusy(),false);
+  finish=null;
+  const second=pick('exe');
+  while(!finish)await new Promise(resolve=>setImmediate(resolve));
+  finish('');
+  assert.equal((await second).status,200);
+  assert.deepEqual(opened,['folder','exe']);
+});

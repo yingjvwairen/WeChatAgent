@@ -217,7 +217,25 @@ def capture_key(executable, account, timeout=180, clock=time.monotonic, sleep=ti
         except (OSError, AttributeError):
             raise SetupError('READER_KEY_COMPONENT_MISSING') from None
     deadline = clock() + timeout
-    attached = None; observed_process = False; seen = set(); buffer = ctypes.create_string_buffer(128)
+    attached = None; observed_process = False; candidates = {}; buffer = ctypes.create_string_buffer(128)
+    max_candidates, max_attempts, retry_interval = 32, 3, 1.0
+    cleanup_required = False; cleanup_unknown = False
+
+    def cleanup():
+        nonlocal cleanup_required, cleanup_unknown
+        if cleanup_unknown:
+            raise SetupError('READER_SETUP_CLEANUP_UNCONFIRMED')
+        if not cleanup_required:
+            return
+        # A failed/throwing cleanup must not be retried implicitly or hidden by
+        # a success result. In particular, do not attach a replacement process.
+        cleanup_unknown = True
+        try:
+            if not library.CleanupHook():
+                raise SetupError('READER_SETUP_CLEANUP_UNCONFIRMED')
+        except Exception:
+            raise SetupError('READER_SETUP_CLEANUP_UNCONFIRMED') from None
+        cleanup_required = False; cleanup_unknown = False
     progress('正在连接匹配微信。请在微信中完成登录；已登录时可退出账号后重新登录，程序会等待。')
     try:
         while clock() < deadline:
@@ -226,35 +244,51 @@ def capture_key(executable, account, timeout=180, clock=time.monotonic, sleep=ti
                 raise SetupError('WECHAT_MULTIPLE_PROCESSES')
             pid = processes[0] if processes else None
             if attached and pid != attached:
-                library.CleanupHook(); attached = None
+                cleanup(); attached = None
+                # A new client process can initialize the same account after a
+                # temporary DB failure. Only confirmed cleanup releases the old
+                # process binding and its bounded candidate retry state.
+                candidates.clear()
             if not pid:
                 if not observed_process:
                     raise SetupError('WECHAT_NOT_RUNNING')
                 sleep(0.5); continue
             if attached is None:
+                cleanup_required = True
                 if not library.InitializeHook(pid):
                     error = library.GetLastErrorMsg() or b''
                     raise SetupError('READER_KEY_ACCESS_DENIED' if b'ACCESS_DENIED' in error or b'0xC0000022' in error else 'READER_SETUP_FAILED')
                 attached = pid
                 observed_process = True
+                progress('读取组件已就绪，正在等待同一微信账号的数据库初始化。')
             if library.PollKeyData(buffer, len(buffer)):
-                key = buffer.value.decode('ascii', errors='ignore')
-                if re.fullmatch(r'[0-9a-fA-F]{64}', key) and key not in seen:
-                    seen.add(key)
-                    try:
-                        verify_database(account, key)
-                        return key
-                    except SetupError as error:
-                        if str(error) != 'READER_KEY_INVALID':
-                            raise
+                key = buffer.value.decode('ascii', errors='ignore').lower()
+                if re.fullmatch(r'[0-9a-f]{64}', key):
+                    if key not in candidates and len(candidates) < max_candidates:
+                        candidates[key] = {'attempts': 0, 'retry_at': 0.0}
+            # DLL events may be consumed once. Retry cached candidates without
+            # requiring the client to emit the same key again, one per loop.
+            for key, candidate in candidates.items():
+                if candidate['attempts'] >= max_attempts or clock() < candidate['retry_at']:
+                    continue
+                candidate['attempts'] += 1
+                try:
+                    verify_database(account, key)
+                    return key
+                except SetupError as error:
+                    if str(error) != 'READER_KEY_INVALID':
+                        raise
+                    candidate['retry_at'] = clock() + retry_interval
+                    if candidate['attempts'] == 1:
                         progress('检测到的密钥与所选账号不匹配。请登录该目录对应的微信账号，或等待本次结束后重新选择账号。')
+                break
             for _ in range(8):
                 status = ctypes.create_string_buffer(512); level = ctypes.c_int()
                 if not library.GetStatusMessage(status, len(status), ctypes.byref(level)):
                     break
             sleep(0.12)
     finally:
-        library.CleanupHook()
+        cleanup()
     raise SetupError('READER_SETUP_TIMEOUT')
 
 

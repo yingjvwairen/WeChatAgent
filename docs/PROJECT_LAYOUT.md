@@ -44,7 +44,7 @@
 | state/member-memory/、state/fish-notebook/、state/plugins/、state/plugin-documents/、state/plugin-schedules/ | 群友记忆、日记、插件文档和每日计划回执。 |
 | state/assistant-tasks/、state/text-deliveries/ | 任务及发送回执状态，不能当作旧测试结果。 |
 | state/group-bindings/、state/proactive/、state/search/ | 群绑定、主动聊天及搜索状态。 |
-| state/hook/ | 匹配微信、Hook 构建产物及连接资源。 |
+| state/ui-host/ | 本机 UIA、OCR 和焦点归还组件。 |
 | state/desktop/、state/logs/ | 窗口、外观、桌面运行记录及排障日志。 |
 | state/backups/、state/console-backups/、state/migrations/ | 既有备份与迁移恢复记录。 |
 

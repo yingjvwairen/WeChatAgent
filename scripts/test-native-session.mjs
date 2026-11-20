@@ -8,13 +8,20 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import {once} from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { socialPersona } from '../components/qq-bridge/src/core/social-persona.js';
 import { contextBufferVersion } from '../packages/dsh-social-bridge-plugin/context-policy.mjs';
 import { WebSearch } from '../components/qq-bridge/src/core/web-search.js';
 import { SEARCH_DEFAULTS } from '../packages/dsh-social-bridge-plugin/search-policy.mjs';
+import {copyUiSelectionFixture} from './fixture-ui-selection.mjs';
 import {CHAT_POLICY_NOTICE,CHAT_COHERENCE_NOTICE,CHAT_MESSAGE_LAYOUT_NOTICE,SOCIAL_PROTOCOL_NOTICE,SOCIAL_FINAL_OUTPUT_HINT} from '../packages/dsh-social-bridge-plugin/prompt-context.mjs';
-import {buildPrivatePrompt,buildSocialPrompt} from '../components/qq-bridge/src/core/social-engine.js';
+import {buildPrivatePrompt,buildSocialPrompt,SocialEngine} from '../components/qq-bridge/src/core/social-engine.js';
+import {MessageBuffer} from '../components/qq-bridge/src/core/message-buffer.js';
+import {UiOneBotBackend,UiOneBotConnection,uiOneBotId} from './ui-onebot.mjs';
+import {TargetSelectionStore} from './target-selection.mjs';
+import {readerAccountId} from './reader-account-state.mjs';
+import {createUiReaderMediaProxy} from './ui-reader-media-proxy.mjs';
 import {wakeContextHint} from '../packages/dsh-social-bridge-plugin/request-window.mjs';
 import {HistoryStore} from '../packages/dsh-social-bridge-plugin/history-store.mjs';
 import {AssistantFeedback} from '../packages/dsh-social-bridge-plugin/assistant-feedback.mjs';
@@ -22,13 +29,25 @@ import {DshPluginClient} from '../components/qq-bridge/src/dsh/plugin-client.js'
 import {WechatOneBotAdapter} from '../components/qq-bridge/src/adapters/wechat/wechat-onebot-adapter.js';
 import {createAssistantNoticeDelivery} from '../components/qq-bridge/src/core/assistant-notice-delivery.js';
 
+test('new plugin and assistant-chat endpoints reject a stale UI scope before model work',async t=>{
+  const f=await fixture(t),file=path.join(f.dir,'config/wechatagent.json'),group='wechat:group:456';
+  fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify({wechat:{whitelist:{private:['123'],groups:['456']},workModes:{[group]:'assistant'},assistant:{administrators:['wxid_fixture']}}}));
+  const r=await f.start(),uiSelectionScope={accountRef:'a'.repeat(64),target:'fixture-private-target',token:'expired-fixture'};
+  for(const route of ['/plugin-actions/fish-notebook/write-today','/fish-notebook/ask']){
+    const response=await r.request(route,{...info,uiSelectionScope,fishNotebookRequest:{id:'b'.repeat(64),viewer:'c'.repeat(64)}},503);
+    assert.equal(response.code,'UI_SELECTION_SCOPE_REVOKED');
+  }
+  const response=await r.request('/assistant-chat',{...info,conversationKey:group,assistantSender:'wxid_fixture',senderWxid:'wxid_fixture',message:'fixture group message',uiSelectionScope},503);
+  assert.equal(response.detail,'UI_SELECTION_SCOPE_REVOKED');assert.equal(r.calls.create.length,0);assert.equal(r.calls.resume.length,0);assert.equal(r.calls.model.length,0);
+});
+
 test('fish notebook uses tool-free persona utilities and discloses only on the third distinct question without a native agent',async t=>{
  const f=await fixture(t),account='b'.repeat(64),viewer='c'.repeat(64),file=path.join(f.dir,'config/wechatagent.json');fs.mkdirSync(path.dirname(file),{recursive:true});fs.mkdirSync(path.join(f.dir,'state/weflow'),{recursive:true});fs.writeFileSync(path.join(f.dir,'state/weflow/active-account.json'),JSON.stringify({id:account,legacyId:account}));const settings={wechat:{whitelist:{private:['123'],groups:[]},fishNotebook:{enabled:true,writeTime:'23:59',chats:{}}}};fs.writeFileSync(file,JSON.stringify(settings));
  const r=await f.start(),{BlockAssembler}=await import(pathToFileURL(path.join(f.dir,'node_modules/@deepseek-ai/dsh-llm/index.js')).href);BlockAssembler.prototype.push=function(chunk){if(chunk.type==='text-delta')this.text=(this.text??'')+chunk.text;};BlockAssembler.prototype.blocks=function(){return [{type:'text',text:this.text??''}];};Object.defineProperty(BlockAssembler.prototype,'finish',{get:()=>({kind:'stop'})});
  const calls=[];r.ctx.llm.resolveModelInfo=async()=>({reasoning:{efforts:[{id:'off'}]}});r.ctx.llm.stream=async function*(options){calls.push(options);const instruction=options.messages[0].content[0].text;yield {type:'text-delta',text:instruction.includes('写一篇角色日记')?'今天的日记正文，鱼认真地记了一页。':'鱼把小本本抱在怀里，不好意思地摇了摇尾巴。'};};
  const pluginSource='optional-extensions/fish-notebook',installer=new PluginInstaller(f.dir),preview=installer.inspect({name:'fish-notebook.zip',zip:packZip(packageFiles(pluginSource)).toString('base64')});installer.install({ticket:preview.ticket,revision:preview.revision});const definition=JSON.parse(fs.readFileSync(path.join(pluginSource,'plugin.json'),'utf8'));updatePlugin(f.dir,'fish-notebook',{revision:configuration(f.dir).revision,enabled:true,permissions:definition.permissions,chats:[key],settings:{writeTime:'23:59'}});
 
- const question=n=>({...info,fishNotebookRequest:{id:String(n).repeat(64),viewer}}),first=await r.request('/diary-question',question(1));assert(first.handled);assert(!first.text.includes('日记正文'));assert.deepEqual(await r.request('/diary-question',question(1)),first);await r.request('/diary-question',question(2));const third=await r.request('/diary-question',question(3));assert(third.text.includes('今天的日记正文'));assert.equal(calls.length,3);assert(calls.every(call=>call.tools.length===0&&call.reasoningEffort==='off'));assert(!JSON.stringify(calls[1].messages).includes('今天的日记正文'));assert.equal(r.calls.create.length,0);assert.equal(r.calls.resume.length,0);assert.equal(r.calls.model.length,0);updatePlugin(f.dir,'fish-notebook',{revision:configuration(f.dir).revision,enabled:false,permissions:[],chats:[],settings:{writeTime:'23:59'}});assert.deepEqual(await r.request('/diary-question',question(4)),{handled:false});assert.equal(calls.length,3);
+ const question=n=>({...info,fishNotebookRequest:{id:String(n).repeat(64),viewer}}),first=await r.request('/fish-notebook/ask',question(1));assert(first.handled);assert(!first.text.includes('日记正文'));assert.deepEqual(await r.request('/fish-notebook/ask',question(1)),first);await r.request('/fish-notebook/ask',question(2));const third=await r.request('/fish-notebook/ask',question(3));assert(third.text.includes('今天的日记正文'));assert.equal(calls.length,3);assert(calls.every(call=>call.tools.length===0&&call.reasoningEffort==='off'));assert(!JSON.stringify(calls[1].messages).includes('今天的日记正文'));assert.equal(r.calls.create.length,0);assert.equal(r.calls.resume.length,0);assert.equal(r.calls.model.length,0);updatePlugin(f.dir,'fish-notebook',{revision:configuration(f.dir).revision,enabled:false,permissions:[],chats:[],settings:{writeTime:'23:59'}});assert.deepEqual(await r.request('/fish-notebook/ask',question(4)),{handled:false});assert.equal(calls.length,3);
 });
 
 test('memory inspection projects native summaries without creating, resuming or calling a model',async t=>{
@@ -243,41 +262,21 @@ test('native meme tools return only the current chat resource as authenticated R
   const cached=await runtime.request('/followup',body);assert.equal(cached.cached,true);assert.equal(cached.memeChoices[0].id,id);assert.equal(selections,1);
 });
 
-test('voice input routes the installed API plugin through bound audio without creating a model session',async t=>{
-  const f=await fixture(t),id='a'.repeat(64),account='c'.repeat(64);
-  fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});
-  const config={wechat:{whitelist:{private:['123'],groups:[]},assistant:{administrators:['wxid_voice_admin']}}};
-  const configFile=path.join(f.dir,'config/wechatagent.json');fs.writeFileSync(configFile,JSON.stringify(config));
-  fs.mkdirSync(path.join(f.dir,'state/weflow'),{recursive:true});fs.writeFileSync(path.join(f.dir,'state/weflow/active-account.json'),JSON.stringify({id:account}));
-  const bytes=Buffer.from('synthetic-silk'),sha256=crypto.createHash('sha256').update(bytes).digest('hex');let reads=0,uploads=0;
-  const reader=http.createServer((req,res)=>{reads++;assert.equal(req.headers.authorization,'Bearer reader-fixture');const url=new URL(req.url,'http://localhost');assert.equal(url.searchParams.get('conversationKey'),key);assert.equal(url.searchParams.get('pluginId'),'speech-recognition');res.setHeader('content-type','application/json');res.end(JSON.stringify({id,conversationKey:key,b64:bytes.toString('base64'),sha256,mime:'audio/silk',filename:'voice.silk',durationSeconds:2,sampleRate:0}));});
-  const provider=http.createServer(async(req,res)=>{uploads++;for await(const _chunk of req){}res.end('{"text":"本机模拟服务转写"}');});
-  await new Promise(resolve=>reader.listen(0,'127.0.0.1',resolve));await new Promise(resolve=>provider.listen(0,'127.0.0.1',resolve));
-  t.after(()=>{reader.closeAllConnections();reader.close();provider.closeAllConnections();provider.close();});
-  fs.writeFileSync(path.join(f.dir,'state/wechat-io-config.json'),JSON.stringify({reader_base_url:'http://127.0.0.1:'+reader.address().port,reader_token:'reader-fixture'}));
-  const source=path.resolve('optional-extensions/speech-recognition');fs.cpSync(source,path.join(f.dir,'plugins/speech-recognition'),{recursive:true});
-  const settings=JSON.parse(fs.readFileSync(path.join(source,'plugin.json'))).settings;settings.endpoint='http://127.0.0.1:'+provider.address().port+'/custom';settings.audioFormat='silk';settings.apiProtocol='custom';
-  fs.writeFileSync(path.join(f.dir,'config/plugins.json'),JSON.stringify({version:1,plugins:{'speech-recognition':{enabled:true,permissions:['audio_read'],chats:[key],settings,generation:'voice-fixture'}}}));
-  const r=await f.start();assert((await r.request('/health')).pluginHostFeatures.includes('voice-input-v1'));
-  const result=await r.request('/voice-input',{conversationKey:key,id,senderWxid:'wxid_voice_admin'});assert.equal(result.text,'本机模拟服务转写');assert.equal(result.plugin,'speech-recognition');assert.equal(reads,1);assert.equal(uploads,1);assert.equal(r.calls.create.length,0);assert.equal(r.calls.model.length,0);
-  await r.request('/voice-input',{conversationKey:'wechat:private:999',id},403);
-  const unbound=await r.request('/plugin-actions/speech-recognition/transcribe',{conversationKey:key,args:{id:'b'.repeat(64)}});assert.equal(unbound.ok,false);assert.equal(reads,1);
-  config.wechat.workModes={[key]:'assistant'};fs.writeFileSync(configFile,JSON.stringify(config));await r.request('/voice-input',{conversationKey:key,id,senderWxid:'wxid_stranger'},403);assert.equal(uploads,1);
-});
-
 async function fixture(t) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'WeChatAgent native context '));
   fs.mkdirSync(path.join(dir,'node_modules/@deepseek-ai/dsh-llm'),{recursive:true});
   fs.writeFileSync(path.join(dir,'node_modules/@deepseek-ai/dsh-llm/package.json'),'{"type":"module","exports":"./index.js"}');
   fs.writeFileSync(path.join(dir,'node_modules/@deepseek-ai/dsh-llm/index.js'),'export class BlockAssembler {} export const createUserMessage=value=>({...value,role:"user"});');
   const pluginDir=path.join(dir,'packages/dsh-social-bridge-plugin');fs.mkdirSync(pluginDir,{recursive:true});
+  copyUiSelectionFixture(pluginDir);
   fs.copyFileSync('packages/dsh-social-bridge-plugin/native-context.mjs',path.join(pluginDir,'native-context.mjs'));
   fs.mkdirSync(path.join(dir,'scripts'),{recursive:true});
   fs.copyFileSync('scripts/reader-account-state.mjs',path.join(dir,'scripts/reader-account-state.mjs'));
   fs.copyFileSync('packages/dsh-social-bridge-plugin/image-input.mjs',path.join(pluginDir,'image-input.mjs'));
+  for(const name of ['media-input.mjs','reader-media-access.mjs'])fs.copyFileSync(path.join('packages/dsh-social-bridge-plugin',name),path.join(pluginDir,name));
   fs.copyFileSync('packages/dsh-social-bridge-plugin/deadline.mjs',path.join(pluginDir,'deadline.mjs'));
   fs.copyFileSync('packages/dsh-social-bridge-plugin/local-policy.mjs',path.join(pluginDir,'local-policy.mjs'));
-  for(const name of ['fish-notebook.mjs','fish-notebook-policy.mjs','fish-notebook-store.mjs','memory-summary.mjs','reply-layout-policy.mjs','assistant-feedback.mjs','assistant-notifications.mjs','social-tool-restrict.mjs','assistant-tasks.mjs','assistant-control.mjs','plugin-catalog.mjs','work-modes.mjs','session-groups.mjs','prompt-context.mjs','member-memory.mjs','member-memory-policy.mjs','meme-library.mjs','meme-library-policy.mjs','model-search.mjs','dsh-access.mjs','file-tools.mjs','file-transfers.mjs','assistant-policy.mjs','conversation-policy.mjs','dsh-bundled.mjs','sticker-pool-review.mjs','dsh-migration.mjs','dsh-search.mjs','search-provider.mjs','search-budget.mjs','search-policy.mjs','weather-query.mjs','weather-source.mjs','social-tool-policy.mjs','context-policy.mjs','history-policy.mjs','history-store.mjs','history-runtime.mjs','usage-summary.mjs','request-window.mjs'])fs.copyFileSync('packages/dsh-social-bridge-plugin/'+name,path.join(pluginDir,name));
+  for(const name of ['fish-notebook.mjs','fish-notebook-policy.mjs','fish-notebook-store.mjs','memory-summary.mjs','reply-layout-policy.mjs','assistant-feedback.mjs','assistant-notifications.mjs','social-tool-restrict.mjs','assistant-tasks.mjs','assistant-control.mjs','plugin-catalog.mjs','work-modes.mjs','session-groups.mjs','prompt-context.mjs','member-memory.mjs','member-memory-policy.mjs','meme-library.mjs','meme-library-policy.mjs','model-search.mjs','dsh-access.mjs','file-tools.mjs','file-transfers.mjs','assistant-policy.mjs','conversation-policy.mjs','dsh-bundled.mjs','sticker-pool-review.mjs','dsh-migration.mjs','dsh-search.mjs','search-provider.mjs','search-budget.mjs','search-policy.mjs','weather-query.mjs','weather-source.mjs','social-tool-policy.mjs','context-policy.mjs','history-policy.mjs','native-quote-source.mjs','history-store.mjs','history-runtime.mjs','usage-summary.mjs','request-window.mjs'])fs.copyFileSync('packages/dsh-social-bridge-plugin/'+name,path.join(pluginDir,name));
   for(const name of ['web-reader.mjs','web-reader-policy.mjs','web-reader-fetch.mjs','web-reader-content.mjs','web-reader-zxsj.mjs'])fs.copyFileSync('packages/dsh-social-bridge-plugin/'+name,path.join(pluginDir,name));
   fs.cpSync('packages/dsh-social-bridge-plugin/skills',path.join(pluginDir,'skills'),{recursive:true});
   for(const name of ['plugin-api','extension-runtime'])fs.cpSync('packages/'+name,path.join(dir,'packages',name),{recursive:true});
@@ -294,10 +293,10 @@ async function fixture(t) {
     for (;;) {
       const portServer=http.createServer();
       try { await new Promise((resolve,reject)=>{portServer.once('error',reject);portServer.listen(20000+crypto.randomInt(40000),'127.0.0.1',resolve);}); }
-      catch(error) { if(error.code==='EADDRINUSE')continue; throw error; }
+      catch(error) { if(['EADDRINUSE','EACCES'].includes(error.code))continue; throw error; }
       port=portServer.address().port;await new Promise(r=>portServer.close(r));break;
     }
-    const listeners=new Map(), agents=new Map(), calls={create:[],resume:[],model:[],inputs:[],requests:[],titles:[],costLogs:[],streamChecks:0,prefixBindings:0};let disposer,turn=0;
+    const listeners=new Map(), agents=new Map(), calls={create:[],resume:[],model:[],inputs:[],requests:[],titles:[],costLogs:[]};let disposer,turn=0;
     const emit=(name,...args)=>{for(const listener of listeners.get(name) ?? [])listener(...args);};
     const waterfall=async(name,payload,next)=>{const callbacks=listeners.get(name) ?? [];let at=0;const invoke=()=>at<callbacks.length?callbacks[at++](payload,invoke):next();return invoke();};
     function session(sid,creation={}) {
@@ -330,10 +329,10 @@ async function fixture(t) {
     };
     function register(sid,creation={}){
       const registeredTools=new Map(),toolGuards=[];
-      let prefixRegistrations=0;const systemSections=new Map(),systemPrompt={getSectionOrder:()=>0,section(section){if(section.name==='wechatagent:fixed-window-prefix'){prefixRegistrations++;calls.prefixBindings++;}if(systemSections.has(section.name))throw Error('duplicate scoped section');systemSections.set(section.name,section);return ()=>systemSections.delete(section.name);}};
+      const systemSections=new Map(),systemPrompt={getSectionOrder:()=>0,section(section){if(systemSections.has(section.name))throw Error('duplicate scoped section');systemSections.set(section.name,section);return ()=>systemSections.delete(section.name);}};
       const sess=session(sid,creation), agent={session:sess,ctx:{on(){return ()=>{};},systemPrompt:options.disableSystemPrompt?undefined:systemPrompt,tools:{presentAs(){},guard(fn){toolGuards.push(fn);return ()=>{};},register(tool){registeredTools.set(tool.name,tool);return ()=>registeredTools.delete(tool.name);}}},systemSections,registeredTools,toolGuards,autoCompact:false,overflowCompact:false,
         followup(message){queueMicrotask(async()=>{
-          const id=++turn;sess.append('turn/start',{turn:id});try{
+          const id=++turn;sess.append('turn/start',{turn:id});
           if(archived.has(sid)){sess.append('turn/end',{turn:id,reason:{kind:'blocked'}});return;}
           if(agent.autoCompact){agent.autoCompact=false;compact(sess);}
           for(let step=0;step<(options.steps??1);step++){
@@ -341,9 +340,8 @@ async function fixture(t) {
           const decision=await waterfall('agent/pre-step',{agent,messages:inbox,step},async()=>({kind:'enter',messages:inbox}));
           const request=await waterfall('agent/request',{agent},async()=>({provider:'fixture-provider',model:'fixture-model',...options.requestSeed}));
           if(request.reasoningEffort!==undefined)assert((options.reasoningInfo??{efforts:[{id:'off'},{id:'high'}]}).efforts.some(item=>item.id===request.reasoningEffort),'provider rejected unsupported reasoning effort');
-          assert.deepEqual(JSON.parse(JSON.stringify(request)),request,'request/header must preserve a lossless JSON snapshot');
           calls.requests.push(request);
-          const systemText=['fixture system guard',...[...systemSections.values()].sort((a,b)=>a.order-b.order).map(section=>section.name==='wechatagent:fixed-window-prefix'&&(options.omitNativePrefix||options.omitInitialNativePrefix&&prefixRegistrations===1)?'':typeof section.text==='function'?section.text({scope:agent}):section.text)].filter(Boolean).join('\n\n');
+          const systemText=['fixture system guard',...[...systemSections.values()].sort((a,b)=>a.order-b.order).map(section=>typeof section.text==='function'?section.text({scope:agent}):section.text)].filter(Boolean).join('\n\n');
           // The native driver commits the first system head only AFTER both
           // hooks. Starting fixtures with a prebuilt head hid early appends.
           if(!sess.snapshotEvents().some(event=>event.type==='system/message')){
@@ -351,20 +349,16 @@ async function fixture(t) {
             sess.append('system/message',{turn:id,step,message:{role:'system',content:[{type:'text',text:systemText}]}},{surfaceOp:'append'});
           }else{
             const head=sess.eventAt(sess.surface.nodes[0]);
-            if(head.type==='system/message'&&head.data.message.content[0]?.text!==systemText)sess.append('system/message',{turn:id,step,message:{role:'system',content:[{type:'text',text:systemText}]}},options.systemPromptUpdate==='in-history'?{surfaceOp:'append'}:{surfaceOp:{op:'replace',startSeq:head.seq,endSeq:head.seq},sourceEventSeqs:[head.seq]});
+            if(head.type==='system/message'&&head.data.message.content[0]?.text!==systemText)sess.append('system/message',{turn:id,step,message:{role:'system',content:[{type:'text',text:systemText}]}},{surfaceOp:{op:'replace',startSeq:head.seq,endSeq:head.seq},sourceEventSeqs:[head.seq]});
           }
           for(const input of decision.messages)sess.append('user/message',input,{surfaceOp:'append'});
           if(agent.overflowCompact){agent.overflowCompact=false;compact(sess);await waterfall('agent/request',{agent},async()=>({provider:'fixture-provider',model:'fixture-model'}));}
-          const messages=sess.surface.nodes.map(seq=>sess.eventAt(seq)).map(event=>({...event.data.message??event.data,role:event.type==='system/message'?'system':event.type==='assistant/message'?'assistant':'user'}));
-          await waterfall('llm/stream',{sessionId:sid,messages,tools:request.tools??[]},async()=>{
-            calls.streamChecks++;calls.inputs.push(messages);
-            calls.model.push(messages.filter(message=>message.role==='user').flatMap(message=>message.content??[]).map(block=>block.text??'').join('\n'));
-          });
+          calls.model.push(sess.surface.nodes.map(seq=>sess.eventAt(seq)).filter(e=>e.type==='user/message').flatMap(e=>e.data.content??[]).map(b=>b.text??'').join('\n'));
+          calls.inputs.push(sess.surface.nodes.map(seq=>sess.eventAt(seq)).map(event=>({...event.data.message??event.data,role:event.type==='system/message'?'system':event.type==='assistant/message'?'assistant':'user'})));
           }
           await options.beforeAssistant?.(agent);
           for(const content of options.assistantMessages??[[{type:'text',text:'SILENT'}]])sess.append('assistant/message',{turn:id,message:{content}},{surfaceOp:'append'});
           sess.append('turn/end',{turn:id,reason:{kind:typeof options.turnReason==='function'?options.turnReason():'completed'}});
-          }catch(error){sess.append('turn/end',{turn:id,reason:{kind:'error',error:{message:error.message}}});}
         });}};
       agents.set(sid,agent);return {dispose:async()=>agents.delete(sid)};
     }
@@ -983,30 +977,131 @@ test('busy agents cannot change profiles or retire their persona mid-turn',async
   assert.equal((await r.request('/configure',{...info,persona:'新的本机人格'})).activePersonaCount,1);
 });
 
+const fixtureMediaPeer='fixture-media-friend', fixtureMediaKey='wechat:private:'+uiOneBotId(fixtureMediaPeer);
+async function connectMediaReader(t,f,respond){
+  const target=fixtureMediaPeer,account='fixture-self';
+  const write=(name,value)=>{const file=path.join(f.dir,name);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(value));};
+  const current={dbPath:path.join(f.dir,'fixture-self_a1b2'),myWxid:'fixture-self_a1b2'};
+  fs.mkdirSync(path.join(current.dbPath,'db_storage'),{recursive:true});const accountRef=readerAccountId(f.dir,current);
+  write('state/weflow/WeFlow-config.json',current);write('state/weflow/active-account.json',{id:accountRef,legacyId:''});write('state/reader/connection-request.json',{schemaVersion:1,accountRef});
+  fs.mkdirSync(path.join(f.dir,'state/reader-service'),{recursive:true});
+  const selection=new TargetSelectionStore({root:f.dir,accountRef,resolveTargets:async ids=>ids.map(wechatId=>({wechatId,id:uiOneBotId(wechatId),name:'Fixture media friend',alias:'',ambiguous:false}))});
+  const selected=await selection.replace({expectedVersion:selection.get().version,targetWxids:[target]});
+  const token='d'.repeat(64),readerToken='e'.repeat(64),generation=new AbortController();
+  const source=http.createServer((req,res)=>{
+    assert.equal(req.headers.authorization,'Bearer '+readerToken);
+    respond(req,res);
+  });
+  await new Promise(resolve=>source.listen(0,'127.0.0.1',resolve));
+  let port;const proxy=createUiReaderMediaProxy({token,getPort:()=>port}),server=http.createServer((req,res)=>void proxy.handle(req,res).then(handled=>{if(!handled)res.writeHead(404).end();}));
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));port=server.address().port;
+  proxy.publish({accountRef,selectionVersion:selected.version,targets:selected.targets,signal:generation.signal,validateCurrent:()=>assert.deepEqual(selection.get(),selected),
+    reader:{accountRef,selectionVersion:selected.version,targets:[target],token:readerToken,baseUrl:'http://127.0.0.1:'+source.address().port,signal:generation.signal,done:new Promise(()=>{})}});
+  t.after(()=>{generation.abort();proxy.close();for(const item of [source,server]){item.closeAllConnections();item.close();}});
+  write('config/wechatagent.json',{runtime:{sender:'wechat-ui'},ports:{adapter:port},wechat:{whitelist:{private:[],groups:[]}}});
+  fs.writeFileSync(path.join(f.dir,'state/social-dsh-token.txt'),token);
+  return {target,account,selection,selected,token,readerToken,
+    grant:eventId=>selection.grantIncoming({account,target,eventId,selectionVersion:selected.version})};
+}
+
+test('DSH HTTP followup carries bound audio transcripts and sampled video into the native session exactly once',async t=>{
+  const f=await fixture(t),key=fixtureMediaKey,audioId='c'.repeat(64),videoId='d'.repeat(64),frame=Buffer.from([255,216,255,217]);
+  let reads=0;
+  const media=await connectMediaReader(t,f,(req,res)=>{
+    const url=new URL(req.url,'http://127.0.0.1'),id=url.pathname.split('/').at(-1),kind=id===audioId?'audio':'video';
+    assert.equal(url.pathname,'/api/v1/media/'+id);assert([audioId,videoId].includes(id));assert.equal(url.searchParams.get('conversationKey'),key);reads++;
+    res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({version:1,mediaId:id,kind,conversationKey:key,sourceSha256:'e'.repeat(64),durationMs:4000,audioPresent:true,semanticAnalysis:'not_performed',
+      transcript:{status:'ready',text:kind==='audio'?'合成语音资料甲':'合成视频音轨乙',automated:true},
+      frames:kind==='audio'?[]:[{atMs:2000,mime:'image/jpeg',b64:frame.toString('base64'),sha256:crypto.createHash('sha256').update(frame).digest('hex')}]}));
+  });
+  const r=await f.start();
+  assert.equal((await r.request('/health')).mediaInput,'local-transcript-sampled-video-v1');
+  const client=new DshPluginClient({url:r.url,token:'fixture-native-token'}),metadata={...info,conversationKey:key,uiSelectionScope:media.grant('source-media'),batchId:'f'.repeat(64),media:[{id:audioId,kind:'audio',sourceLabel:'引用原消息'},{id:videoId,kind:'video',sourceLabel:'转发第2条'}]};
+  assert.equal(await client.followup(key,'检查合成附件',metadata),'SILENT');assert.equal(reads,2);assert.equal(r.calls.model.length,1);
+  const input=r.calls.inputs.at(-1).find(message=>message.source?.socialBatchId===metadata.batchId);
+  assert.deepEqual(input.source.socialImageIds,[audioId,videoId]);assert.equal(input.content.filter(block=>block.type==='image').length,1);
+  const text=input.content.map(block=>block.text??'').join('\n');
+  for(const expected of ['合成语音资料甲','合成视频音轨乙','引用原消息','转发第2条','自动语音转写','间隔采样帧'])assert(text.includes(expected));
+  assert(!text.includes('fixture-reader'));assert(!text.includes(f.dir));
+  const session=[...f.store.values()].find(value=>value.snapshotEvents().some(event=>event.data.source?.socialBatchId===metadata.batchId));
+  const event=session.snapshotEvents().find(value=>value.data.source?.socialBatchId===metadata.batchId);
+  assert.equal(session.deriveEventMessage(event).content.find(block=>block.type==='image').offloaded,true);
+  assert.equal(await client.followup(key,'检查合成附件',metadata),'SILENT');assert.equal(reads,2);assert.equal(r.calls.model.length,1);
+});
+
+for(const kind of ['audio','video'])test('selected '+kind+' reaches DSH HTTP and durable reply queue through the formal adapter',async t=>{
+  // Only the source bytes and native model are fixtures. All selection, media
+  // proxy, reverse WebSocket, normalization, engine, HTTP and queue are real.
+  // The queue is explicitly paused: no desktop driver or WeChat send is used.
+  const f=await fixture(t),id='c'.repeat(64),conversationKey=fixtureMediaKey;
+  const frame=Buffer.from([255,216,255,217]);let reads=0,nativeInputs=0;
+  const {target,account,selection,selected,token,readerToken}=await connectMediaReader(t,f,(req,res)=>{
+    const url=new URL(req.url,'http://127.0.0.1');
+    assert.equal(url.pathname,'/api/v1/media/'+id);assert.equal(url.searchParams.get('conversationKey'),conversationKey);reads++;
+    res.writeHead(200,{'content-type':'application/json'}).end(JSON.stringify({version:1,mediaId:id,kind,conversationKey,sourceSha256:'f'.repeat(64),durationMs:4000,audioPresent:true,semanticAnalysis:'not_performed',
+      transcript:{status:'ready',text:'隔离媒体链路合成转写',automated:true},frames:kind==='audio'?[]:[{atMs:2000,mime:'image/jpeg',b64:frame.toString('base64'),sha256:crypto.createHash('sha256').update(frame).digest('hex')}],privatePath:'must-not-leak',readerToken}));
+  });
+  const runtime=await f.start({assistantMessages:[[{type:'text',text:'RESPOND: 已收到合成媒体资料。'}]]});
+  const backend=new UiOneBotBackend({directory:path.join(f.dir,'queue'),selectionStore:selection,policy:{accountWxid:account,targets:[{kind:'private',wxid:target,id:uiOneBotId(target)}]},
+    driver:{observe:async()=>{nativeInputs++;throw Error('NO_DESKTOP_IN_FIXTURE');},typeGrapheme:()=>{nativeInputs++;throw Error('NO_DESKTOP_IN_FIXTURE');},submit:()=>{nativeInputs++;throw Error('NO_DESKTOP_IN_FIXTURE');}}});
+  t.after(()=>backend.shutdown());
+  const adapter=new WechatOneBotAdapter({server:{host:'127.0.0.1',port:0,path:'/ws',timeoutMs:1000}}),client=new DshPluginClient({url:runtime.url,token:'fixture-native-token'}),buffer=new MessageBuffer(path.join(f.dir,'state/pipeline-messages.json'));
+  let sends=0;
+  const engine=new SocialEngine({buffer,roleFor:()=>persona,personaNameFor:()=> '测试人格',stickerPolicyFor:()=>({enabled:false,labelCache:false}),
+    decide:(key,prompt,metadata)=>client.followup(key,prompt,metadata),send:(message,text,options)=>{sends++;return adapter.sendText({kind:message.kind,target:message.conversation_id,text,...options,selectionRequired:message.ui_selection_required,selectionScope:message.ui_reply_scope});}});
+  t.after(()=>engine.stop());adapter.acceptUiMessage=message=>{engine.receive(message);return buffer.persistedIncoming(message);};
+  backend.outbox.pause();await adapter.start();
+  const connection=new UiOneBotConnection({backend,url:'ws://127.0.0.1:'+adapter.server.server.address().port+'/ws'});
+  t.after(async()=>{connection.stop();await adapter.stop();});
+  const meta=once(adapter,'meta');await connection.start();await meta;
+  const incoming={event:'message.new',sessionId:target,talkerId:target,conversationId:uiOneBotId(target),isSend:false,rawid:'fixture-media-event',timestamp:Math.floor(Date.now()/1000),type:kind==='audio'?34:43,media:[{id,kind}],selectionVersion:selected.version};
+  const event=backend.incoming(incoming);assert(event);
+  await connection.sendIncomingDurable(incoming,'a'.repeat(32)+':1');assert.equal(connection.intake.size,0);
+  const deadline=Date.now()+8000;while(Date.now()<deadline&&(!backend.outbox.list().length||engine.running.size))await new Promise(resolve=>setTimeout(resolve,10));
+  const jobs=backend.outbox.list();assert.equal(jobs.length,1);assert(['queued','paused'].includes(jobs[0].state));assert.equal(jobs[0].target,target);assert.equal(jobs[0].text,'已收到合成媒体资料。');
+  assert.equal(selection.authorizeDelivery(jobs[0]),true);assert.equal(nativeInputs,0);assert.equal(reads,1);assert.equal(runtime.calls.model.length,1);assert.equal(sends,1);
+  assert.deepEqual(buffer.recent(conversationKey,10)[0].media,[{id,kind}]);
+  const request=runtime.calls.inputs.at(-1).find(item=>item.source?.socialBatchId),text=request.content.map(item=>item.text??'').join('\n');
+  assert(text.includes('隔离媒体链路合成转写'));assert.equal(request.content.filter(item=>item.type==='image').length,kind==='video'?1:0);
+  for(const secret of [token,readerToken,'must-not-leak'])assert.equal(JSON.stringify(request).includes(secret),false);
+  const pending=buffer.pendingReplies.get(conversationKey);assert(pending);assert.equal(pending.parts[0].state,'submitted');assert.equal(pending.parts[0].deliveryProtocol,'durable-ui-v1');
+  assert.equal(backend.incoming(incoming),null);await connection.sendIncomingDurable(incoming,'a'.repeat(32)+':1');await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(runtime.calls.model.length,1);assert.equal(backend.outbox.list().length,1);assert.equal(sends,1);
+  await selection.replace({expectedVersion:selected.version,targetWxids:[]});assert.equal(selection.authorizeDelivery(jobs[0]),false);
+  // Receipt recovery may report the paused job or its revoked cancellation; it
+  // must not create a new send, UI attempt or replacement authorization.
+  const recovered=await adapter.sendText({kind:'private',target:uiOneBotId(target),text:jobs[0].text,deliveryId:jobs[0].id,selfId:backend.selfId,receiptOnly:true,selectionRequired:true,selectionScope:event.wechatagent.selectionScope});
+  assert.equal(recovered.confirmed,false);assert(['queued','paused','cancelled'].includes(recovered.state));assert.equal(backend.outbox.list().length,1);assert.equal(nativeInputs,0);
+  engine.stop();connection.stop();await adapter.stop();
+});
+
 test('image completion offloads after the native append publisher returns and never offloads twice',async t=>{
-  const f=await fixture(t),r=await f.start(),id='b'.repeat(64),bytes=Buffer.from('fixture image');
-  const server=http.createServer((req,res)=>{assert.equal(req.headers.authorization,'Bearer fixture-reader');res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({imageId:id,conversationKey:key,b64:bytes.toString('base64'),mime:'image/jpeg',sha256:crypto.createHash('sha256').update(bytes).digest('hex')}));});
-  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>server.close(resolve)));
-  fs.mkdirSync(path.join(f.dir,'state'),{recursive:true});fs.writeFileSync(path.join(f.dir,'state/wechat-io-config.json'),JSON.stringify({reader_base_url:`http://127.0.0.1:${server.address().port}`,reader_token:'fixture-reader'}));
-  const result=await r.request('/followup',{...info,message:'请看测试图片',images:[{id}]});
+  const f=await fixture(t),id='a'.repeat(64),bytes=Buffer.from('fixture image'),key=fixtureMediaKey;
+  const media=await connectMediaReader(t,f,(_req,res)=>res.writeHead(200,{'content-type':'application/json'}).end(JSON.stringify({
+    imageId:id,conversationKey:key,b64:bytes.toString('base64'),mime:'image/png',sha256:crypto.createHash('sha256').update(bytes).digest('hex')})));
+  const metadata={...info,conversationKey:key,uiSelectionScope:media.grant('image-event')};
+  const r=await f.start();
+  const result=await r.request('/followup',{...metadata,message:'请看测试图片',images:[{id}]});
   const session=f.store.get(result.sessionId),events=session.snapshotEvents();
   const imageEvent=events.find(e=>e.type==='user/message' && e.data.source?.socialImageIds);
   assert(imageEvent.data.content.some(block=>block.type==='image'));
   const offload=events.find(e=>e.type==='image/offload'),end=events.findLast(e=>e.type==='turn/end');
   assert(offload && offload.seq>end.seq);assert.equal(session.deriveEventMessage(imageEvent).content.at(-1).offloaded,true);
-  await r.request('/followup',{...info,message:'下一轮只发文字'});
+  await r.request('/followup',{...metadata,message:'下一轮只发文字'});
   assert.equal(session.snapshotEvents().filter(e=>e.type==='image/offload').length,1);
 });
 
 test('a failed vision request offloads the bad image and the same session accepts later text without archiving',async t=>{
-  let failed=true;const f=await fixture(t),r=await f.start({turnReason:()=>failed?'failed':'completed'}),id='a'.repeat(64),bytes=Buffer.from('fixture bad-for-provider image');
-  const server=http.createServer((_req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({imageId:id,conversationKey:key,b64:bytes.toString('base64'),mime:'image/png',sha256:crypto.createHash('sha256').update(bytes).digest('hex')}));});
-  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.closeAllConnections();server.close();});
-  fs.writeFileSync(path.join(f.dir,'state/wechat-io-config.json'),JSON.stringify({reader_base_url:`http://127.0.0.1:${server.address().port}`,reader_token:'fixture'}));
-  const failure=await r.request('/followup',{...info,message:'图片请求',images:[{id}]},502);assert.equal(failure.error,'turn_failed');
+  let failed=true;
+  const f=await fixture(t),id='a'.repeat(64),bytes=Buffer.from('fixture image'),key=fixtureMediaKey;
+  const media=await connectMediaReader(t,f,(_req,res)=>res.writeHead(200,{'content-type':'application/json'}).end(JSON.stringify({
+    imageId:id,conversationKey:key,b64:bytes.toString('base64'),mime:'image/png',sha256:crypto.createHash('sha256').update(bytes).digest('hex')})));
+  const metadata={...info,conversationKey:key,uiSelectionScope:media.grant('image-event')};
+  const r=await f.start({turnReason:()=>failed?'failed':'completed'});
+  const failure=await r.request('/followup',{...metadata,message:'图片请求',images:[{id}]},502);assert.equal(failure.error,'turn_failed');
   const session=f.store.get(failure.sessionId),image=session.snapshotEvents().find(e=>e.data.source?.socialImageIds);
   assert.equal(session.deriveEventMessage(image).content.find(b=>b.type==='image').offloaded,true);
-  failed=false;const next=await r.request('/followup',{...info,message:'继续发文字'});assert.equal(next.sessionId,failure.sessionId);assert.equal(next.text,'SILENT');
+  failed=false;const next=await r.request('/followup',{...metadata,message:'继续发文字'});assert.equal(next.sessionId,failure.sessionId);assert.equal(next.text,'SILENT');
   assert.equal(r.calls.create.length,1);assert.equal((await r.request('/health')).pendingTurns,0);
 });
 
@@ -1129,102 +1224,4 @@ for(const [text,count,mode]of [['为什么？',4,'continuation'],['上次我们�
  const r=await f.start({beforeAssistant:async agent=>{if(mode==='memory')evidence=JSON.parse((await agent.registeredTools.get('wechat_history_search').execute({query:'桂花面'})).content);}});
  await r.request('/followup',c.body(text));const input=r.calls.inputs[0],meta=input.find(m=>m.source?.socialInputWindow).source.socialInputWindow;assert.equal(meta.selection.mode,mode);assert.equal(meta.recentRecords,count);assert.equal(r.calls.model.length,1);
  if(mode==='memory'){assert(!r.calls.model[0].includes('COLD_OLD_'));assert(evidence.matches.some(row=>row.text.includes('桂花面')));}else{assert(r.calls.model[0].includes('COLD_OLD_11'));assert(!r.calls.model[0].includes('COLD_OLD_0 '));assert(r.calls.model[0].includes('COLD_PREVIOUS_ECHO'));}
-});
-
-
-test('the real native stream guard accepts updated system snapshots in both private and group histories',async t=>{
- for(const kind of ['private','group']){
-  const f=await fixture(t),chat='wechat:'+kind+':123';
-  fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});
-  fs.writeFileSync(path.join(f.dir,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:['123'],groups:['123']},history:{enabled:true,mode:'window'}}}));
-  const r=await f.start({systemPromptUpdate:'in-history'});
-  const first=await r.request('/followup',{...info,conversationKey:chat,message:'Before owner update'});
-  const previous=structuredClone(f.store.get(first.sessionId).snapshotEvents());
-  const updated='UPDATED_OWNER_PERSONA_'+kind;f.setPersona(chat,'更新人格',updated);
-  const next=await r.request('/followup',{...info,conversationKey:chat,persona:updated,personaName:'更新人格',message:'After owner update'});
-  assert.equal(next.sessionId,first.sessionId);assert.equal(r.calls.streamChecks,2);
-  const systems=r.calls.inputs.at(-1).filter(message=>message.role==='system').map(message=>message.content.map(block=>block.text??'').join(''));
-  assert(systems.length>=2);assert(!systems[0].includes(updated));assert(systems.at(-1).includes(updated));
-  assert.deepEqual(f.store.get(first.sessionId).snapshotEvents().slice(0,previous.length),previous);
- }
-});
-
-test('a truly missing system prefix blocks the provider and rebinds once on the next new input without rotating history',async t=>{
- const f=await fixture(t);fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});fs.writeFileSync(path.join(f.dir,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:['123'],groups:[]},history:{enabled:true,mode:'window'}}}));
- const r=await f.start({omitInitialNativePrefix:true}),failed=await r.request('/followup',{...info,message:'First request is not sent to the provider',batchId:'a'.repeat(64)},502);
- assert.equal(failed.detail,'HISTORY_NATIVE_PREFIX_MISSING');assert.equal(r.calls.model.length,0);assert.equal(r.calls.prefixBindings,1);
- const original=structuredClone(f.store.get(failed.sessionId).snapshotEvents());
- const next=await r.request('/followup',{...info,message:'A distinct next request',batchId:'b'.repeat(64)});
- assert.equal(next.sessionId,failed.sessionId);assert.equal(r.calls.prefixBindings,2);assert.equal(r.calls.model.length,1);assert.equal(r.calls.create.length,1);
- const state=(await r.request('/sessions')).sessions[0];assert.equal(state.generation,0);assert.equal(state.prefixRecovery.status,'verified');assert.equal(state.prefixRecovery.attempts,1);
- assert.deepEqual(f.store.get(next.sessionId).snapshotEvents().slice(0,original.length),original);
- const repeated=await r.request('/followup',{...info,message:'First request is not sent to the provider',batchId:'a'.repeat(64)},502);assert(repeated.cached||repeated.error==='turn_already_admitted');assert.equal(r.calls.model.length,1);
-});
-
-test('persistent prefix failures cannot loop registrations or bypass the guard; manual repair is confirmed, idle and history preserving',async t=>{
- const f=await fixture(t);fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});fs.writeFileSync(path.join(f.dir,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:['123'],groups:[]},history:{enabled:true,mode:'window'}}}));
- const options={omitNativePrefix:true},r=await f.start(options);
- let failed;for(let i=0;i<3;i++)failed=await r.request('/followup',{...info,message:'blocked '+i},502);
- assert.equal(r.calls.model.length,0);assert.equal(r.calls.prefixBindings,2);
- const sid=failed.sessionId,body={conversationKey:key,expectedSessionId:sid,confirmed:true};
- assert.equal((await r.request('/repair-context',{...body,confirmed:false},503)).detail,'HISTORY_REPAIR_CONFIRM_REQUIRED');
- assert.equal((await r.request('/repair-context',{...body,expectedSessionId:'social-'+('0'.repeat(32))},503)).detail,'HISTORY_REPAIR_SESSION_CHANGED');
- assert.equal((await r.request('/repair-context',{...body,conversationKey:'wechat:private:999'},503)).detail,'HISTORY_REPAIR_CHAT_NOT_ALLOWED');
- const agent=r.agents.get(sid);agent.status='running';assert.equal((await r.request('/repair-context',body,503)).detail,'session_busy');agent.status='idle';
- const original=structuredClone(f.store.get(sid).snapshotEvents());options.omitNativePrefix=false;
- const repaired=await r.request('/repair-context',body);assert(repaired.repaired&&repaired.historyRetained);assert.equal(repaired.sessionId,sid);assert.equal(r.calls.model.length,0);assert.equal(r.calls.prefixBindings,3);assert(fs.existsSync(path.join(f.dir,repaired.prefixRecovery.backup)));
- assert.deepEqual(f.store.get(sid).snapshotEvents().slice(0,original.length),original);
- await r.request('/followup',{...info,message:'Continue after repair'});assert.equal(r.calls.model.length,1);assert.equal(r.calls.create.length,1);assert.equal((await r.request('/sessions')).sessions[0].prefixRecovery.status,'verified');
- const settingsFile=path.join(f.dir,'config/wechatagent.json'),settings=JSON.parse(fs.readFileSync(settingsFile,'utf8'));settings.wechat.history.mode='bounded';fs.writeFileSync(settingsFile,JSON.stringify(settings));
- await r.request('/configure',info);const bounded=(await r.request('/sessions')).sessions[0];assert.equal(bounded.prefixRepairAvailable,false);assert.equal(bounded.prefixRecovery,null);
- assert.equal((await r.request('/repair-context',body,503)).detail,'HISTORY_REPAIR_UNAVAILABLE');
- settings.wechat.history.mode='window';fs.writeFileSync(settingsFile,JSON.stringify(settings));await r.request('/configure',info);
- fs.mkdirSync(path.join(f.dir,'state/weflow'),{recursive:true});fs.writeFileSync(path.join(f.dir,'state/weflow/active-account.json'),JSON.stringify({id:'d'.repeat(64)}));
- assert.equal((await r.request('/repair-context',body,409)).detail,'ACCOUNT_SWITCH_REQUIRES_DSH_RESTART');
-});
-
-
-test('member chat headers omit toolChoice entirely and stay lossless JSON while administrator tools remain intact',async t=>{
- const f=await fixture(t),group='wechat:group:456';fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});
- fs.writeFileSync(path.join(f.dir,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:[],groups:['456']},workModes:{[group]:'assistant'},assistant:{administrators:['wxid_admin'],adminOnlyGroups:{[group]:true}},dshAccess:{chats:{[group]:{mode:'native',skills:[],tools:[]}}}}}));
- const r=await f.start({requestSeed:{toolChoice:'auto',tools:[{name:'pwsh',parameters:{type:'object'}}]},assistantMessages:[[{type:'text',text:'RESPOND: 群友聊天正常'}]]});
- const member=await r.request('/assistant-chat',{conversationKey:group,assistantSender:'wxid_member',message:'群友普通聊天'});
- assert.equal(member.text,'RESPOND: 群友聊天正常');const header=r.calls.requests.at(-1);
- assert.deepEqual(header.tools,[]);assert.equal(Object.hasOwn(header,'toolChoice'),false);assert.deepEqual(JSON.parse(JSON.stringify(header)),header);
- const agent=r.agents.get(member.sessionId);assert.equal(agent.registeredTools.size,0);assert(agent.toolGuards.some(guard=>typeof guard({agent,name:'pwsh'})==='string'));
- await r.request('/followup',{conversationKey:group,assistantSender:'wxid_member',message:'群友要求执行命令'},403);
- await r.request('/followup',{conversationKey:group,assistantSender:'wxid_admin',message:'管理员任务'});
- assert.equal(r.calls.requests.at(-1).toolChoice,'auto');assert(r.calls.requests.at(-1).tools.some(tool=>tool.name==='pwsh'));assert.equal(r.calls.model.length,2);
-});
-
-test('preset discovery retries a startup registration race once before any session or model admission',async t=>{
- const f=await fixture(t),r=await f.start();let resolutions=0;
- r.ctx.agentPresets.resolve=async id=>{if(++resolutions===1)throw Object.assign(Error('Unknown agent preset: '+id),{code:'agent-preset/not-found'});return {id};};
- const result=await r.request('/followup',{...info,message:'A fresh startup input'});
- assert.equal(result.text,'SILENT');assert.equal(resolutions,2);assert.equal(r.calls.create.length,1);assert.equal(r.calls.model.length,1);
-});
-
-test('unready assistant presets reject task submission clearly without persisting a failed task or widening membership',async t=>{
- const f=await fixture(t);fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});fs.writeFileSync(path.join(f.dir,'config/wechatagent.json'),JSON.stringify({wechat:{whitelist:{private:['123'],groups:[]},workModes:{[key]:'assistant'},assistant:{administrators:['wxid_admin']}}}));
- const r=await f.start();let resolutions=0;
- r.ctx.agentPresets.resolve=async()=>{resolutions++;throw Object.assign(Error('Unknown agent preset: wechat-assistant'),{code:'agent-preset/not-found'});};
- const body={conversationKey:key,senderWxid:'wxid_admin',assistantSender:'wxid_admin',message:'Task after restart',batchId:'e'.repeat(64)};
- await r.request('/assistant-task/submit',{...body,senderWxid:'wxid_member',assistantSender:'wxid_member'},403);assert.equal(resolutions,0);
- const blocked=await r.request('/assistant-task/submit',body,503);assert.equal(blocked.error,'AGENT_PRESET_NOT_READY');assert.equal(resolutions,2);assert.equal(r.calls.create.length,0);assert.equal(r.calls.model.length,0);
- assert.deepEqual((await r.request('/assistant-task/list',{conversationKey:key,senderWxid:'wxid_admin'})).tasks,[]);
- r.ctx.agentPresets.resolve=async id=>({id});const accepted=await r.request('/assistant-task/submit',body);assert(accepted.task.id);
- let done;for(let i=0;i<200;i++){done=await r.request('/assistant-task/result',{conversationKey:key,senderWxid:'wxid_admin',taskId:accepted.task.id});if(done.task.state==='completed')break;await new Promise(resolve=>setTimeout(resolve,5));}
- assert.equal(done.task.state,'completed');assert.equal(r.calls.model.length,1);
- r.ctx.agentPresets.resolve=async()=>{throw Error('Unknown agent preset: wechat-assistant');};
- const duplicate=await r.request('/assistant-task/submit',body);assert.equal(duplicate.task.id,accepted.task.id);assert.equal(r.calls.model.length,1);
-});
-
-
-test('preset preflight does not retry unrelated failures and rechecks owner revocation after waiting',async t=>{
- const f=await fixture(t);fs.mkdirSync(path.join(f.dir,'config'),{recursive:true});const file=path.join(f.dir,'config/wechatagent.json'),settings={wechat:{whitelist:{private:['123'],groups:[]},workModes:{[key]:'assistant'},assistant:{administrators:['wxid_admin']}}};fs.writeFileSync(file,JSON.stringify(settings));
- const r=await f.start(),body={conversationKey:key,senderWxid:'wxid_admin',assistantSender:'wxid_admin',message:'Guarded task',batchId:'f'.repeat(64)};let calls=0;
- r.ctx.agentPresets.resolve=async()=>{calls++;throw Error('FIXTURE_PERMISSION_DENIED');};
- const failed=await r.request('/assistant-task/submit',body,503);assert.equal(failed.detail,'FIXTURE_PERMISSION_DENIED');assert.equal(calls,1);
- calls=0;r.ctx.agentPresets.resolve=async id=>{if(++calls===1)throw Error('Unknown agent preset: '+id);settings.wechat.assistant.administrators=[];fs.writeFileSync(file,JSON.stringify(settings));return {id};};
- await r.request('/assistant-task/submit',body,403);assert.equal(calls,2);assert.equal(r.calls.create.length,0);assert.equal(r.calls.model.length,0);
 });

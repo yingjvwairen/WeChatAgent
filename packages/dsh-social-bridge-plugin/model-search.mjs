@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {allowedConversation} from './conversation-policy.mjs';
+import {selectedWechat} from './ui-selection-policy.mjs';
 import {searchPolicy} from './search-policy.mjs';
 import {searchErrorCode,searchSourceUrl} from './search-provider.mjs';
 import {createDshSearch} from './dsh-search.mjs';
@@ -19,8 +21,9 @@ const instructions=fs.readFileSync(new URL('./skills/search/SKILL.md',import.met
 export function localSearchPolicy(root,key){
   try{const file=path.join(root,'config/wechatagent.json'),stat=fs.lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>1024*1024)return null;
     const config=JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')),match=/^wechat:(private|group):([1-9]\d{0,15})$/.exec(key);
-    if(!match||!Number.isSafeInteger(Number(match[2]))||!config.wechat?.whitelist?.[match[1]==='group'?'groups':'private']?.some(id=>String(id)===match[2]))return null;
-    const policy=searchPolicy(config.wechat,key);return policy.enabled?policy:null;
+    const wechat=selectedWechat(root,config.wechat);
+    if(!match||!Number.isSafeInteger(Number(match[2]))||!allowedConversation(wechat,key))return null;
+    const policy=searchPolicy(wechat,key);return policy.enabled?policy:null;
   }catch{return null;}
 }
 export function createModelSearchTurn({webTurn,optOut=false,privateNames=[],prefetchedSearches=0}={}){

@@ -3,6 +3,7 @@ import html
 import re
 import xml.etree.ElementTree as ET
 from wechat_forwarded import safe_xml
+from wechat_extra_card import parse_extra_card
 
 QUOTE_TYPE = (57 << 32) | 49
 MAX_XML = 100_000
@@ -32,12 +33,9 @@ def _reference_text(kind, value, depth):
         if not value or value.lower() in ('null', '(null)'):
             return '[被引用文字不可用]', True, False
         return value[:MAX_REFERENCE], False, len(value) > MAX_REFERENCE
-    labels = {'3': '图片，未提供图片内容', '34': '语音，未转写', '43': '视频，未提供视频内容',
-              '47': '表情包，未提供表情内容', '48': '位置，未解析位置内容', '10000': '系统消息'}
-    if kind in labels:
-        return '[' + labels[kind] + ']', True, False
-    if kind == '49' or (kind.isdigit() and int(kind) & 0xffffffff == 49):
-        # References may contain an XML tree, CDATA, or doubly escaped XML.
+    card_type = int(kind) if kind.isdigit() and len(kind)<=16 else 0
+    if card_type in (42,48) or card_type & 0xffffffff == 49:
+        # Some clients escape the embedded message separately from the outer XML.
         for _ in range(3):
             if value.startswith('<'):
                 break
@@ -45,6 +43,17 @@ def _reference_text(kind, value, depth):
             if decoded == value:
                 break
             value = decoded
+        card = parse_extra_card(card_type,value)
+        if card:
+            shown = '['+card['label']+'] '+card['title']
+            if card.get('summary'):
+                shown += ' · '+card['summary']
+            return shown[:MAX_REFERENCE], False, len(shown)>MAX_REFERENCE
+    labels = {'3': '图片，未提供图片内容', '34': '语音，未转写', '43': '视频，未提供视频内容',
+              '47': '表情包，未提供表情内容', '48': '位置，未解析位置内容', '10000': '系统消息'}
+    if kind in labels:
+        return '[' + labels[kind] + ']', True, False
+    if kind == '49' or (kind.isdigit() and int(kind) & 0xffffffff == 49):
         try:
             app = _app(value)
             if app is not None:
@@ -57,9 +66,9 @@ def _reference_text(kind, value, depth):
                         ref = nested['reference']
                         text = '回复：' + nested['reply'] + '\n引用 ' + ref['senderName'] + '：' + ref['text']
                         return text[:MAX_REFERENCE], ref['unavailable'], nested['truncated'] or ref['truncated'] or len(text) > MAX_REFERENCE
-                label = {'5': '链接', '6': '文件，未读取文件内容', '8': '表情包，未提供表情内容',
+                label = {'4': '链接', '5': '链接', '6': '文件，未读取文件内容', '8': '表情包，未提供表情内容',
                          '19': '合并聊天记录，未展开'}.get(subtype, '应用消息，未解析附件')
-                full_title = _text(app, 'title') if subtype in ('5', '6', '19') else ''
+                full_title = _text(app, 'title') if subtype in ('4', '5', '6', '19') else ''
                 title = full_title[:500]
                 return '[' + label + ']' + (' ' + title if title else ''), True, len(full_title) > 500
         except (ValueError, ET.ParseError, RecursionError):
@@ -92,5 +101,24 @@ def parse_quote_reply(value, depth=0):
                               'messageId': _metadata(_text(ref, 'svrid'), 32),
                               'time': _metadata(_text(ref, 'createtime'), 64), 'kind': kind,
                               'text': text, 'unavailable': unavailable, 'truncated': truncated}}
+    except (ValueError, ET.ParseError, RecursionError):
+        return None
+
+
+def quote_receipt(value):
+    """Return only the exact submitted body and the native referenced server ID."""
+    try:
+        app = _app(value) if isinstance(value, str) else None
+        if app is None or _text(app, 'type') != '57':
+            return None
+        titles, refs = app.findall('title'), app.findall('refermsg')
+        if len(titles) != 1 or len(refs) != 1 or len(titles[0]):
+            return None
+        ids = refs[0].findall('svrid')
+        reply = titles[0].text
+        sid = ids[0].text if len(ids) == 1 and not len(ids[0]) else None
+        if not reply or len(reply) > MAX_REPLY or not re.fullmatch(r'[1-9][0-9]{0,19}', sid or '') or int(sid) >= 2**64:
+            return None
+        return {'reply': reply, 'messageId': sid}
     except (ValueError, ET.ParseError, RecursionError):
         return None

@@ -9,38 +9,65 @@ import {MEMBER_MEMORY_POLICY} from './member-memory-policy.mjs';
 import {HISTORY_POLICY} from './history-policy.mjs';
 export const name = 'social-tool-restrict';
 export const inject = ['tools'];
+const policySymbols=[Symbol.for('wechatagent.extension-tools.v1'),WEB_READER_POLICY,MODEL_SEARCH_POLICY,DSH_ACCESS_POLICY,FILE_TRANSFER_POLICY,MEME_LIBRARY_POLICY,MEMBER_MEMORY_POLICY,HISTORY_POLICY];
+const policies = ctx => policySymbols.map(symbol => ctx[symbol]).filter(Boolean);
+const assistantAllowed = ctx => {try{return ctx[ASSISTANT_ACCESS]?.()!==false;}catch{return false;}};
+const visibleNames = ctx => new Set(assistantAllowed(ctx)?policies(ctx).flatMap(policy=>[...policy.names()]):[]);
+const executorMarker=Symbol.for('wechatagent.scoped-tool-executor.v1');
+const baseMarker=Symbol.for('wechatagent.scoped-tool-executor-base.v1');
+const bindOwner=Symbol.for('wechatagent.scoped-tool-executor-bind.v1');
+
+// DSH 0.2.2 computes tool descriptions BEFORE its assembly callback and
+// attaches them to the result afterwards. Bind before the first turn.
+export function bindSocialToolExecutor(owner,agent) {
+  const tools=owner.tools;
+  if(typeof tools?.selectExecutor!=='function'||typeof tools.setExecutor!=='function'||Object.hasOwn(owner,executorMarker))return;
+  const selected=tools.selectExecutor(agent);
+  const base=selected[baseMarker]??selected;
+  let permissions=owner,agentContext=agent?.ctx;
+  const allowedDefinitions=definitions=>{
+    const names=visibleNames(permissions);
+    return definitions.filter(definition=>names.has(definition.name));
+  };
+  const wrapper={
+    [baseMarker]:base,
+    [bindOwner](ctx) {
+      if(agentContext&&agentContext!==ctx)throw Error('Social tool executor scope changed');
+      agentContext=permissions=ctx;
+    },
+    describe(definitions) {
+      const allowed=allowedDefinitions(definitions);
+      const names=new Set(allowed.map(tool=>tool.name));
+      const description=base.describe(allowed);
+      const schemas=description.schemas.filter(tool=>names.has(tool.name)).map(({deferLoading,...schema})=>schema);
+      return {...description,schemas:canonicalSocialTools(schemas),knownNames:[...names].sort()};
+    },
+    execute:input=>base.execute(input),
+  };
+  if(base.sections?.length)wrapper.sections=base.sections.map(section=>typeof section.text==='function'
+    ?{...section,text:definitions=>section.text(allowedDefinitions(definitions))}:section);
+  try{tools.setExecutor(wrapper);}
+  catch(error){
+    // A mounted preset may have registered against the same Cordis scope
+    // through its plugin context before the agent context becomes available.
+    // An inherited preset executor does not count as a duplicate in DSH.
+    if(!agent||error?.message!=='Only one tool executor may be registered in each scope'||!selected[bindOwner])throw error;
+    selected[bindOwner](owner);
+  }
+  Object.defineProperty(owner,executorMarker,{value:true,configurable:true});
+}
 export function apply(ctx) {
   const marker=Symbol.for('wechatagent.scoped-tool-guard.v1');if(Object.hasOwn(ctx,marker))return;Object.defineProperty(ctx,marker,{value:true,configurable:true});
   ctx.tools.presentAs?.('native'); // Visibility and execution use the same live per-chat authorization below.
-  const policies = agent => [Symbol.for('wechatagent.extension-tools.v1'),WEB_READER_POLICY,MODEL_SEARCH_POLICY,DSH_ACCESS_POLICY,FILE_TRANSFER_POLICY,MEME_LIBRARY_POLICY,MEMBER_MEMORY_POLICY,HISTORY_POLICY]
-    .map(symbol => agent?.ctx?.[symbol] ?? ctx[symbol]).filter(Boolean);
-  const assistantAllowed=agent=>{try{return (agent?.ctx?.[ASSISTANT_ACCESS] ?? (agent ? undefined : ctx[ASSISTANT_ACCESS]))?.()!==false;}catch{return false;}};
-  const visibleNames=agent=>new Set(assistantAllowed(agent)?policies(agent).flatMap(policy => [...policy.names()]):[]);
-  ctx.tools.guard(exec => assistantAllowed(exec?.agent)&&policies(exec?.agent).some(policy => policy.check(exec?.name)) ? undefined : '微信群友会话不允许调用未授权工具');
-  // DSH 0.2.2+ attaches tools after the prompt-assembly hook, from the scope's
-  // tool executor. A scoped executor that only narrows describe() keeps the
-  // model-facing list equal to the live per-chat authorization; execution is
-  // delegated unchanged and still passes the guard above.
-  let scopeAgent;
-  const hasPromptTools=typeof ctx.tools.resolve!=='function';
-  if(!hasPromptTools&&typeof ctx.tools.setExecutor==='function'&&typeof ctx.tools.selectExecutor==='function'){
-    const base=()=>ctx.tools.selectExecutor();
-    try{
-      // Executors that own prompt sections (PTC) cannot be wrapped without hiding those sections.
-      if(!(base().sections?.length))ctx.tools.setExecutor({
-        describe(definitions){
-          const names=visibleNames(scopeAgent),described=base().describe(definitions.filter(definition=>names.has(definition.name)));
-          return {...described,schemas:canonicalSocialTools((described.schemas??[]).map(({deferLoading,...schema})=>schema))};
-        },
-        execute:input=>base().execute(input),
-      });
-    }catch(error){ctx.logger?.warn?.(`social tool visibility filter unavailable: ${error?.message ?? error}`);}
-  }
+  bindSocialToolExecutor(ctx);
+  ctx.tools.guard(exec => {
+    const owner=exec?.agent?.ctx??ctx;
+    return assistantAllowed(owner)&&policies(owner).some(policy=>policy.check(exec?.name))?undefined:'微信群友会话不允许调用未授权工具';
+  });
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
-    if(context?.scope)scopeAgent=context.scope;
     const original = withoutDshIdentity(await next()), assembly=original.sections?.some(section=>section.name==='dsh-expression:companion')?{...original,sections:original.sections.filter(section=>section.name!=='dsh-expression:companion')}:original;
     if(!Array.isArray(assembly.tools))return assembly;
-    const names = visibleNames(context?.scope);
+    const names=visibleNames(context?.scope?.ctx??ctx);
     return names.size ? { ...assembly, tools: canonicalSocialTools(assembly.tools.filter(tool => names.has(tool.name)).map(({deferLoading,...tool})=>tool)) } : withoutSocialTools(assembly);
   }, { prepend: true });
 }

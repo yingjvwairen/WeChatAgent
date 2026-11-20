@@ -2,9 +2,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 // Credentials travel over stdin and the private result channel, never argv or job logs.
-export function runReaderSetup({ root, python, request, onProgress = () => {} }) {
+export function runReaderSetup({ root, python, request, onProgress = () => {}, spawnImpl = spawn, timeoutMs = 210000 }) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 210000) return Promise.reject(new Error('READER_SETUP_PROTOCOL'));
   return new Promise((resolve, reject) => {
-    const child = spawn(python, ['-B', path.join(root, 'scripts', 'reader_setup.py')], {
+    const child = spawnImpl(python, ['-B', path.join(root, 'scripts', 'reader_setup.py')], {
       cwd: root, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUTF8: '1', PYTHONUNBUFFERED: '1' },
     });
@@ -14,29 +15,49 @@ export function runReaderSetup({ root, python, request, onProgress = () => {} })
       finished = true; clearTimeout(timer);
       error ? reject(error) : resolve(value);
     };
-    const timer = setTimeout(() => { child.kill(); finish(new Error('READER_SETUP_TIMEOUT')); }, 210000);
+    const unknown = causeCode => Object.assign(new Error('READER_SETUP_CLEANUP_UNCONFIRMED'), {
+      code: 'READER_SETUP_CLEANUP_UNCONFIRMED', cleanupConfirmed: false, causeCode,
+    });
+    const abandon = causeCode => {
+      if (finished) return;
+      // Only the exact child handle is terminated. A venv launcher may own a
+      // separate interpreter; neither process exit nor kill proves DLL cleanup.
+      // The caller retains its connection lock for explicit recovery.
+      try { child.kill(); } catch {}
+      finish(unknown(causeCode));
+      child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); child.unref();
+    };
+    const timer = setTimeout(() => abandon('READER_SETUP_TIMEOUT'), timeoutMs);
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => {
+      if (finished) return;
       pending += chunk;
-      if (pending.length > 128000) { child.kill(); finish(new Error('READER_SETUP_PROTOCOL')); return; }
+      if (pending.length > 128000) { abandon('READER_SETUP_PROTOCOL'); return; }
       let newline;
       while ((newline = pending.indexOf('\n')) >= 0) {
         const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
         try {
           const event = JSON.parse(line);
           if (event.type === 'progress' && typeof event.message === 'string') onProgress(event.message);
-          if (event.type === 'result') result = event;
+          if (event.type === 'result') {
+            if (result) { abandon('READER_SETUP_PROTOCOL'); return; }
+            result = event;
+          }
         } catch { /* Third-party diagnostics are private and are never forwarded. */ }
       }
     });
     child.stderr.on('data', chunk => { diagnostic = (diagnostic + chunk).slice(-8000); });
     child.stdin.on('error', () => {});
-    child.once('error', () => finish(new Error('READER_RUNTIME_MISSING')));
-    child.once('close', () => {
-      if (result) finish(null, result);
-      else finish(new Error(/ModuleNotFoundError|ImportError|DLL load failed/.test(diagnostic) ? 'READER_DEPENDENCY_MISSING' : 'READER_SETUP_FAILED'));
+    child.once('error', () => {
+      if (child.pid) abandon('READER_SETUP_FAILED');
+      else finish(new Error('READER_RUNTIME_MISSING'));
     });
-    child.stdin.end(JSON.stringify(request));
+    child.once('close', code => {
+      if (code === 0 && result) finish(null, result);
+      else finish(unknown(/ModuleNotFoundError|ImportError|DLL load failed/.test(diagnostic) ? 'READER_DEPENDENCY_MISSING' : 'READER_SETUP_FAILED'));
+    });
+    try { child.stdin.end(JSON.stringify(request)); }
+    catch { abandon('READER_SETUP_PROTOCOL'); }
   });
 }
 
@@ -70,6 +91,7 @@ export const readerSetupMessages = {
   REVIEWED_HOOK_BUILD_REQUIRED: '当前端口不是已适配的微信发送组件，原配置已保留。请检查端口和匹配微信。',
   READER_KEY_ACCESS_DENIED: '无法连接微信进程。请以相同的 Windows 用户和权限打开微信与助手后重试。',
   READER_SETUP_TIMEOUT: '获取密钥超时。请再次点击“一键连接并验证”，然后在微信中退出账号并重新登录；程序会等待登录完成。',
+  READER_SETUP_CLEANUP_UNCONFIRMED: '读取组件的清理尚未确认，不能自动重试。请先检查本次连接任务并处理恢复状态；进程退出不代表微信中的组件已清理。',
   READER_SETUP_FAILED: '自动连接未完成。请确认微信已打开、目录对应当前账号后重试；原有配置已保留。',
 };
 

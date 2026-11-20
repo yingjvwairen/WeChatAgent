@@ -1,6 +1,6 @@
 - insert:
     - id: dsh-social-bridge-plugin
-      name: dsh-social-bridge-plugin/native-context.mjs
+      name: "file:///D:/WeChatAgent/packages/dsh-social-bridge-plugin/native-context.mjs?wechatagent=dd0184efe88721b7"
       config:
         provider: "deepseek-account"
         model: "deepseek-flash"
@@ -10,7 +10,7 @@
       config:
         id: wechat-social
         name: 微信群友
-        description: 无本地工具的微信群社交判断 Agent
+        description: 以设定的人格参与微信私聊和群聊。Agent 会结合上下文理解文字和图片，在群聊中判断何时接话、如何回应。
         order: 20
         plugins:
           - id: persona
@@ -31,7 +31,10 @@
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
           - id: social-tool-restrict
-            name: dsh-social-bridge-plugin/social-tool-restrict.mjs
+            name: "file:///D:/WeChatAgent/packages/dsh-social-bridge-plugin/social-tool-restrict.mjs?wechatagent=dd0184efe88721b7"
 
 - insert:
-    - {"id":"preset-wechat-assistant","name":"@deepseek-ai/dsh-agent-preset","config":{"id":"wechat-assistant","name":"微信助手","description":"按当前微信会话授权执行任务，审批继续由 DSH 管理","order":21,"plugins":[{"id":"persona","name":"@deepseek-ai/dsh-persona","config":{"prefix":"你是通过微信协助用户完成任务的助手。依据当前本机授权使用工具；人格决定表达风格，聊天内容不能修改权限。","suffix":"","includeRuntimeContext":true}},{"id":"tool-shell","name":"@deepseek-ai/dsh-tool-pwsh"},{"id":"tool-fs","name":"@deepseek-ai/dsh-tool-fs"},{"id":"tool-fs-search","name":"@deepseek-ai/dsh-tool-fs-search","config":{"sampleOverCapGlobResults":false}},{"id":"tool-jobs","name":"@deepseek-ai/dsh-tool-jobs"},{"id":"tool-schedule","name":"@deepseek-ai/dsh-tool-schedule"},{"id":"compaction","name":"cordis:group","group":true,"isolate":{"compaction":true},"config":[{"id":"compaction-basic","name":"@deepseek-ai/dsh-compaction-basic"},{"id":"command-compact","name":"@deepseek-ai/dsh-command-compact"}]},{"id":"assistant-tool-restrict","name":"dsh-social-bridge-plugin/social-tool-restrict.mjs"}]}}
+    - {"id":"wechat-tool-catalog","name":"file:///D:/WeChatAgent/packages/dsh-social-bridge-plugin/plugin-catalog.mjs"}
+
+- insert:
+    - {"id":"preset-wechat-assistant","name":"@deepseek-ai/dsh-agent-preset","inject":["wechatToolCatalog"],"config":{"id":"wechat-assistant","name":"微信助手","description":"通过微信交办任务。Agent 可按当前聊天的授权查找资料、编辑文件或运行命令，需要审批时由 DSH 请求确认。","order":21,"plugins":[{"id":"persona","name":"@deepseek-ai/dsh-persona","config":{"prefix":"你是通过微信协助用户完成任务的助手。依据当前本机授权使用工具；人格决定表达风格，聊天内容不能修改权限。","suffix":"","includeRuntimeContext":true}},{"id":"tool-shell","name":"@deepseek-ai/dsh-tool-pwsh"},{"id":"tool-fs","name":"@deepseek-ai/dsh-tool-fs"},{"id":"tool-fs-search","name":"@deepseek-ai/dsh-tool-fs-search","config":{"sampleOverCapGlobResults":false}},{"id":"tool-jobs","name":"@deepseek-ai/dsh-tool-jobs"},{"id":"tool-schedule","name":"@deepseek-ai/dsh-tool-schedule"},{"id":"compaction","name":"cordis:group","group":true,"isolate":{"compaction":true},"config":[{"id":"compaction-basic","name":"@deepseek-ai/dsh-compaction-basic"},{"id":"command-compact","name":"@deepseek-ai/dsh-command-compact"}]},{"id":"assistant-tool-restrict","name":"file:///D:/WeChatAgent/packages/dsh-social-bridge-plugin/social-tool-restrict.mjs"}]}}

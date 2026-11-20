@@ -14,7 +14,7 @@ function fixture(t,options={}){
   const make=()=>{const buffer=new MessageBuffer(file);const engine=new SocialEngine({buffer,batchMs:1,privateMinIntervalMs:0,maxPerMinute:100,maxPerTenMinutes:1000,
     deliveryRetry:{mediaDeadlineMs:5000,mediaCallTimeoutMs:40,receiptDelayMs:5,busyDelayMs:5},
     stickerChoicesFor:async()=>[{id,description:'测试图',tags:['测试']}],
-    decide:async()=>++calls===1?'RESPOND: 第一轮\n[STICKER:S1]':'RESPOND: 后续文字',send:async(_target,text)=>{sent.push(text);},
+    decide:async()=>++calls===1?'RESPOND: 第一轮\n[STICKER:S1]':'RESPOND: 后续文字',send:async(_target,text)=>{sent.push(text);return {confirmed:true};},
     sendSticker:(...args)=>args[2]?.abandon?Promise.resolve({released:true}):(options.sendSticker??(()=>new Promise(()=>{})))(...args)});engines.push(engine);return engine;};
   t.after(()=>{for(const e of engines)e.stop();assert(path.resolve(root).startsWith(path.resolve(os.tmpdir())+path.sep));fs.rmSync(root,{recursive:true,force:true});});
   return {make,file,sent,get calls(){return calls;}};

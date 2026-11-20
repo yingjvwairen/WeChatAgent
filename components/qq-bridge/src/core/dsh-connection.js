@@ -6,7 +6,7 @@ export class DshConnectionGuard {
     this.cutoff=this.saved?.cutoff??0;this.instanceId=this.saved?.instanceId??'';this.lastCheck=-Infinity;this.stopped=false;
   }
   current(epoch){return !this.stopped&&this.ready&&epoch===this.epoch;}
-  skips(message){return !this.ready||Number(message.timestamp)*1000<this.cutoff;}
+  skips(message){return !this.ready||Number(message.timestamp)*1000<this.cutoff&&!(message.offline_replay==='reply'&&message.ui_selection_required===true);}
   metadata(){return this.instanceId&&this.instanceId!=='legacy'?{dshInstanceId:this.instanceId}:{};}
   async check({force=false}={}) {
     if(this.stopped)return false;

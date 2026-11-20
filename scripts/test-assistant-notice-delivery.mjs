@@ -52,6 +52,26 @@ test('stopping while discovery is pending suppresses delivery, and concurrent ti
  const f=fixture(t);f.add();let release;const gate=new Promise(resolve=>release=resolve);f.plugin.controllerReady=()=>gate;const first=f.delivery.tick();await f.delivery.tick();f.delivery.stop();release(true);await first;assert.equal(f.sent.length,0);assert.equal(f.requests.length,0);
 });
 
+test('changing the active account during controller or notification discovery cannot send or acknowledge old notices',async t=>{
+ for(const phase of ['controller','notifications']){
+  const f=fixture(t),id=f.add();let release;
+  if(phase==='controller')f.plugin.controllerReady=()=>new Promise(resolve=>release=()=>resolve(true));
+  else{const original=f.plugin.assistantTask;f.plugin.assistantTask=async(...args)=>{const result=await original(...args);if(args[1]==='notifications')await new Promise(resolve=>release=resolve);return result;};}
+  const pending=f.delivery.tick();for(let i=0;!release&&i<20;i++)await new Promise(resolve=>setTimeout(resolve,1));assert(release);
+  f.adapter.selfId='different-account';release();await pending;
+  assert.equal(f.sent.length,0);assert.equal(f.queue.messages[id].state,'queued');assert.equal(f.requests.filter(item=>item.action==='notification-ack').length,0);
+ }
+});
+
+test('the UI asynchronous-send barrier is rechecked after discovery before sending notifications',async t=>{
+ const f=fixture(t),id=f.add();let allowed=false,release;
+ const delivery=createAssistantNoticeDelivery({adapter:f.adapter,plugin:f.plugin,settingsFor:()=>f.w,isReady:()=>allowed});t.after(()=>delivery.stop());
+ await delivery.tick();assert.equal(f.requests.length,0);
+ allowed=true;const original=f.plugin.assistantTask;f.plugin.assistantTask=async(...args)=>{const result=await original(...args);if(args[1]==='notifications')await new Promise(resolve=>release=resolve);return result;};
+ const pending=delivery.tick();for(let i=0;!release&&i<20;i++)await new Promise(resolve=>setTimeout(resolve,1));assert(release);
+ allowed=false;release();await pending;assert.equal(f.sent.length,0);assert.equal(f.queue.messages[id].state,'queued');assert.equal(f.requests.filter(item=>item.action==='notification-ack').length,0);
+});
+
 test('scheduled rendering rejects reasoning, keeps ordinary text, and acknowledges intentional silence',async t=>{
  const f=fixture(t);assert.equal(assistantNotificationText({kind:'result',textFormat:'wechat-result-text-v2',text:'RESPOND: 该休息了。\n[STICKER:S9]'}),'该休息了。');assert.equal(assistantNotificationText({kind:'result',textFormat:'wechat-result-text-v2',text:'<think>private reasoning</think>\nRESPOND: hi'}),fallback);const id=f.add({text:'SILENT'});await f.delivery.tick();assert.equal(f.queue.messages[id].state,'delivered');assert.equal(f.sent.length,0);
 });

@@ -1,8 +1,9 @@
 import {AssistantNotifications} from './assistant-notifications.mjs';
-import {apply as applyAssistantToolGuard} from './social-tool-restrict.mjs';
+import {apply as applyAssistantToolGuard,bindSocialToolExecutor} from './social-tool-restrict.mjs';
 import {AssistantTasks,ASSISTANT_CONTROLLER,liveTask,taskFault,assistantHelp,formatAssistantTask} from './assistant-tasks.mjs';
 import {createAssistantControl} from './assistant-control.mjs';
 import { activeReaderAccount } from '../../scripts/reader-account-state.mjs';
+import {withUiSelection,assertUiSelectionCurrent,selectedWechat} from './ui-selection-policy.mjs';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -12,6 +13,7 @@ import { pathToFileURL } from 'node:url';
 import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm';
 import {createStickerPoolReviewer} from './sticker-pool-review.mjs';
 import { imageBlocks, offloadCompletedImages, offloadCompletedSessionImages } from './image-input.mjs';
+import {mediaBlocks} from './media-input.mjs';
 import {boundedTask} from './deadline.mjs';
 import { BEHAVIOR_POLICY, MAX_RPC_BYTES, localPersona, assertLocalPersona } from './local-policy.mjs';
 import { bindWebReader, createWebReaderTurn, webReaderInstructions, builtinWebReader } from './web-reader.mjs';
@@ -22,7 +24,10 @@ import {ASSISTANT_ACCESS,assistantSenderAllowed,assistantGroupChatAllowed,assist
 import {conversationAccess,allowedConversation} from './conversation-policy.mjs';
 import {readWorkMode,createWorkModeSlots,scopeHistory,assistantChatInstructionsFor,ASSISTANT_PRESET,WORK_MODE_POLICY} from './work-modes.mjs';
 import {createSessionGroups,groupFault} from './session-groups.mjs';
-import {API_VERSION,HOST_RUNTIME,HOST_FEATURES,PERMISSIONS,CONTRACT_REVISION} from '../plugin-api/contract.mjs';
+function selectedConfig(root) {
+  const config=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));
+  return {...config,wechat:selectedWechat(root,config.wechat)};
+}
 const runtimeQuery=new URL(import.meta.url).search;
 const {nativeMemorySummaries}=await import(new URL('./memory-summary.mjs'+runtimeQuery,import.meta.url));
 const {AssistantThinkingFeedback,createProgressWriter}=await import(new URL('./assistant-feedback.mjs'+runtimeQuery,import.meta.url));
@@ -36,7 +41,7 @@ const {contextPolicy,contextRowsIdle,contextBufferVersion}=await import(new URL(
 const {HistoryStore}=await import(new URL('./history-store.mjs'+runtimeQuery,import.meta.url));
 const {readHistoryPolicy:baseHistoryPolicy,sessionSize,rotationReason}=await import(new URL('./history-policy.mjs'+runtimeQuery,import.meta.url));
 const {bindHistory,summarizeHistory,recordSessionUsage}=await import(new URL('./history-runtime.mjs'+runtimeQuery,import.meta.url));
-const {REQUEST_WINDOW_MODE,NATIVE_PREFIX_POLICY,APPEND_WINDOW_POLICY,CACHE_LAYOUT,fixedWindowPrefix,inspectWindowSystemPrefix,bindWindowSystemPrefix,recentWindow,windowRecord,appendWindow,dedupeWindowReply,resetWindow,updateWindow,windowTailMessage,describeWindowRequest,displayHistoryPages,selectWakeWindow,omitWakeReplyEcho}=await import(new URL('./request-window.mjs'+runtimeQuery,import.meta.url));
+const {REQUEST_WINDOW_MODE,NATIVE_PREFIX_POLICY,APPEND_WINDOW_POLICY,CACHE_LAYOUT,fixedWindowPrefix,bindWindowSystemPrefix,recentWindow,windowRecord,appendWindow,dedupeWindowReply,resetWindow,updateWindow,windowTailMessage,describeWindowRequest,displayHistoryPages,selectWakeWindow,omitWakeReplyEcho}=await import(new URL('./request-window.mjs'+runtimeQuery,import.meta.url));
 
 const readHistoryPolicy=(root,key,chatOnly=false)=>{const value=baseHistoryPolicy(root,key);return !chatOnly&&readWorkMode(root,key)==='assistant'?{...value,enabled:false}:value;};
 export const name = 'dsh-social-bridge-plugin';
@@ -114,8 +119,8 @@ export function apply(ctx, config={}) {
   const root = config.projectRoot ? path.resolve(config.projectRoot) : path.resolve(import.meta.dirname,'..','..');
   const loadedAccount = activeReaderAccount(root);
   const accountReady = () => activeReaderAccount(root).id === loadedAccount.id;
-  const chatInputAllowed=(key,sender)=>readWorkMode(root,key)==='assistant'&&assistantGroupChatAllowed(JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat,key,sender??'');
-  const acceptsInput=(key,sender)=>internalGroupChat?chatInputAllowed(key,sender):assistantSenderAllowed(JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat,key,sender);
+  const chatInputAllowed=(key,sender)=>readWorkMode(root,key)==='assistant'&&assistantGroupChatAllowed(selectedConfig(root).wechat,key,sender??'');
+  const acceptsInput=(key,sender)=>internalGroupChat?chatInputAllowed(key,sender):assistantSenderAllowed(selectedConfig(root).wechat,key,sender);
   const chatCwd=internalGroupChat?path.join(root,'state/assistant-group-chat',loadedAccount.id||loadedAccount.legacyId||'legacy','workspace'):null;
   if(chatCwd)fs.mkdirSync(chatCwd,{recursive:true});
   const sidScope = loadedAccount.id && loadedAccount.id !== loadedAccount.legacyId ? loadedAccount.id : '';
@@ -140,7 +145,6 @@ export function apply(ctx, config={}) {
   const historyBindings=new Map();
   const windowStates=new Map();
   const fixedPrefixBindings=new Map();
-  let presetStopped=false;
   const history=scopeHistory(new HistoryStore(root,loadedAccount.id||loadedAccount.legacyId),key=>profiles[key]?.workMode??'social',internalGroupChat?{fixedMode:'assistant-chat'}:{});
   const memberMemory=createMemberMemory({root,accountScope:loadedAccount.id||loadedAccount.legacyId,isAllowed:accountReady});
   const pluginRowsForDate=(key,date)=>{
@@ -216,7 +220,7 @@ export function apply(ctx, config={}) {
     }
   }
   function idleContext(key, version) {
-    const settings = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8').replace(/^\uFEFF/, ''));
+    const settings = selectedConfig(root);
     const policy = contextPolicy(settings.wechat, key);
     if (!policy.enabled) return { policy, reason: 'disabled' };
     const file = path.join(root, 'state/social-messages.json');
@@ -278,47 +282,28 @@ export function apply(ctx, config={}) {
     }
     return false;
   }
-  function preserveSessionMapping(key,sid,reason='SYSTEM_HEAD_MISSING') {
-    if(!['SYSTEM_HEAD_MISSING','NATIVE_PREFIX_REPAIR'].includes(reason))throw Error('SESSION_RECOVERY_REASON_INVALID');
+  function preserveSessionMapping(key,sid) {
     if(!/^social-[a-f0-9]{32}$/.test(sid))throw Error('SESSION_RECOVERY_ID_INVALID');
     const folder=path.join(root,'state/dsh-session-recovery');
     fs.mkdirSync(folder,{recursive:true});
     if(fs.lstatSync(folder).isSymbolicLink())throw Error('SESSION_RECOVERY_PATH_INVALID');
-    const file=path.join(folder,sid+(reason==='SYSTEM_HEAD_MISSING'?'':'.prefix')+'.json');
-    const backup={version:1,reason,conversationKey:key,sessionId:sid,createdAt:Date.now(),profile:profiles[key]??null};
+    const file=path.join(folder,sid+'.json');
+    const backup={version:1,reason:'SYSTEM_HEAD_MISSING',conversationKey:key,sessionId:sid,createdAt:Date.now(),profile:profiles[key]??null};
     try{fs.writeFileSync(file,JSON.stringify(backup,null,2),{flag:'wx',mode:0o600});}
     catch(error){
       if(error.code!=='EEXIST')throw error;
       const stat=fs.lstatSync(file);
       if(!stat.isFile()||stat.isSymbolicLink()||stat.size>2*1024*1024)throw Error('SESSION_RECOVERY_BACKUP_INVALID');
       const prior=JSON.parse(fs.readFileSync(file,'utf8'));
-      if(prior.sessionId!==sid||prior.conversationKey!==key||prior.reason!==reason)throw Error('SESSION_RECOVERY_BACKUP_INVALID');
+      if(prior.sessionId!==sid||prior.conversationKey!==key||prior.reason!=='SYSTEM_HEAD_MISSING')throw Error('SESSION_RECOVERY_BACKUP_INVALID');
     }
     // DSH's original compressed history stays in its original directory.
     // This checkpoint preserves the old mapping/profile without rewriting it.
     return path.relative(root,file).replaceAll('\\','/');
   }
-  // A registered bridge can precede the preset patch during DSH startup.
-  // Retry discovery once, before allocating a session or admitting any task.
-  async function resolvePresetReady(id){
-    for(let attempt=0;attempt<2;attempt++){
-      if(presetStopped)throw taskFault('plugin_stopped',503);
-      try{
-        const selected=await ctx.agentPresets.resolve(id);
-        if(presetStopped)throw taskFault('plugin_stopped',503);
-        if(!selected)throw Object.assign(Error('Unknown agent preset'),{code:'agent-preset/not-found'});
-        return selected;
-      }catch(error){
-        const missing=error?.code==='agent-preset/not-found'||/\bUnknown agent preset\b/.test(String(error?.message??''));
-        if(!missing)throw error;
-        if(attempt===1)throw taskFault('AGENT_PRESET_NOT_READY',503);
-        await new Promise(resolve=>setTimeout(resolve,1000));
-      }
-    }
-  }
   async function agentFor(key,requestedPreset=presetFor(key)) {
     const preset=requestedPreset;
-    const selected=await resolvePresetReady(preset);
+    const selected=await ctx.agentPresets.resolve(preset);
     if(selected?.id!==preset)throw new Error('Required safe preset unavailable');
     const previousSid=mappings[key], previousGeneration=profiles[key]?.generation ?? 0;
     const archived=new Set(ctx.get?.('workspaceRegistry')?.archivedSessionIds ?? []);
@@ -433,6 +418,7 @@ export function apply(ctx, config={}) {
     });
   }
   async function bindConversationTools(agent,key,sid){
+    bindSocialToolExecutor(agent.ctx,agent);
     if(internalGroupChat){Object.defineProperty(agent.ctx,ASSISTANT_ACCESS,{configurable:true,value:()=>false});applyAssistantToolGuard(agent.ctx);return;}
     if(!webReaderBindings.has(sid))webReaderBindings.set(sid,bindWebReader(agent.ctx,root,key,()=>pending.get(sid)?.webReaderTurn));
     const extension = await extensions();
@@ -447,14 +433,14 @@ export function apply(ctx, config={}) {
       if(typeof web?.search!=='function')throw Object.assign(Error('Native search unavailable'),{code:'WEB_PROVIDER_UNAVAILABLE'});
       return ctx.agents.withInitiator(agent,()=>web.search(request,signal));
     }}));
-    Object.defineProperty(agent.ctx,ASSISTANT_ACCESS,{configurable:true,value:()=>!internalGroupChat&&(readWorkMode(root,key)!=='assistant'||assistantSenderAllowed(JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat,key,pending.get(sid)?.assistantSender))});
+    Object.defineProperty(agent.ctx,ASSISTANT_ACCESS,{configurable:true,value:()=>{const item=pending.get(sid);try{return withUiSelection(root,item?.uiSelectionScope,key,()=>readWorkMode(root,key)!=='assistant'||assistantSenderAllowed(selectedConfig(root).wechat,key,item?.assistantSender));}catch{return false;}}});
     if(!fileBindings.has(sid))fileBindings.set(sid,bindFileTools(agent.ctx,root,key,agent,()=>pending.get(sid)?.fileTurn,{isAllowed:()=>accountReady()&&agent.ctx[ASSISTANT_ACCESS]?.()!==false}));
     if(!dshBindings.has(sid))dshBindings.set(sid,bindDshAccess(agent.ctx,ctx,agent,root,key,()=>pending.get(sid)?.dshAccessTurn,{isAllowed:accountReady}));
     if(!memeBindings.has(sid))memeBindings.set(sid,bindMemeLibrary(agent.ctx,memeLibrary,root,key,()=>pending.get(sid)?.memeTurn,{isAllowed:accountReady}));
     if(!memberMemoryBindings.has(sid))memberMemoryBindings.set(sid,bindMemberMemory(agent.ctx,memberMemory,key,()=>pending.get(sid)?.memberMemoryTurn));
     if(!historyBindings.has(sid))historyBindings.set(sid,bindHistory(agent.ctx,history,root,key,()=>pending.get(sid)?.webReaderTurn,accountReady));
   }
-  async function configure(key,body,{repairPrefix=false}={}) {
+  async function configure(key,body) {
     const workMode=readWorkMode(root,key);
     if(body.workMode!==undefined&&body.workMode!==workMode)throw Error('BEHAVIOR_CHANGE_NOT_ALLOWED');
     const locked=localPersona(root,key);assertLocalPersona(body,locked);
@@ -470,10 +456,7 @@ export function apply(ctx, config={}) {
     const previous=profiles[key] ?? {};
     const instructions=internalGroupChat?assistantChatInstructionsFor(root,body.replyMaxMessages):stableChatInstructions(root,key,{maxMessages:body.replyMaxMessages}),instructionsDigest=hash(instructions);
     profiles[key]={...previous,...(workMode==='assistant'?{nativePreset:presetFor(key)}:{}),persona,digest,instructions,instructionsDigest,personaName:clean(locked.personaName,24),conversationName:clean(body.conversationName ?? previous.conversationName),cache:previous.digest===digest && previous.instructionsDigest===instructionsDigest && previous.behaviorPolicy===BEHAVIOR_POLICY && previous.coherencePolicy===COHERENCE_POLICY ? previous.cache ?? {} : {},behaviorPolicy:BEHAVIOR_POLICY,coherencePolicy:COHERENCE_POLICY};
-    const fault=profiles[key].nativePrefixRecovery;
-    const repairing=repairPrefix||fault?.status==='required'&&(fault.attempts??0)<1;
-    const nativePrefix=syncFixedPrefix(key,agent,{force:repairing});
-    if(repairing&&nativePrefix)profiles[key].nativePrefixRecovery={...fault,status:'rebound',attempts:(fault?.attempts??0)+1,expectedDigest:hash(fixedWindowPrefix(profiles[key])),source:repairPrefix?'manual':'automatic',reboundAt:Date.now()};
+    syncFixedPrefix(key,agent);
     reconcilePersona(session, profiles[key]);
     offloadCompletedSessionImages(session);
     retireSearchContext(session);
@@ -494,10 +477,10 @@ export function apply(ctx, config={}) {
   }
   function windowPolicy(key){const policy=readHistoryPolicy(root,key,internalGroupChat);return policy.enabled&&policy.mode==='window'?policy:null;}
   function disposeFixedPrefix(sid){fixedPrefixBindings.get(sid)?.dispose?.();fixedPrefixBindings.delete(sid);}
-  function syncFixedPrefix(key,agent,{force=false}={}){
+  function syncFixedPrefix(key,agent){
     const sid=String(agent.session.id),preset=presetFor(key),enabled=preset==='wechat-social'&&key.startsWith('wechat:')&&!!windowPolicy(key);
     if(!enabled){
-      disposeFixedPrefix(sid);delete profiles[key].nativeSystemPrefix;delete profiles[key].nativePrefixRecovery;
+      disposeFixedPrefix(sid);delete profiles[key].nativeSystemPrefix;
       // A former system-prefix window is only a reference, not a user persona
       // initialization. Keep its evidence when returning to bounded mode.
       const active=new Set(agent.session.surface.nodes);
@@ -510,7 +493,7 @@ export function apply(ctx, config={}) {
     const mounted=ctx.agentPresets.composedPreset?.(agent.ctx)??agent.session.header.agentPreset;
     if(mounted!==presetFor(key))throw Error('HISTORY_NATIVE_PREFIX_PRESET_INVALID');
     const previous=fixedPrefixBindings.get(sid);
-    if(previous?.agent!==agent||force){
+    if(previous?.agent!==agent){
       disposeFixedPrefix(sid);
       const dispose=bindWindowSystemPrefix(agent.ctx,()=>accountReady()&&mappings[key]===sid&&windowPolicy(key)?profiles[key]:null);
       fixedPrefixBindings.set(sid,{agent,dispose});
@@ -690,9 +673,7 @@ export function apply(ctx, config={}) {
       search.lastWebReads=reads;
       return result;
     }
-    if(!(internalGroupChat&&profile))return result;
-    const {toolChoice:unusedToolChoice,...toolFree}=result;
-    return {...toolFree,tools:[]};
+    return internalGroupChat&&profile?{...result,tools:[],toolChoice:undefined}:result;
   },{global:true});
   ctx.on('session/event',(session,event)=>{
     const sid=String(session.id), key=keyFor(sid);
@@ -742,6 +723,8 @@ export function apply(ctx, config={}) {
     item.webReaderTurn?.controller.abort();
     const reason=event.data.reason?.kind, failure=event.data.reason?.error;
     const output=reason==='completed'?{text:turn?.text ?? '',sessionId:sid}:{error:'turn_'+(reason ?? 'failed'),sessionId:sid,...(item.admitted?{admitted:true}:{}),...(failure?.code?{code:String(failure.code)}:{}),...(failure?.message?{detail:String(failure.message).slice(0,2000)}:{})};
+    if(!output.error&&item.webReaderTurn?.allowHistoryQuote&&Object.keys(item.webReaderTurn.historyQuoteRefs??{}).length)
+      output.historyQuoteRefs=item.webReaderTurn.historyQuoteRefs;
     if(item.batchId&&(!output.error||item.admitted)){
       const cache=profiles[key].cache ??= {};cache[item.batchId]={digest:profiles[key].digest,replyFormat:'final-message-v1',output};
       for(const id of Object.keys(cache).slice(0,-20))delete cache[id];saveQuietly();
@@ -759,13 +742,8 @@ export function apply(ctx, config={}) {
     const chars=JSON.stringify(messages).length+JSON.stringify(options.tools??[]).length;
     if(chars>windowPolicy(key).maxContextChars)throw Error('HISTORY_WINDOW_REQUEST_TOO_LARGE');
     const prefix=window.source.socialInputWindow;
-    const checked=inspectWindowSystemPrefix(messages,profiles[key]),system=checked.text;
-    if(prefix.prefixPlacement==='native-system'&&!checked.matches){
-      const prior=profiles[key].nativePrefixRecovery;
-      profiles[key].nativePrefixRecovery={status:'required',code:'HISTORY_NATIVE_PREFIX_MISSING',expectedDigest:checked.expectedDigest,actualDigest:checked.actualDigest,attempts:prior?.expectedDigest===checked.expectedDigest?prior.attempts??0:0,at:Date.now()};
-      saveQuietly();throw Error('HISTORY_NATIVE_PREFIX_MISSING');
-    }
-    if(prefix.prefixPlacement==='native-system'&&profiles[key].nativePrefixRecovery&&profiles[key].nativePrefixRecovery.status!=='verified')profiles[key].nativePrefixRecovery={...profiles[key].nativePrefixRecovery,status:'verified',verifiedAt:Date.now()};
+    const system=messages[0]?.role==='system'?(messages[0].content??[]).filter(block=>block.type==='text').map(block=>block.text).join(''):'';
+    if(prefix.prefixPlacement==='native-system'&&!system.includes(fixedWindowPrefix(profiles[key])))throw Error('HISTORY_NATIVE_PREFIX_MISSING');
     const item=pending.get(String(options.sessionId)),observations=profiles[key].windowRequests??=[];
     profiles[key].windowRequest={mode:REQUEST_WINDOW_MODE,...describeWindowRequest(messages,options.tools,observations.at(-1)),strategy:prefix.strategy??'rolling',reused:prefix.reused??false,resetReason:prefix.resetReason,maxRecords:prefix.maxRecords,duplicateReplyCharsRemoved:messages.reduce((n,message)=>n+(message.source?.socialWindowReplyDedup??0),0),chars,messages:messages.length,recentRecords:prefix.recentRecords,contextSelection:prefix.selection??null,prefixDigest:prefix.prefixDigest,prefixChars:prefix.prefixChars,prefixPlacement:prefix.prefixPlacement,systemChars:system.length,systemDigest:hash(system),toolSchemaHash:hash(JSON.stringify(options.tools??[])).slice(0,16),toolNames:(options.tools??[]).map(tool=>tool.name),purpose:item?.repairContinuation?'format-repair':'chat',turn:windowStates.get(String(options.sessionId))?.turn,at:Date.now()};
     observations.push(profiles[key].windowRequest);if(observations.length>20)observations.splice(0,observations.length-20);if(item)item.cacheObservation=profiles[key].windowRequest;
@@ -773,6 +751,9 @@ export function apply(ctx, config={}) {
   },{global:true});
 
   async function nativeRequest(route,body,requestController=new AbortController(),onAdmitted=()=>{}) {
+    return withUiSelection(root,body.uiSelectionScope,String(body.conversationKey??''),()=>nativeRequestScoped(route,body,requestController,onAdmitted));
+  }
+  async function nativeRequestScoped(route,body,requestController,onAdmitted) {
     const key=String(body.conversationKey??'');let message=String(body.message??'');
     if(!KEY.test(key)||route==='/followup'&&(!message||message.length>18000))throw taskFault('invalid_request',400);
     if(['/'+'followup','/configure'].includes(route)&&readWorkMode(root,key)==='assistant'&&profiles[key]?.workMode==='assistant'&&mappings[key]&&(profiles[key].nativePreset??ASSISTANT_PRESET)!==presetFor(key)){
@@ -785,33 +766,20 @@ export function apply(ctx, config={}) {
     }
       return serialize(key,async()=>{
         requestController.signal.throwIfAborted();
+        assertUiSelectionCurrent();
         if(route==='/context-maintenance')return maintainContext(key,body);
-        if(route==='/followup'&&readWorkMode(root,key)==='assistant'){const w=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat;if(!acceptsInput(key,body.assistantSender))throw Error('ASSISTANT_SENDER_DENIED');}
-        const repairing=route==='/repair-context';let repairBackup;
-        if(repairing){
-          if(body.confirmed!==true)throw Error('HISTORY_REPAIR_CONFIRM_REQUIRED');
-          if(!accountReady())throw Error('HISTORY_ACCOUNT_CHANGED');
-          const w=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,'' )).wechat;
-          if(!allowedConversation(w,key))throw Error('HISTORY_REPAIR_CHAT_NOT_ALLOWED');
-          const expected=mappings[key];
-          if(!expected||body.expectedSessionId!==expected)throw Error('HISTORY_REPAIR_SESSION_CHANGED');
-          if(pending.has(expected)||ctx.agents.get(expected)?.status==='running')throw Error('session_busy');
-          if(!windowPolicy(key)||presetFor(key)!=='wechat-social')throw Error('HISTORY_REPAIR_UNAVAILABLE');
-          repairBackup=preserveSessionMapping(key,expected,'NATIVE_PREFIX_REPAIR');
-        }
-        let {sid,agent}=await configure(key,repairing?{}:body,{repairPrefix:repairing});
-        if(repairing)profiles[key].nativePrefixRecovery.backup=repairBackup;
+        if(route==='/followup'&&readWorkMode(root,key)==='assistant'){const w=selectedConfig(root).wechat;if(!acceptsInput(key,body.assistantSender))throw Error('ASSISTANT_SENDER_DENIED');}
+        let {sid,agent}=await configure(key,body);
         requestController.signal.throwIfAborted();
         if(pending.has(sid))throw new Error('session_busy');
-        if(route==='/configure'||repairing){
+        if(route==='/configure'){
           const policy=windowPolicy(key);
           if(policy&&agent.session.surface.nodes.length){
             history.archiveSession(key,agent.session);backfillHistory(key);await restoreWindowDisplay(key,agent,policy);
             resetWindow(agent.session,profiles[key],{recent:recentWindow(history.windowRows(key,policy),policy),nativeSystemPrefix:fixedPrefixBindings.has(sid),compactSeq:contextState(agent.session,profiles[key].digest,profiles[key].instructionsDigest).compactSeq},createUserMessage);
             await ctx.sessions.flush(agent.session);saveQuietly();
           }
-          if(repairing){requestController.signal.throwIfAborted();if(!accountReady())throw Error('HISTORY_ACCOUNT_CHANGED');}
-          return {ok:true,sessionId:sid,title:profiles[key].title,...personaStats(agent.session),recovery:profiles[key].recovery??null,...(repairing?{repaired:true,historyRetained:true,prefixRecovery:profiles[key].nativePrefixRecovery}:{})};
+          return {ok:true,sessionId:sid,title:profiles[key].title,...personaStats(agent.session),recovery:profiles[key].recovery??null};
         }
         if(route==='/compact'){
           if(windowPolicy(key)){
@@ -852,6 +820,8 @@ export function apply(ctx, config={}) {
         const networkOptOut=repairContinuation||body.searchOptOut===true||/^(?:不要|不用|别)(?:联网|搜索|查)/.test(message.trim());
         const webReaderTurn=createWebReaderTurn(message,networkOptOut?[]:body.webReaderUrls);
         webReaderTurn.historyCalls=repairContinuation?2:0;
+        webReaderTurn.allowHistoryQuote=body.allowHistoryQuote===true&&!!body.uiSelectionScope&&!repairContinuation;
+        webReaderTurn.allowRichHistoryQuote=webReaderTurn.allowHistoryQuote&&body.allowRichHistoryQuote===true;
         requestController.signal.addEventListener('abort',()=>webReaderTurn.controller.abort(requestController.signal.reason),{once:true});
         const memberMemoryTurn=memberMemory.openTurn(key,body.memberObservations??[],webReaderTurn.controller);
         if(memberMemoryTurn.error)log.warn('group member memory unavailable:',memberMemoryTurn.error);
@@ -859,6 +829,7 @@ export function apply(ctx, config={}) {
         const modelSearchTurn=createModelSearchTurn({webTurn:webReaderTurn,optOut:networkOptOut,privateNames:body.searchPrivateNames,prefetchedSearches:search?.searches??0});
         const imageStarted=Date.now();
         const images=await imageBlocks(ctx,root,key,body.images ?? [],provider,model,{signal:webReaderTurn.controller.signal,onUnavailable:failure=>log.warn('attachment unavailable:',failure.code)});
+        images.push(...await mediaBlocks(ctx,root,key,body.media??[],provider,model,{signal:webReaderTurn.controller.signal,maxImageFrames:Math.max(0,4-images.filter(item=>item.type==='image').length),onUnavailable:failure=>log.warn('media unavailable:',failure.code)}));
         if(body.images?.length)log.info('image preparation:',JSON.stringify({count:body.images.length,ready:images.filter(item=>item.type==='image').length,elapsedMs:Date.now()-imageStarted}));
         const extension=await extensions();
         const extensionTurn={conversationKey:key,conversationName:profiles[key].conversationName,actorId:body.assistantSender??body.pluginSender??'',sessionId:sid,replies:[],toolCalls:0,networkOptOut};
@@ -869,7 +840,7 @@ export function apply(ctx, config={}) {
         const memeTurn={controller:webReaderTurn.controller,networkOptOut,calls:0,choices:[],allowedUrls:webReaderTurn.urls,disabled:body.memeLibraryDisabled===true};
         const output=await new Promise((resolve,reject)=>{
           const firstImageSeq=agent.session.snapshotEvents().length;
-          const item={resolve,reject,startedAt:Date.now(),taskId:body.assistantTaskId,assistantSender:body.assistantSender,fileTurn:{controller:webReaderTurn.controller,sender:body.assistantSender,batchId,files:Array.isArray(body.files)?body.files.filter(file=>/^[a-f0-9]{64}$/.test(file?.id??'')&&typeof file.name==='string'&&file.name.length<=180&&Number.isSafeInteger(file.size)&&file.size>=0&&file.size<=50*1024*1024).slice(0,3):[],calls:0},batchId,historyExcludeIds,recentWindow:recent,contextSelection:selectedWindow?.selection,repairContinuation,onAdmitted:()=>{onAdmitted();}};
+          const item={resolve,reject,startedAt:Date.now(),taskId:body.assistantTaskId,assistantSender:body.assistantSender,uiSelectionScope:body.uiSelectionScope,fileTurn:{controller:webReaderTurn.controller,sender:body.assistantSender,selectionScope:body.uiSelectionScope,batchId,files:Array.isArray(body.files)?body.files.filter(file=>/^[a-f0-9]{64}$/.test(file?.id??'')&&typeof file.name==='string'&&file.name.length<=180&&Number.isSafeInteger(file.size)&&file.size>=0&&file.size<=50*1024*1024).slice(0,3):[],calls:0},batchId,historyExcludeIds,recentWindow:recent,contextSelection:selectedWindow?.selection,repairContinuation,onAdmitted:()=>{onAdmitted();}};
           const cancel=error=>{
             if(pending.get(sid)!==item)return;
             clearTimeout(item.timer);
@@ -888,7 +859,7 @@ export function apply(ctx, config={}) {
           requestController.signal.addEventListener('abort',()=>cancel(requestController.signal.reason??new Error('request_closed')),{once:true});
           webReaderTurn.controller.signal.addEventListener('abort',()=>cancel(new Error('request_closed')),{once:true});
           if(webReaderTurn.controller.signal.aborted){cancel(new Error('request_closed'));return;}
-          try{if(readWorkMode(root,key)==='assistant'&&!acceptsInput(key,body.assistantSender))throw Error('ASSISTANT_SENDER_DENIED');agent.followup(createUserMessage({content:[{type:'text',text:message+'\n'+SOCIAL_FINAL_OUTPUT_HINT},...images],source:{kind:'wechat-social-bridge',form:'relay',...(batchId?{socialBatchId:batchId}:{}),...(repairContinuation?{socialFormatRepair:true}:{}),...(historyExcludeIds.length?{socialArchiveRowIds:historyExcludeIds}:{}),...(images.length?{socialImageIds:body.images.map(image=>image.id)}:{})}}));}
+          try{assertUiSelectionCurrent();if(readWorkMode(root,key)==='assistant'&&!acceptsInput(key,body.assistantSender))throw Error('ASSISTANT_SENDER_DENIED');agent.followup(createUserMessage({content:[{type:'text',text:message+'\n'+SOCIAL_FINAL_OUTPUT_HINT},...images],source:{kind:'wechat-social-bridge',form:'relay',...(batchId?{socialBatchId:batchId}:{}),...(repairContinuation?{socialFormatRepair:true}:{}),...(historyExcludeIds.length?{socialArchiveRowIds:historyExcludeIds}:{}),...(images.length?{socialImageIds:[...(body.images??[]),...(body.media??[])].map(image=>image.id)}:{})}}));}
           catch(error){webReaderTurn.controller.abort();clearTimeout(item.timer);pending.delete(sid);turns.delete(sid);staged.delete(sid);reject(error);}
         });
         offloadCompletedSessionImages(agent.session);
@@ -915,6 +886,7 @@ export function apply(ctx, config={}) {
   async function adoptScheduledTurn(agent,key,decision){
     const sid=String(agent.session.id),owner=assistantNotifications.scheduleOwner(sid,decision.messages);
     if(!owner||ctx.agentPresets.composedPreset?.(agent.ctx)!==presetFor(key))throw taskFault('ASSISTANT_BACKGROUND_OWNER_UNAVAILABLE');
+    if(assistantTasks.get(owner.taskId)?.request?.uiSelectionScope!==undefined)throw taskFault('UI_ASYNC_UNSUPPORTED');
     if(presetFor(key)!==ASSISTANT_PRESET)applyAssistantToolGuard(agent.ctx);
     await bindConversationTools(agent,key,sid);
     const batchId=hash('native-schedule:'+sid+':'+decision.messages.map(message=>message.id).join(':'));
@@ -930,46 +902,36 @@ export function apply(ctx, config={}) {
     return {...decision,messages:decision.messages.map(message=>({...message,content:[...message.content,{type:'text',text:SOCIAL_FINAL_OUTPUT_HINT+' 本次是到期通知，直接给出应发送的提醒或任务结果；本轮没有候选表情，不使用历史 [STICKER:编号]，不输出后台任务编号或 completed 系统播报。'}]}))};
   }
   let thinkingFeedback;
-  const assistantTasks=new AssistantTasks({file:path.join(root,'state/assistant-tasks',loadedAccount.id||loadedAccount.legacyId||'legacy',internalGroupChat?'group-chat-tasks.json':'tasks.json'),allowed:(key,sender)=>accountReady()&&readWorkMode(root,key)==='assistant'&&assistantSenderAllowed(JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat,key,sender),execute:(body,signal)=>{const controller=new AbortController();if(signal.aborted)controller.abort(signal.reason);else signal.addEventListener('abort',()=>controller.abort(signal.reason),{once:true});const stopFeedback=thinkingFeedback.start(body.assistantTaskId,signal);return nativeRequest('/followup',body,controller).catch(error=>{if(signal.aborted)throw error;return {error:'agent_unavailable',detail:String(error.message).slice(0,200),admitted:error.admitted===true,...(error.imageError?{imageError:error.imageError}:{})};}).finally(stopFeedback);}});
-  thinkingFeedback=new AssistantThinkingFeedback({root,tasks:assistantTasks,generate:createProgressWriter({ctx,provider,model,createUserMessage,BlockAssembler,recordUsage:row=>history.putUsage(row)}),styleFor:job=>profiles[job.key]?.persona??'',isAllowed:job=>!internalGroupChat&&accountReady()&&readWorkMode(root,job.key)==='assistant'&&acceptsInput(job.key,job.sender)});
-  const assistantNotifications=new AssistantNotifications(path.join(root,'state/assistant-tasks',loadedAccount.id||loadedAccount.legacyId||'legacy',internalGroupChat?'group-chat-notifications.json':'notifications.json'),(key,sender)=>accountReady()&&readWorkMode(root,key)==='assistant'&&assistantSenderAllowed(JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat,key,sender));
-  const assistantControl=createAssistantControl({ctx,root,tasks:assistantTasks,accountReady,sessionGroups,mappings,profiles,pending,notifications:assistantNotifications,beforeSubmit:key=>resolvePresetReady(readDshAccess(root,key).preset??ASSISTANT_PRESET)});
+  const assistantTasks=new AssistantTasks({file:path.join(root,'state/assistant-tasks',loadedAccount.id||loadedAccount.legacyId||'legacy',internalGroupChat?'group-chat-tasks.json':'tasks.json'),allowed:(key,sender,request)=>{try{return withUiSelection(root,request?.uiSelectionScope,key,()=>accountReady()&&readWorkMode(root,key)==='assistant'&&assistantSenderAllowed(selectedConfig(root).wechat,key,sender));}catch{return false;}},execute:(body,signal)=>{const controller=new AbortController();if(signal.aborted)controller.abort(signal.reason);else signal.addEventListener('abort',()=>controller.abort(signal.reason),{once:true});const stopFeedback=thinkingFeedback.start(body.assistantTaskId,signal);return nativeRequest('/followup',body,controller).catch(error=>{if(signal.aborted)throw error;return {error:'agent_unavailable',detail:String(error.message).slice(0,200),admitted:error.admitted===true,...(error.imageError?{imageError:error.imageError}:{})};}).finally(stopFeedback);}});
+  thinkingFeedback=new AssistantThinkingFeedback({root,tasks:assistantTasks,generate:createProgressWriter({ctx,provider,model,createUserMessage,BlockAssembler,recordUsage:row=>history.putUsage(row)}),styleFor:job=>profiles[job.key]?.persona??'',isAllowed:job=>!internalGroupChat&&job.request?.uiSelectionScope===undefined&&accountReady()&&readWorkMode(root,job.key)==='assistant'&&acceptsInput(job.key,job.sender)});
+  const assistantNotifications=new AssistantNotifications(path.join(root,'state/assistant-tasks',loadedAccount.id||loadedAccount.legacyId||'legacy',internalGroupChat?'group-chat-notifications.json':'notifications.json'),(key,sender)=>accountReady()&&readWorkMode(root,key)==='assistant'&&assistantSenderAllowed(selectedConfig(root).wechat,key,sender));
+  const rawAssistantControl=createAssistantControl({ctx,root,tasks:assistantTasks,accountReady,sessionGroups,mappings,profiles,pending,notifications:assistantNotifications});
+  const assistantControl=(action,body)=>withUiSelection(root,body.uiSelectionScope,String(body.conversationKey??''),()=>rawAssistantControl(action,body));
+  assistantControl.dispose=()=>rawAssistantControl.dispose();
   if(!internalGroupChat)assistantTasks.pump();
   const server=http.createServer(async(req,res)=>{
     const reply=(code,body)=>{if(!res.destroyed){res.writeHead(code,{'content-type':'application/json; charset=utf-8'});res.end(JSON.stringify(body));}};
     const supplied=Buffer.from(String(req.headers.authorization ?? '').replace(/^Bearer /i,'')), expected=Buffer.from(token);
     if(supplied.length!==expected.length || !crypto.timingSafeEqual(supplied,expected))return reply(401,{error:'unauthorized'});
-    if(req.method==='GET' && req.url==='/health')return reply(200,{ok:accountReady(),instanceId,instanceStartedAt,assistantGroupChat:'read-only-member-channel-v1',offlineReplay:'skip-old-v1',accountScope:loadedAccount.id,messageSource:'wechat-social-bridge',project:'WeChatAgent',projectRoot:root,extensionApiVersion:API_VERSION,pluginApiVersion:API_VERSION,pluginRuntime:HOST_RUNTIME,pluginHostFeatures:HOST_FEATURES,pluginPermissions:PERMISSIONS,pluginContractRevision:CONTRACT_REVISION,voiceInput:'feature-route-v1',diaryQuestion:'feature-route-v1',assistantAccess:'sender-admin-v1',fileTransfer:'workspace-files-v1',assistantController:ASSISTANT_CONTROLLER,assistantFeedback:'thinking-heartbeat-v1',assistantNotifications:'text-result-v2',replyLayout:'adjustable-parts-v1',provider,model,pluginRevision:new URL(import.meta.url).searchParams.get('wechatagent')??'',workModes:WORK_MODE_POLICY,contextMode:'native-session-v1',historyMode:'external-bounded-v1',requestWindow:REQUEST_WINDOW_MODE,continuousTranscript:true,historyArchive:'account-sqlite-v1',costPolicy:COST_POLICY,inputDedup:'confirmed-window-reply-v1',contextMaintenance:'idle-threshold-v1',promptContext:PROMPT_POLICY,sessionNaming:true,sessionGroups:'dsh-workspace-v1',imageInput:'native-attachment-v1',replyText:'final-message-v1',imageRecovery:'per-image-v1',imageOffloadMode:'after-turn-v1',sessionLifecycle:'archive-rotation-v1',turnRecovery:'cancel-on-timeout-v1',followupDedup:'durable-batch-v1',builtinSkills:'web-reader-v1',webPriceRead:'zxsj-api-v1',searchTool:'model-search-v1',searchRoute:'dsh-native-only-v1',dshAccess:'per-chat-v1',memberMemory:'group-scoped-json-v1',stickerPoolReview:'ds-select-v1',searchBudget:'per-turn-count-v1',searchReasoning:'model-default-v1',toolIsolation:SOCIAL_TOOL_ISOLATION,pendingTurns:pending.size,behaviorPolicy:BEHAVIOR_POLICY,coherencePolicy:COHERENCE_POLICY});
+    if(req.method==='GET' && req.url==='/health')return reply(200,{ok:accountReady(),instanceId,instanceStartedAt,assistantGroupChat:'read-only-member-channel-v1',offlineReplay:'skip-old-v1',accountScope:loadedAccount.id,messageSource:'wechat-social-bridge',project:'WeChatAgent',projectRoot:root,extensionApiVersion:2,pluginApiVersion:2,pluginRuntime:'isolated-v2',pluginHostFeatures:['actions-v1','documents-v1','persona-read-v1','model-utility-v1','daily-schedule-v1'],fishNotebookMode:'optional-plugin-v1',assistantAccess:'sender-admin-v1',fileTransfer:'workspace-files-v1',assistantController:ASSISTANT_CONTROLLER,assistantFeedback:'thinking-heartbeat-v1',assistantNotifications:'text-result-v2',replyLayout:'adjustable-parts-v1',provider,model,pluginRevision:new URL(import.meta.url).searchParams.get('wechatagent')??'',workModes:WORK_MODE_POLICY,contextMode:'native-session-v1',historyMode:'external-bounded-v1',requestWindow:REQUEST_WINDOW_MODE,continuousTranscript:true,historyArchive:'account-sqlite-v1',costPolicy:COST_POLICY,inputDedup:'confirmed-window-reply-v1',contextMaintenance:'idle-threshold-v1',promptContext:PROMPT_POLICY,sessionNaming:true,sessionGroups:'dsh-workspace-v1',imageInput:'native-attachment-v1',mediaInput:'local-transcript-sampled-video-v1',replyText:'final-message-v1',imageRecovery:'per-image-v1',imageOffloadMode:'after-turn-v1',sessionLifecycle:'archive-rotation-v1',turnRecovery:'cancel-on-timeout-v1',followupDedup:'durable-batch-v1',builtinSkills:'web-reader-v1',webPriceRead:'zxsj-api-v1',searchTool:'model-search-v1',searchRoute:'dsh-native-only-v1',dshAccess:'per-chat-v1',memberMemory:'group-scoped-json-v1',stickerPoolReview:'ds-select-v1',searchBudget:'per-turn-count-v1',searchReasoning:'model-default-v1',toolIsolation:SOCIAL_TOOL_ISOLATION,pendingTurns:pending.size,behaviorPolicy:BEHAVIOR_POLICY,coherencePolicy:COHERENCE_POLICY});
     if(!accountReady())return reply(409,{error:'account_changed',detail:'ACCOUNT_SWITCH_REQUIRES_DSH_RESTART'});
-    if(req.method==='POST'&&req.url==='/voice-input'){
-      const controller=new AbortController(),closed=()=>{if(!res.writableEnded)controller.abort();};res.once('close',closed);
-      try{
-        const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>4096)throw Error('VOICE_REQUEST_INVALID');chunks.push(chunk);}
-        const body=JSON.parse(Buffer.concat(chunks)),key=body.conversationKey;
-        if(!/^[a-f0-9]{64}$/.test(body.id??''))throw Error('VOICE_REFERENCE_INVALID');
-        const settings=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));
-        if(!allowedConversation(settings.wechat,key)||internalGroupChat||readWorkMode(root,key)==='assistant'&&!assistantSenderAllowed(settings.wechat,key,body.senderWxid))return reply(403,{ok:false,code:'VOICE_INPUT_NOT_ALLOWED'});
-        const extension=await extensions();if(!extension)return reply(503,{ok:false,code:'VOICE_HOST_UNAVAILABLE'});
-        // voice-input-v1: the one plugin for this chat with audio_read and a transcribe action.
-        const found=await extension.runtime.invokeFeature('voice-input-v1',{id:body.id},{conversationKey:key,actorId:body.senderWxid??'',voiceIds:[body.id]},{signal:controller.signal,timeoutMs:33000});
-        return reply(200,found.handled?{...found.result,plugin:found.plugin}:{ok:false,code:'VOICE_PLUGIN_DISABLED'});
-      }catch(error){const code=error.message==='PLUGIN_FEATURE_CONFLICT'?'VOICE_PLUGIN_CONFLICT':/^VOICE_[A-Z0-9_]{3,80}$/.test(error.message??'')?error.message:'VOICE_INPUT_FAILED';return reply(503,{ok:false,code});}
-      finally{res.removeListener('close',closed);}
-    }
     const pluginActionRoute=/^\/plugin-actions\/([a-z][a-z0-9-]{0,39})\/([a-z][a-z0-9-]{0,19})$/.exec(req.url);
-    if(req.method==='POST'&&(req.url==='/diary-question'||pluginActionRoute)){
-      try{const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>MAX_RPC_BYTES)throw Error('PLUGIN_REQUEST_TOO_LARGE');chunks.push(chunk);}const body=JSON.parse(Buffer.concat(chunks)),key=body.conversationKey,settings=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));if(!allowedConversation(settings.wechat,key))return reply(403,{error:'chat_not_allowed'});
-        const extension=await extensions();if(!extension)return reply(503,{error:'PLUGIN_HOST_UNAVAILABLE'});assertLocalPersona(body,localPersona(root,key));
-        if(pluginActionRoute)return reply(200,await extension.runtime.invokeAction(pluginActionRoute[1],pluginActionRoute[2],body.args??{},{conversationKey:key}));
-        // diary-question-v1: the one plugin for this chat that declares it, holds reply and registers ask.
-        try{const found=await extension.runtime.invokeFeature('diary-question-v1',body.fishNotebookRequest,{conversationKey:key});return reply(200,found.handled?found.result:{handled:false});}
-        catch(error){if(error.message!=='PLUGIN_FEATURE_CONFLICT')throw error;log.warn('diary question left to the normal reply; several plugins handle it:',error.plugins.join(', '));return reply(200,{handled:false});}
-      }catch(error){const code=/^[A-Z0-9_]{3,80}$/.test(error.message??'')?error.message:'PLUGIN_ACTION_FAILED';log.warn('plugin action failed:',code);return reply(503,{error:pluginActionRoute?'PLUGIN_ACTION_UNAVAILABLE':'DIARY_QUESTION_UNAVAILABLE',code});}
+    if(req.method==='POST'&&(['/fish-notebook/ask','/fish-notebook/write'].includes(req.url)||pluginActionRoute)){
+      try{const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>MAX_RPC_BYTES)throw Error('NOTEBOOK_REQUEST_TOO_LARGE');chunks.push(chunk);}const body=JSON.parse(Buffer.concat(chunks)),key=body.conversationKey,settings=selectedConfig(root);
+        return await withUiSelection(root,body.uiSelectionScope,key,async()=>{
+          if(!allowedConversation(settings.wechat,key))return reply(403,{error:'chat_not_allowed'});
+          const extension=await extensions();if(!extension)return reply(503,{error:'NOTEBOOK_HOST_UNAVAILABLE'});assertUiSelectionCurrent();assertLocalPersona(body,localPersona(root,key));
+          // Plugin permissions remain separate. Actions have no background send
+          // channel; a returned reply still belongs to this incoming message.
+          const output=await extension.runtime.invokeAction(pluginActionRoute?.[1]??'fish-notebook',pluginActionRoute?.[2]??(req.url==='/fish-notebook/ask'?'ask':'write-today'),pluginActionRoute?body.args??{}:req.url==='/fish-notebook/ask'?body.fishNotebookRequest:{},{conversationKey:key},{requireReply:req.url==='/fish-notebook/ask'});
+          assertUiSelectionCurrent();return reply(200,output);
+        });
+      }catch(error){const code=/^[A-Z0-9_]{3,80}$/.test(error.message??'')?error.message:'PLUGIN_ACTION_FAILED';log.warn('plugin action failed:',code);return reply(503,{error:pluginActionRoute?'PLUGIN_ACTION_UNAVAILABLE':'NOTEBOOK_UNAVAILABLE',code});}
     }
     if(req.method==='GET'&&req.url.startsWith('/memory/native?')){
       try{
         const key=new URL(req.url,'http://localhost').searchParams.get('conversationKey');
-        const settings=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));
+        const settings=selectedConfig(root);
         if(!allowedConversation(settings.wechat,key))return reply(403,{error:'chat_not_allowed'});
         const slots=[{sid:mappings[key],profile:profiles[key]},...Object.values(modeSessions[key]??{}).map(slot=>({sid:slot.sessionId,profile:slot.profile}))],seen=new Set(),summaries=[];
         for(const {sid,profile} of slots)for(const sessionId of [sid,...(profile?.previousSessions??[]).slice(-20)]){
@@ -1006,22 +968,23 @@ export function apply(ctx, config={}) {
     }
     if(req.method==='GET'&&(req.url==='/dsh-catalog'||req.url.startsWith('/dsh-catalog?'))){try{
       const catalogKey=new URL(req.url,'http://localhost').searchParams.get('conversationKey');
-      if(catalogKey&&!allowedConversation(JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat,catalogKey))return reply(403,{error:'chat_not_allowed'});
+      if(catalogKey&&!allowedConversation(selectedConfig(root).wechat,catalogKey))return reply(403,{error:'chat_not_allowed'});
       let scope=catalogKey?ctx.agents.get(mappings[catalogKey]):undefined;
       if(catalogKey&&(!scope||readWorkMode(root,catalogKey)!==(profiles[catalogKey]?.workMode??'social')))scope=(await serialize(catalogKey,()=>configure(catalogKey,{}))).agent;
       return reply(200,await dshCatalog(ctx,{scope,workMode:catalogKey?readWorkMode(root,catalogKey):'social',cwd:scope?.session.header?.cwd??config.cwd??process.cwd(),signal:AbortSignal.timeout(4000)}));
     }catch{return reply(503,{error:'dsh_catalog_unavailable'});}}
     if(req.method==='GET'&&req.url==='/meme-library/status')return reply(200,await memeLibrary.status());
     if(req.method==='GET' && req.url==='/skills')return reply(200,{skills:[builtinWebReader(),builtinModelSearch()]});
-    if(req.method==='GET' && req.url==='/sessions')return reply(200,{sessions:Object.entries(mappings).map(([key,sid])=>({conversationKey:key,workMode:profiles[key]?.workMode??'social',preservedModes:Object.keys(modeSessions[key]??{}),sessionId:sid,groupId:sessionGroups.groupFor(sid,profiles[key])?.id??null,title:profiles[key]?.title ?? sessionTitle(key),running:pending.has(sid)||ctx.agents.get(sid)?.status==='running',taskStartedAt:pending.get(sid)?.startedAt??null,initializations:profiles[key]?.initializations ?? 0,compactions:profiles[key]?.compactions ?? 0,generation:profiles[key]?.generation ?? 0,previousSessionCount:profiles[key]?.previousSessions?.length ?? 0,usage:readHistoryPolicy(root,key,internalGroupChat).enabled?history.usageSummary(key):null,recovery:profiles[key]?.recovery??null,prefixRecovery:profiles[key]?.nativePrefixRecovery??null,prefixRepairAvailable:!!windowPolicy(key)&&presetFor(key)==='wechat-social',history:readHistoryPolicy(root,key,internalGroupChat).enabled?{mode:windowPolicy(key)?REQUEST_WINDOW_MODE:'external-bounded-v1',request:profiles[key]?.windowRequest??null,requests:profiles[key]?.windowRequests??[],display:profiles[key]?.windowHistoryRestored??null,rotation:profiles[key]?.historyRotation??null,checkpoint:history.checkpoint(key)?.id??null}:null,...contextStatus(key,sid),contextAuto:profiles[key]?.contextAuto ? {status:profiles[key].contextAuto.status,finishedAt:profiles[key].contextAuto.finishedAt,retryAt:profiles[key].contextAuto.retryAt} : null}))});
+    if(req.method==='GET' && req.url==='/sessions')return reply(200,{sessions:Object.entries(mappings).map(([key,sid])=>({conversationKey:key,workMode:profiles[key]?.workMode??'social',preservedModes:Object.keys(modeSessions[key]??{}),sessionId:sid,groupId:sessionGroups.groupFor(sid,profiles[key])?.id??null,title:profiles[key]?.title ?? sessionTitle(key),running:pending.has(sid)||ctx.agents.get(sid)?.status==='running',taskStartedAt:pending.get(sid)?.startedAt??null,initializations:profiles[key]?.initializations ?? 0,compactions:profiles[key]?.compactions ?? 0,generation:profiles[key]?.generation ?? 0,previousSessionCount:profiles[key]?.previousSessions?.length ?? 0,usage:readHistoryPolicy(root,key,internalGroupChat).enabled?history.usageSummary(key):null,recovery:profiles[key]?.recovery??null,history:readHistoryPolicy(root,key,internalGroupChat).enabled?{mode:windowPolicy(key)?REQUEST_WINDOW_MODE:'external-bounded-v1',request:profiles[key]?.windowRequest??null,requests:profiles[key]?.windowRequests??[],display:profiles[key]?.windowHistoryRestored??null,rotation:profiles[key]?.historyRotation??null,checkpoint:history.checkpoint(key)?.id??null}:null,...contextStatus(key,sid),contextAuto:profiles[key]?.contextAuto ? {status:profiles[key].contextAuto.status,finishedAt:profiles[key].contextAuto.finishedAt,retryAt:profiles[key].contextAuto.retryAt} : null}))});
     if(req.method==='POST'&&req.url.startsWith('/assistant-task/')&&!['/assistant-task/status','/assistant-task/cancel'].includes(req.url)){
       try{const chunks=[];let size=0;for await(const part of req){size+=part.length;if(size>MAX_RPC_BYTES)throw taskFault('request_too_large',413);chunks.push(part);}const body=JSON.parse(Buffer.concat(chunks));if(body.dshInstanceId&&body.dshInstanceId!==instanceId)throw taskFault('DSH_CONNECTION_CHANGED');const result=await assistantControl(req.url.slice('/assistant-task/'.length),body);return reply(200,result);}
       catch(error){return reply(error.status??503,{error:error.code??'ASSISTANT_CONTROL_FAILED',detail:String(error.message).slice(0,200)});}
     }
     if(req.method==='POST'&&['/assistant-task/status','/assistant-task/cancel','/work-mode-ready'].includes(req.url)){
       try{const parts=[];let size=0;for await(const part of req){size+=part.length;if(size>2048)throw Error('invalid_request');parts.push(part);}const body=JSON.parse(Buffer.concat(parts)),key=body.conversationKey;
+        return await withUiSelection(root,body.uiSelectionScope,key,async()=>{
         if(req.url!=='/work-mode-ready'&&(body.taskId||(body.senderWxid||body.localControl===true)&&assistantTasks.list(key,body.senderWxid,{admin:true}).length))return reply(200,await assistantControl(req.url.endsWith('/cancel')?'cancel':'status',body));
-        const w=JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8')).wechat;
+        const w=selectedConfig(root).wechat;
         if(!allowedConversation(w,key))return reply(403,{error:'chat_not_allowed'});
         const sid=mappings[key],agent=ctx.agents.get(sid),item=pending.get(sid),running=!!item||agent?.status==='running';
         if(req.url==='/work-mode-ready')return reply(running?409:200,{ok:!running,error:running?'session_busy':undefined});
@@ -1029,9 +992,10 @@ export function apply(ctx, config={}) {
         if(body.localControl!==true&&!assistantControlAllowed(w,key,body.senderWxid,item?.assistantSender,{running}))return reply(403,{error:'assistant_sender_denied'});
         if(req.url.endsWith('/cancel')&&running){if(item)item.cancel?.(new Error('task_cancelled'));else agent.cancel({kind:'user'});}
         return reply(200,{ok:true,running:req.url.endsWith('/cancel')?false:running,startedAt:item?.startedAt??null});
+        });
       }catch(error){return reply(error.status??400,{error:error.code??'invalid_request'});}
     }
-    if(req.method!=='POST' || !['/followup','/assistant-chat','/configure','/compact','/repair-context','/context-maintenance'].includes(req.url))return reply(404,{error:'not_found'});
+    if(req.method!=='POST' || !['/followup','/assistant-chat','/configure','/compact','/context-maintenance'].includes(req.url))return reply(404,{error:'not_found'});
     const requestController=new AbortController();let requestAdmitted=false;
     // Once the inbox is durably admitted, let its bounded turn finish and be
     // cached. A lost HTTP response must not turn the next replay into new input.
@@ -1044,7 +1008,7 @@ export function apply(ctx, config={}) {
       if(!KEY.test(key) || (['/followup','/assistant-chat'].includes(req.url) && (!message || message.length>18000)))return reply(400,{error:'invalid_request'});
       let output;
       if(req.url==='/assistant-chat'){
-        if(!chatInputAllowed(key,body.assistantSender))throw taskFault('ASSISTANT_SENDER_DENIED',403);
+        if(!withUiSelection(root,body.uiSelectionScope,key,()=>chatInputAllowed(key,body.assistantSender)))throw taskFault('ASSISTANT_SENDER_DENIED',403);
         if(body.files?.length||body.assistantTaskId||body.assistantParentId)throw taskFault('ASSISTANT_ADMIN_REQUIRED',403);
         groupChatRuntime??=apply(ctx,{...config,internalGroupChat:true});
         output=await groupChatRuntime.followup({...body,workMode:'assistant',assistantChatOnly:true,files:[],searchTicket:undefined,searchContext:undefined,webReaderUrls:[],searchOptOut:true,memeLibraryDisabled:true},requestController,()=>{requestAdmitted=true;});
@@ -1057,7 +1021,7 @@ export function apply(ctx, config={}) {
   // Warm discovery at plugin startup, before the first ordinary chat needs it.
   if(!internalGroupChat)extensions().then(async extension=>{if(extension){await extension.runtime.sync();extension.runtime.start();}}).catch(error=>log.warn('extension preload failed:',error.message));
   if(!internalGroupChat)server.listen(port,host,()=>log.info(`Native-session WeChat plugin listening on ${host}:${port}`));
-  let closing;const dispose=()=>closing??=(async()=>{presetStopped=true;await groupChatRuntime?.dispose();thinkingFeedback.close();assistantControl.dispose();assistantTasks.close();disposeToolOrigins();bundledDispose?.();for(const dispose of memeBindings.values())dispose();for(const binding of dshBindings.values())binding.dispose();for(const binding of fileBindings.values())binding.dispose();
+  let closing;const dispose=()=>closing??=(async()=>{await groupChatRuntime?.dispose();thinkingFeedback.close();assistantControl.dispose();assistantTasks.close();disposeToolOrigins();bundledDispose?.();for(const dispose of memeBindings.values())dispose();for(const binding of dshBindings.values())binding.dispose();for(const binding of fileBindings.values())binding.dispose();
     for(const sid of fixedPrefixBindings.keys())disposeFixedPrefix(sid);
     for(const dispose of memberMemoryBindings.values())dispose();
     for(const dispose of historyBindings.values())dispose();

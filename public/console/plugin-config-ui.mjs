@@ -14,29 +14,3 @@ export function pluginSettingsMarkup(item, rows, esc) {
   const other = rows.filter(row => !used.has(row.key));
   return `${ui.description ? `<p class="modal-description">${esc(ui.description)}</p>` : ''}${sections}${other.length ? grid(other) : ''}`;
 }
-
-export function settingsViewLifecycle() {
-  let serial = 0, controller, cleanup, activeKey;
-  const retire = key => {
-    if (key !== undefined && key !== activeKey) return;
-    serial++;
-    controller?.abort();
-    controller = undefined;
-    activeKey = undefined;
-    const dispose = cleanup;
-    cleanup = undefined;
-    dispose?.();
-  };
-  return {
-    retire,
-    begin(key) {
-      retire();
-      activeKey = key;
-      const own = serial;
-      controller = new AbortController();
-      return { signal: controller.signal, current: () => serial === own && !controller?.signal.aborted,
-        bind(dispose) { if (serial === own) cleanup = dispose; else dispose(); },
-        close() { if (serial === own) retire(); } };
-    },
-  };
-}

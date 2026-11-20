@@ -5,7 +5,40 @@ import {MessageBuffer} from '../components/qq-bridge/src/core/message-buffer.js'
 import {SocialEngine} from '../components/qq-bridge/src/core/social-engine.js';
 import {chatSettingsSnapshot,applyChatSettings,mergeConversationSave} from '../public/console/conversation-settings.mjs';
 import {applyReaderAccount} from './reader-account-state.mjs';
-import {apply as restrictTools} from '../packages/dsh-social-bridge-plugin/social-tool-restrict.mjs';
+import {apply as restrictTools, bindSocialToolExecutor} from '../packages/dsh-social-bridge-plugin/social-tool-restrict.mjs';
+
+test('late DSH tool attachment keeps concurrent scopes separate and revocation takes effect before describe and execute',async()=>{
+  let assemble,guard;
+  restrictTools({tools:{guard:fn=>{guard=fn;}},on(_event,fn){assemble=fn;}});
+  const defs=[{name:'first',deferLoading:true},{name:'second'},{name:'hidden'}];
+  function scope(name){
+    let allowed=true,executor,installCount=0;
+    const ctx={
+      [Symbol.for('wechatagent.assistant-access.v1')]:()=>allowed,
+      [Symbol.for('wechatagent.dsh-access.v1')]:{names:()=>[name],check:value=>value===name},
+      tools:{
+        selectExecutor:()=>({describe:schemas=>({schemas}),execute:()=>name,
+          sections:[{name:'dynamic',text:items=>items.map(x=>x.name).join(',')}]}),
+        setExecutor:value=>{executor=value;installCount++;},
+      }
+    };
+    return {ctx,revoke:()=>{allowed=false;},executor:()=>executor,count:()=>installCount};
+  }
+  const a=scope('first'),b=scope('second');
+  bindSocialToolExecutor(a.ctx,a);bindSocialToolExecutor(b.ctx,b);
+  assert.deepEqual(b.executor().describe(defs).knownNames,['second']); // DSH reads this before assemble.
+  const run=scope=>assemble({}, {scope},async()=>({sections:[{name:'harness:identity',text:'hidden'}]}));
+  const [assembly]=await Promise.all([run(a),run(b)]);
+  assert.deepEqual(assembly,{sections:[]});
+  await run(a);assert.equal(a.count(),1);
+  assert.deepEqual(a.executor().describe(defs),{schemas:[{name:'first'}],knownNames:['first']});
+  assert.deepEqual(b.executor().describe(defs).knownNames,['second']);
+  assert.equal(a.executor().sections[0].text(defs),'first');
+  assert.equal(guard({agent:a,name:'second'}),'微信群友会话不允许调用未授权工具');
+  a.revoke();assert.deepEqual(a.executor().describe(defs).schemas,[]);
+  assert.equal(typeof guard({agent:a,name:'first'}),'string');assert.equal(guard({agent:b,name:'second'}),undefined);
+  assert.equal(b.executor().execute({}),'second');
+});
 const wxid='wxid_admin',other='wxid_other',id=wx=>String(Number(crypto.createHash('sha256').update(wx).digest().readBigUInt64BE(0)%2147483647n+1n));
 const group='wechat:group:456',priv='wechat:private:'+id(wxid);
 const config=()=>({persona:{default:'test',chats:{}},wechat:{whitelist:{groups:['456'],private:[id(wxid)]},workModes:{[group]:'assistant',[priv]:'assistant'},assistant:{administrators:[wxid]}}});
@@ -28,7 +61,6 @@ test('member chat runs independently while an administrator task is in flight',a
 
 test('only administrators control tasks even when a legacy group switch is false',()=>{const w=config().wechat;w.assistant.adminOnlyGroups={[group]:false};assert(!assistantControlAllowed(w,group,other,other,{running:true}));assert(!assistantControlAllowed(w,group,other,wxid,{running:true}));assert(!assistantControlAllowed(w,group,other,undefined,{running:true}));assert(assistantControlAllowed(w,group,wxid,other,{running:true}));});
 test('assistant revocation overrides every tool provider and removes tool visibility before the next model step',async()=>{let guard,assemble,allowed=true;const agent={ctx:{[Symbol.for('wechatagent.assistant-access.v1')]:()=>allowed,[Symbol.for('wechatagent.dsh-access.v1')]:{names:()=>new Set(['read']),check:name=>name==='read'}}};restrictTools({tools:{presentAs(){},guard(fn){guard=fn;}},on(_name,fn){assemble=fn;}});assert.equal(guard({agent,name:'read'}),undefined);allowed=false;assert.equal(typeof guard({agent,name:'read'}),'string');const result=await assemble({}, {scope:agent},async()=>({sections:[],tools:[{name:'read',parameters:{}}]}));assert.equal(result.tools.length,0);});
-test('DSH 0.2.2 prompt assembly without tools passes through and the scoped executor narrows model-visible tools',async()=>{let assemble,wrapped,allowed=true;const calls=[];const base={describe:tools=>({schemas:tools.map(({name,deferLoading})=>({name,parameters:{},...(deferLoading?{deferLoading}:{})}))}),execute:input=>{calls.push(input);return 'ran';}};const agent={ctx:{[Symbol.for('wechatagent.assistant-access.v1')]:()=>allowed,[Symbol.for('wechatagent.dsh-access.v1')]:{names:()=>new Set(['read','write']),check:()=>true}}};restrictTools({tools:{guard(){},resolve(){},selectExecutor:()=>base,setExecutor(value){wrapped=value;}},on(_name,fn){assemble=fn;}});const result=await assemble({}, {scope:agent},async()=>({sections:[{name:'harness:identity',text:'x'},{name:'keep',text:'y'}],contexts:[],variables:{}}));assert.equal(result.tools,undefined);assert.deepEqual(result.sections.map(s=>s.name),['keep']);assert.deepEqual(wrapped.describe([{name:'write',deferLoading:true},{name:'shell'},{name:'read'}]).schemas,[{name:'read',parameters:{}},{name:'write',parameters:{}}]);allowed=false;assert.deepEqual(wrapped.describe([{name:'read'}]).schemas,[]);assert.equal(wrapped.execute({calls:[]}),'ran');assert.equal(calls.length,1);});
 test('tightening policy discards restored member requests without blocking later admin tasks',async t=>{const f=engineFixture(t);f.buffer.append({...message(other,'助手 旧任务'),work_mode:'assistant',direct_mention:true});f.engine.receive(message(wxid,'助手 新任务'));await wait(()=>f.sent.length===1);assert(!f.calls[0].prompt.includes('旧任务'));assert.equal(f.buffer.unread(group).length,0);});
 test('revoking a sender during a turn suppresses its reply and leaves the next authorized request usable',async t=>{let release;const f=engineFixture(t,config().wechat,{decide:async()=>{await new Promise(r=>{release=r;});return 'RESPOND: 不应发送';}});f.engine.receive(message(wxid));await wait(()=>release);f.w.assistant.administrators=[];release();await wait(()=>!f.engine.running.size);assert.equal(f.sent.length,0);assert.equal(f.buffer.unread(group).length,0);f.w.assistant.administrators=[wxid];f.engine.decide=async()=> 'RESPOND: 恢复';f.engine.receive(message(wxid));await wait(()=>f.sent.length===1);});
 test('adding an administrator neither drops an authorized result nor changes a pending batch identity',async t=>{let attempt=0;const batches=[],f=engineFixture(t,config().wechat,{decide:async(_key,_prompt,meta)=>{batches.push(meta.batchId);if(++attempt===1)throw Error('test response lost');return 'RESPOND: 原批次结果';}});f.engine.receive(message(wxid));await wait(()=>attempt===1&&!f.engine.running.size);f.w.assistant.administrators.push(other);f.engine.replay(group);await wait(()=>f.sent.length===1);assert.equal(batches[0],batches[1]);assert.equal(f.buffer.unread(group).length,0);});

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import {runConsoleCommand,windowsPowerShellExecutable} from './console-process.mjs';
 
 const failure = message => Object.assign(new Error(message), {status:409});
@@ -24,11 +25,21 @@ export function startupConflictPorts(output,allowedPorts){
 export function createProcessRecovery({root,probe=request=>helper(root,'Inspect',request),stop=request=>helper(root,'Stop',request),now=Date.now,ttlMs=120000}={}) {
   const scans=new Map(),confirmations=new Map();let busy=false;
   const prune=()=>{for(const map of [scans,confirmations])for(const [id,value] of map)if(value.expiresAt<=now())map.delete(id);};
-  const request=(config,healthyPorts,includeMatchingWeChat,matchingWeChatOnly)=>({root,ports:matchingWeChatOnly?[]:[...Object.values(config.ports),Number(new URL(config.hook.baseUrl).port||80)].filter(port=>!healthyPorts.includes(port)),wechatExecutable:path.resolve(root,config.hook.wechatExecutable),protectedPids:[process.pid],includeMatchingWeChat,matchingWeChatOnly});
+  const request=(config,healthyPorts)=>{
+    const protectedPids=[process.pid];
+    try{
+      for(const [relative,key]of [['state/runtime.json','adapter'],['state/ui-service.lock',null]]){
+        const file=path.join(root,relative);if(!fs.existsSync(file))continue;
+        const value=JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')),pid=key?value[key]?.pid:value.pid;
+        if(Number.isInteger(pid)&&pid>0)protectedPids.push(pid);
+      }
+    }catch{throw failure('界面服务的进程记录需要核对；请先正常停止服务。');}
+    return {root, ports:Object.values(config.ports).filter(port=>!healthyPorts.includes(port)), protectedPids};
+  };
   return {
-    async scan(config,revision,{healthyPorts=[],includeMatchingWeChat=false,matchingWeChatOnly=false}={}) {
-      prune();const input=request(config,healthyPorts,includeMatchingWeChat,matchingWeChatOnly),result=await probe(input);
-      const items=(Array.isArray(result)?result:result.items??[]).filter(item=>!matchingWeChatOnly||path.resolve(item.path??'').toLowerCase()===input.wechatExecutable.toLowerCase()).slice(0,32).map(item=>({...item,id:crypto.randomUUID()}));
+    async scan(config,revision,{healthyPorts=[]}={}) {
+      prune();const input=request(config,healthyPorts),result=await probe(input);
+      const items=(Array.isArray(result)?result:result.items??[]).slice(0,32).map(item=>({...item,...(input.protectedPids.includes(item.pid)||/^(?:Weixin|WeChat|WechatVoicePreview|WechatQtActions|WechatUiHost)\.exe$/i.test(item.name??'')?{canStop:false,blockedReason:'请通过停止服务等待界面和语音操作清理。'}:{}),id:crypto.randomUUID()}));
       const id=crypto.randomUUID(),scan={revision,input,items,expiresAt:now()+ttlMs};scans.set(id,scan);
       while(scans.size>4)scans.delete(scans.keys().next().value);
       return {scanId:id,expiresAt:scan.expiresAt,items:items.map(publicItem)};

@@ -2,6 +2,11 @@ export const PAT_TYPE = 62 * 2 ** 32 + 49;
 export const FORWARD_TYPE = 19 * 2 ** 32 + 49;
 export const QUOTE_TYPE = 57 * 2 ** 32 + 49;
 
+export function validOfflineBatch(batch) {
+  return !!batch && !Array.isArray(batch) && Object.keys(batch).length===2 && typeof batch.id==='string' &&
+    /^[a-f0-9]{64}$/.test(batch.id) && typeof batch.last==='boolean';
+}
+
 export function normalizeQuoteReply(value) {
   const bounded=(text,limit)=>typeof text==='string' && text.length<=limit*2 && [...text].length<=limit;
   if (!value || value.version!==1 || !bounded(value.reply,4000)) return null;

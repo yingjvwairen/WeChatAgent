@@ -20,13 +20,32 @@ try {
         if ($occupied) { throw 'Console port is occupied. Close the other console or choose another port.' }
     }
     if (-not $connected) {
-        $node = (Get-Command node -ErrorAction Stop).Source
+        # Use this installation's saved DSH runtime, including on machines
+        # without Node on PATH. Never take the coding app's cached runtime.
+        $runtimeFile = Join-Path $root 'state\ui-runtime.json'
+        if (Test-Path -LiteralPath $runtimeFile -PathType Leaf) {
+            $runtime = Get-Content -LiteralPath $runtimeFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($runtime.schemaVersion -ne 1 -or -not $runtime.node) { throw 'UI_RUNTIME_CONFIG_INVALID' }
+            $node = [string]$runtime.node
+        } else {
+            $node = Get-Command node -CommandType Application -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch '(^|[\\/])(\.codex|codex-runtimes|codex-primary-runtime)([\\/]|$)' } | Select-Object -First 1 -ExpandProperty Source
+        }
+        if (-not $node -or -not [IO.Path]::IsPathRooted($node) -or $node -match '(^|[\\/])(\.codex|codex-runtimes|codex-primary-runtime)([\\/]|$)' -or -not (Test-Path -LiteralPath $node -PathType Leaf)) { throw 'Configure the DSH runtime or install an independent Node.js first.' }
         New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-        $previousConsolePort = $env:WECHATAGENT_CONSOLE_PORT
+        $consoleEnvironment = @{}
         try {
+            foreach ($entry in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'CODEX*' -or $_.Name -in @('NODE_OPTIONS','NODE_PATH','PYTHONHOME','PYTHONPATH','WECHATAGENT_CONSOLE_PORT','PATH') })) {
+                $consoleEnvironment[$entry.Name] = $entry.Value
+                Remove-Item -LiteralPath ('Env:' + $entry.Name)
+            }
+            $inheritedPaths = @(([string]$consoleEnvironment['PATH']).Split(';') | Where-Object { $_ -and $_ -notmatch '(^|[\\/])(\.codex|codex-runtimes|codex-primary-runtime)([\\/]|$)' })
+            $env:PATH = (@((Split-Path -Parent $node)) + $inheritedPaths) -join ';'
             $env:WECHATAGENT_CONSOLE_PORT = [string]$Port
             $process = Start-Process -FilePath $node -ArgumentList ('"' + (Join-Path $PSScriptRoot 'console-server.mjs') + '"') -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logDir 'console.stdout.log') -RedirectStandardError (Join-Path $logDir 'console.stderr.log')
-        } finally { $env:WECHATAGENT_CONSOLE_PORT = $previousConsolePort }
+        } finally {
+            foreach ($name in @('WECHATAGENT_CONSOLE_PORT','PATH')) { Remove-Item -LiteralPath ('Env:' + $name) -ErrorAction SilentlyContinue }
+            foreach ($name in $consoleEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name,$consoleEnvironment[$name],'Process') }
+        }
         for ($i = 0; $i -lt 50; $i++) {
             if ($process.HasExited) { throw 'Console failed to start. See state/logs/console.stderr.log.' }
             try {

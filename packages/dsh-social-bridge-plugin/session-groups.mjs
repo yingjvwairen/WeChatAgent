@@ -1,3 +1,4 @@
+import {selectedWechat} from './ui-selection-policy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -34,7 +35,7 @@ export function createSessionGroups({ctx, root, isAllowed, move, references=()=>
       const owner = registry();
       if (operation === 'move') {
         const config = JSON.parse(fs.readFileSync(path.join(root,'config/wechatagent.json'),'utf8').replace(/^\uFEFF/,''));
-        if (!allowedConversation(config.wechat,body.conversationKey)) throw groupFault('SESSION_GROUP_CHAT_NOT_ALLOWED',400);
+        if (!allowedConversation(selectedWechat(root,config.wechat),body.conversationKey)) throw groupFault('SESSION_GROUP_CHAT_NOT_ALLOWED',400);
         const group = owner.get(body.groupId);
         if (!group) throw groupFault('SESSION_GROUP_NOT_FOUND',404);
         return move(body,group,signal);

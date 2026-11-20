@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {PLUGIN_HOST_FILES} from '../packages/plugin-api/contract.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { selectRoleText } from '../components/qq-bridge/src/role-card.js';
 import {personaError} from '../public/console/persona-files.mjs';
 import {upsertToolCatalogPatch} from '../packages/dsh-social-bridge-plugin/plugin-catalog.mjs';
 import {upsertAssistantPresetPatch} from '../packages/dsh-social-bridge-plugin/assistant-preset.mjs';
 import { migrateConnections } from './migrate-io-config.mjs';
+import {syncInstalledUiRuntime} from './installed-ui-runtime.mjs';
 import { validateStickerSettings } from '../components/qq-bridge/src/core/sticker-policy.js';
 import { validateSearchSettings } from '../packages/dsh-social-bridge-plugin/search-policy.mjs';
 import {validateProactiveSettings} from '../components/qq-bridge/src/core/proactive-policy.js';
@@ -20,8 +20,7 @@ import {validateMemberMemory} from '../packages/dsh-social-bridge-plugin/member-
 
 import {validateConversationSettings,conversationMode} from '../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 import {migrateDshSettings} from '../packages/dsh-social-bridge-plugin/dsh-migration.mjs';
-import {hookProfile} from './hook-profiles.mjs';
-import {INPUT_BACKEND,inputSettings} from './input-sender.mjs';
+import {migrateUiaModeSettings} from './uia-mode.mjs';
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
 const write = (file, value) => {
@@ -41,31 +40,10 @@ export function validateConfig(config) {
   validateContextSettings(config.wechat?.context);
   validateWebReaderSettings(config.wechat?.webReader);
   if (config.version !== 1) throw new Error('Unsupported WeChatAgent config version');
-  if (!['nt', 'bundled', 'existing'].includes(config.runtime?.weflowMode ?? 'nt')) throw new Error('weflowMode must be nt, bundled or existing');
-  if (!['wechat-hook', INPUT_BACKEND, 'wechat-helper'].includes(config.runtime?.sender)) throw new Error('sender must be wechat-hook, wechat-input or wechat-helper; the UIA sender has been removed');
-  if (config.runtime.sender === 'wechat-helper') {
-    // Helper sends text and voice through its own WeChat 4.2.0.12 connection.
-    if ((config.runtime.weflowMode ?? 'nt') !== 'nt') throw new Error('Helper sending requires the NT reader for account and receipt checks');
-    if (config.hook?.expectedVersion !== '4.2.0.12' || !config.hook.wechatExecutable || /[\r\n"\0]/.test(config.hook.wechatExecutable)) throw new Error('Helper sending requires the selected WeChat 4.2.0.12 client');
-    const port = config.helperVoice?.port ?? 8777;
-    if (!Number.isInteger(port) || port < 1024 || port > 65535 || Object.values(config.ports ?? {}).includes(port)) throw new Error('Helper port must be 1024-65535 and distinct from the project ports');
-  }
-  if (config.runtime.sender === INPUT_BACKEND) {
-    if ((config.runtime.weflowMode ?? 'nt') !== 'nt') throw new Error('Foreground input requires the NT reader for account and receipt checks');
-    try { inputSettings(config, projectRoot); } catch (error) { throw new Error('Invalid foreground input settings: ' + error.message); }
-  }
-  if (config.runtime.sender === 'wechat-hook') {
-    if ((config.runtime.weflowMode ?? 'nt') !== 'nt') throw new Error('WeChat-Hook requires the NT reader for account and receipt checks');
-    const url = new URL(config.hook?.baseUrl ?? '');
-    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Hook API must be an HTTP loopback base URL');
-    if (!hookProfile(config.hook.expectedVersion) || !config.hook.wechatExecutable || /[\r\n"\0]/.test(config.hook.wechatExecutable)) throw new Error('Configure a supported, exactly matching WeChat-Hook executable and version');
-    for (const [key, low, high] of [['requestTimeoutMs',1000,5000],['receiptTimeoutMs',1000,18000],['maxConcurrentSends',1,4]]) {
-      const value = config.hook[key];
-      if (!Number.isInteger(value) || value < low || value > high) throw new Error('Invalid Hook ' + key);
-    }
-    const port = Number(url.port || 80);
-    if (Object.values(config.ports ?? {}).includes(port)) throw new Error('Hook port must be distinct from the four project ports');
-  }
+  if (config.runtime?.sender !== 'wechat-ui') throw new Error('sender must be wechat-ui');
+  if ((config.runtime.weflowMode ?? 'nt') !== 'nt') throw new Error('WeChat UI requires the NT reader');
+  if (config.ui?.bridgeConfig !== undefined && (typeof config.ui.bridgeConfig !== 'string' || !path.isAbsolute(config.ui.bridgeConfig) || /^[\\/]{2}/u.test(config.ui.bridgeConfig) || /[\0\r\n"]/u.test(config.ui.bridgeConfig))) throw new Error('Invalid UI bridge configuration path');
+  if (config.runtime.wechatExecutable && (typeof config.runtime.wechatExecutable !== 'string' || !path.isAbsolute(config.runtime.wechatExecutable) || /^[\\/]{2}|[\0\r\n"]/u.test(config.runtime.wechatExecutable))) throw new Error('Invalid WeChat executable path');
   const ports = Object.values(config.ports ?? {});
   if (ports.length !== 4 || ports.some(p => !Number.isInteger(p) || p < 1024 || p > 65535) || new Set(ports).size !== 4) throw new Error('Configure four distinct service ports between 1024 and 65535');
   if (!['weflow','onebot','adapter','dshPlugin'].every(key => Number.isInteger(config.ports[key]))) throw new Error('Required ports: weflow, onebot, adapter, dshPlugin');
@@ -79,28 +57,45 @@ export function validateConfig(config) {
   if (!config.dsh?.provider || !config.dsh?.model || /[\r\n]/.test(config.dsh.provider + config.dsh.model)) throw new Error('Configure DSH provider and model IDs');
   return config;
 }
+export function migrateRetiredSender(config,root=projectRoot) {
+  const legacy = config.runtime?.sender === 'wechat-hook';
+  if (!legacy && !Object.hasOwn(config, 'hook')) return false;
+  const oldExe=config.hook?.wechatExecutable;
+  if(!legacy&&config.runtime?.sender==='wechat-ui'&&!config.runtime.wechatExecutable&&typeof oldExe==='string'&&
+      path.isAbsolute(oldExe)&&!/^[/\\]{2}|[\0\r\n"]/u.test(oldExe)&&/^(Weixin|WeChat)\.exe$/i.test(path.basename(oldExe))){
+    const relative=path.relative(path.join(root,'state','hook'),oldExe);
+    if((relative.startsWith('..'+path.sep)||path.isAbsolute(relative))&&
+        fs.lstatSync(oldExe,{throwIfNoEntry:false})?.isFile()&&!fs.existsSync(path.join(path.dirname(oldExe),'version.dll')))
+      config.runtime.wechatExecutable=oldExe;
+  }
+  if (legacy) {
+    config.runtime.sender = 'wechat-ui';
+    config.runtime.weflowMode = 'nt';
+  }
+  delete config.hook;
+  return true;
+}
+
+export function migrateRetiredGroupReplyProbability(config) {
+  if(!config.wechat || !Object.hasOwn(config.wechat,'groupReplyProbability'))return false;
+  delete config.wechat.groupReplyProbability;
+  return true;
+}
+
 export function prepare(root = projectRoot) {
   const configFile = path.join(root, 'config', 'wechatagent.json');
   if (!fs.existsSync(configFile)) fs.copyFileSync(path.join(root, 'config', 'wechatagent.example.json'), configFile);
   migrateConnections(root);
-  const config = validateConfig(read(configFile));
+  const config = read(configFile);
+  const migrated = migrateRetiredSender(config,root);
+  const retiredProbability = migrateRetiredGroupReplyProbability(config);
+  validateConfig(config);
+  if (migrated || retiredProbability) write(configFile,config);
+  migrateUiaModeSettings(root);
   if(migrateHistorySettings(config)){validateConfig(config);write(configFile,config);}
   const migratedMeme=migrateDshSettings(root,config);if(migratedMeme!==null){validateConfig(config);write(configFile,config);}
   const state = path.join(root, 'state');
   for (const dir of ['logs', 'weflow', 'attachments']) fs.mkdirSync(path.join(state, dir), { recursive: true });
-  if (config.runtime.sender === 'wechat-hook') {
-    const hookDir = path.join(state, 'hook');
-    fs.mkdirSync(hookDir, { recursive: true });
-    const hookToken = path.join(hookDir, 'native-token.txt');
-    if (!fs.existsSync(hookToken)) fs.writeFileSync(hookToken, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
-    if (!/^[a-f0-9]{64}$/.test(fs.readFileSync(hookToken, 'utf8').trim())) throw new Error('Invalid native Hook token');
-  }
-  if (config.runtime.sender === 'wechat-helper') {
-    // Shared with the Helper plugin's token_file; created once, never printed.
-    const helperToken = path.join(state, 'helper-voice.token');
-    if (!fs.existsSync(helperToken)) fs.writeFileSync(helperToken, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
-    if (!/^[a-f0-9]{64}$/.test(fs.readFileSync(helperToken, 'utf8').trim())) throw new Error('Invalid Helper token');
-  }
   const tokenFile = path.join(state, 'social-dsh-token.txt');
   if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
   const roleTexts=new Map();
@@ -140,7 +135,7 @@ export function prepare(root = projectRoot) {
     let changed = false;
     for (const [key, rows] of Object.entries(buffer.chats ?? {})) {
       const match = /^wechat:(private|group):(\d+)$/.exec(key);
-      if (match && !config.wechat.whitelist[match[1] === 'group' ? 'groups' : 'private'].map(String).includes(match[2])) {
+      if (config.runtime.sender !== 'wechat-ui' && match && !config.wechat.whitelist[match[1] === 'group' ? 'groups' : 'private'].map(String).includes(match[2])) {
         for (const row of rows) if (!row.processed) { row.processed = true; changed = true; }
       }
     }
@@ -152,9 +147,9 @@ export function prepare(root = projectRoot) {
     const existingPatch=fs.readFileSync(patchFile,'utf8');
     const before=upsertAssistantPresetPatch(upsertToolCatalogPatch(existingPatch,root),root);
     let after = before.replace(/^(        provider:).*/m, `$1 ${JSON.stringify(config.dsh.provider)}`).replace(/^(        model:).*/m, `$1 ${JSON.stringify(config.dsh.model)}`);
-    const moduleDir=path.dirname(patchFile),sources=['fish-notebook.mjs','fish-notebook-policy.mjs','fish-notebook-store.mjs','memory-summary.mjs','reply-layout-policy.mjs','assistant-notifications.mjs','assistant-feedback.mjs','assistant-tasks.mjs','file-tools.mjs','file-transfers.mjs','assistant-policy.mjs','plugin-catalog.mjs','work-modes.mjs','assistant-preset.mjs','local-policy.mjs','image-input.mjs','deadline.mjs','prompt-context.mjs','member-memory.mjs','member-memory-policy.mjs','meme-library.mjs','meme-library-policy.mjs','native-context.mjs','session-groups.mjs','conversation-policy.mjs','dsh-access.mjs','dsh-bundled.mjs','sticker-pool-review.mjs','dsh-migration.mjs','web-reader.mjs','web-reader-policy.mjs','web-reader-content.mjs','web-reader-fetch.mjs','web-reader-zxsj.mjs','skills/web-reader/skill.json','skills/web-reader/SKILL.md','skills/web-reader/references/quotes.md','skills/web-reader/references/video.md','model-search.mjs','dsh-search.mjs','search-provider.mjs','skills/search/skill.json','skills/search/SKILL.md','search-budget.mjs','search-policy.mjs','weather-query.mjs','weather-source.mjs','social-tool-policy.mjs','social-tool-restrict.mjs','context-policy.mjs','history-policy.mjs','history-store.mjs','history-runtime.mjs','usage-summary.mjs','request-window.mjs'].map(name=>path.join(moduleDir,name));
+    const moduleDir=path.dirname(patchFile),sources=['fish-notebook.mjs','fish-notebook-policy.mjs','fish-notebook-store.mjs','memory-summary.mjs','reply-layout-policy.mjs','assistant-notifications.mjs','assistant-feedback.mjs','assistant-tasks.mjs','file-tools.mjs','file-transfers.mjs','assistant-policy.mjs','plugin-catalog.mjs','work-modes.mjs','assistant-preset.mjs','local-policy.mjs','image-input.mjs','reader-media-access.mjs','media-input.mjs','deadline.mjs','prompt-context.mjs','member-memory.mjs','member-memory-policy.mjs','meme-library.mjs','meme-library-policy.mjs','native-context.mjs','session-groups.mjs','conversation-policy.mjs','dsh-access.mjs','dsh-bundled.mjs','sticker-pool-review.mjs','dsh-migration.mjs','web-reader.mjs','web-reader-policy.mjs','web-reader-content.mjs','web-reader-fetch.mjs','web-reader-zxsj.mjs','skills/web-reader/skill.json','skills/web-reader/SKILL.md','skills/web-reader/references/quotes.md','skills/web-reader/references/video.md','model-search.mjs','dsh-search.mjs','search-provider.mjs','skills/search/skill.json','skills/search/SKILL.md','search-budget.mjs','search-policy.mjs','weather-query.mjs','weather-source.mjs','social-tool-policy.mjs','social-tool-restrict.mjs','context-policy.mjs','history-policy.mjs','native-quote-source.mjs','history-store.mjs','history-runtime.mjs','usage-summary.mjs','request-window.mjs'].map(name=>path.join(moduleDir,name));
     for(const name of ['index.mjs','catalog.mjs','snapshots.mjs']){const file=path.join(root,'packages/extension-runtime',name);if(fs.existsSync(file))sources.push(file);}
-    if(fs.existsSync(path.join(root,'packages/plugin-api')))for(const name of PLUGIN_HOST_FILES){const file=path.join(root,name);if(!fs.existsSync(file))throw new Error('插件宿主文件不完整，请更新 WeChatAgent：'+name);sources.push(file);}
+    sources.push(path.join(moduleDir, 'ui-selection-policy.mjs'));
     if(sources.every(file=>fs.existsSync(file))){
       const revision=crypto.createHash('sha256').update(Buffer.concat(sources.map(file=>fs.readFileSync(file)))).digest('hex').slice(0,16);
       // Revision inputs may grow or move; the Cordis plugin entry stays fixed.
@@ -168,6 +163,7 @@ export function prepare(root = projectRoot) {
     if (existingPatch !== after) fs.writeFileSync(patchFile, after);
   }
   // Original WeFlow owns its encrypted configuration in every provider mode.
+  syncInstalledUiRuntime(root,config);
   return config;
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

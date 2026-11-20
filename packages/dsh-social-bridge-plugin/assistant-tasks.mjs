@@ -47,7 +47,7 @@ export class AssistantTasks {
     if(this.closed)throw taskFault('ASSISTANT_CONTROLLER_STOPPED',503);
     const key=request.conversationKey,sender=request.assistantSender,batchId=request.batchId;
     if(!/^[a-f0-9]{64}$/.test(batchId??''))throw taskFault('ASSISTANT_BATCH_REQUIRED',400);
-    if(!this.allowed(key,sender))throw taskFault('ASSISTANT_SENDER_DENIED',403);
+    if(!this.allowed(key,sender,request))throw taskFault('ASSISTANT_SENDER_DENIED',403);
     const id='T'+crypto.createHash('sha256').update(key+'\0'+sender+'\0'+batchId).digest('hex').slice(0,16),prior=this.jobs.get(id);
     if(prior)return this.view(prior);
     if([...this.jobs.values()].filter(job=>job.key===key&&liveTask(job)).length>=20)throw taskFault('ASSISTANT_QUEUE_FULL',429);
@@ -60,7 +60,7 @@ export class AssistantTasks {
   update(id,patch){const job=this.jobs.get(id);if(!job)return;Object.assign(job,patch,{revision:(job.revision??0)+1});this.persist();return this.view(job);}
   adopt(request,sessionId){
     const key=request.conversationKey,sender=request.assistantSender,id='T'+crypto.createHash('sha256').update(key+'\0'+sender+'\0'+request.batchId).digest('hex').slice(0,16);
-    if(this.closed||!this.allowed(key,sender)||this.jobs.has(id))throw taskFault('ASSISTANT_BACKGROUND_ALREADY_ADMITTED');
+    if(this.closed||!this.allowed(key,sender,request)||this.jobs.has(id))throw taskFault('ASSISTANT_BACKGROUND_ALREADY_ADMITTED');
     if(this.jobs.size>=200){const old=[...this.jobs.values()].find(job=>terminal.has(job.state));if(!old)throw taskFault('ASSISTANT_QUEUE_FULL');this.jobs.delete(old.id);}
     const job={id,key,sender,batchId:request.batchId,request,parentId:request.assistantParentId,state:'running',sessionId,createdAt:this.now(),startedAt:this.now(),stage:'执行 DSH 原生定时任务',revision:1};
     this.jobs.set(id,job);this.persist();const controller=new AbortController();this.active.set(id,controller);
@@ -77,7 +77,7 @@ export class AssistantTasks {
     for(const job of this.jobs.values()){
       if(this.active.size>=this.concurrency)break;if(job.state!=='queued')continue;
       if([...this.active.keys()].some(id=>this.jobs.get(id)?.key===job.key))continue;
-      if(!this.allowed(job.key,job.sender)){this.update(job.id,{state:'cancelled',stage:'权限已收回',finishedAt:this.now()});continue;}
+      if(!this.allowed(job.key,job.sender,job.request)){this.update(job.id,{state:'cancelled',stage:'权限已收回',finishedAt:this.now()});continue;}
       const controller=new AbortController();this.active.set(job.id,controller);this.update(job.id,{state:'running',stage:'准备 DSH 工作区',startedAt:this.now()});
       Promise.resolve().then(()=>this.execute({...job.request,assistantTaskId:job.id},controller.signal)).then(output=>{
         if(this.closed)return;const state=output?.error?'failed':'completed';this.update(job.id,{state,stage:state==='completed'?'已完成':'执行失败',finishedAt:this.now(),output,...(output?.error?{error:short(output.code??output.error)}:{})});

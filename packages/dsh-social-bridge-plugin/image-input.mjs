@@ -1,12 +1,13 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 import {boundedTask} from './deadline.mjs';
+import {fetchBoundReaderMedia} from './reader-media-access.mjs';
+
+const validSourceLabel=value=>value===undefined||value==='引用原消息'||typeof value==='string'&&/^转发第([1-9]\d?(?:\.[1-9]\d?){0,3})条$/.test(value)&&value.slice(3,-1).split('.').every(part=>Number(part)<=50);
 
 export async function imageBlocks(ctx,root,conversationKey,images,provider,model,{onUnavailable,timeoutMs=25000,signal:parentSignal}={}) {
   if (!Array.isArray(images) || images.length>4) throw new Error('IMAGE_BATCH_LIMIT');
   if (!images.length) return [];
-  if (images.some(image=>!/^[a-f0-9]{64}$/.test(image?.id ?? ''))) throw new Error('INVALID_IMAGE_REFERENCE');
+  if (images.some(image=>!/^[a-f0-9]{64}$/.test(image?.id ?? '')||!validSourceLabel(image.sourceLabel))) throw new Error('INVALID_IMAGE_REFERENCE');
   const llm=ctx.get('llm'), attachments=ctx.get('attachments');
   if (!llm || !attachments) throw new Error('NATIVE_IMAGE_SERVICES_UNAVAILABLE');
   const signal=AbortSignal.any([AbortSignal.timeout(timeoutMs),...(parentSignal?[parentSignal]:[])]);
@@ -22,30 +23,21 @@ export async function imageBlocks(ctx,root,conversationKey,images,provider,model
   try{info=await boundedTask(s=>llm.resolveModelInfo(provider,model,s),{timeoutMs,signal});}
   catch(error){return images.map((image,index)=>unavailableBlock(image,index,error));}
   if (!info.inputModalities?.includes('image')) return images.map((image,index)=>unavailableBlock(image,index,new Error('MODEL_IMAGE_INPUT_UNSUPPORTED')));
-  const io=JSON.parse(fs.readFileSync(path.join(root,'state/wechat-io-config.json'),'utf8').replace(/^\uFEFF/,''));
-  const base=new URL(io.reader_base_url);
-  if (base.protocol!=='http:' || base.hostname!=='127.0.0.1' || base.username || base.password || base.pathname!=='/' || base.search || base.hash) throw new Error('IMAGE_READER_LOOPBACK_REQUIRED');
   const blocks=new Array(images.length);let next=0;
   async function prepare(image,index) {
     try {
     return await boundedTask(async taskSignal=>{
-    const response=await fetch(base.origin+'/api/v1/images/'+image.id,{headers:{Authorization:'Bearer '+io.reader_token},redirect:'error',signal:taskSignal});
-    if (!response.ok) {
-      const failure = await response.json().catch(() => ({}));
-      const error = new Error('IMAGE_READER_NOT_READY');
-      if (typeof failure.error === 'string' && /^IMAGE_[A-Z_]{3,80}$/.test(failure.error)) error.imageError = failure.error;
-      throw error;
-    }
-    const content=await response.json();
+    const content=await fetchBoundReaderMedia(root,'images',image.id,conversationKey,{signal:taskSignal});
     if (content.imageId!==image.id || content.conversationKey!==conversationKey) throw new Error('IMAGE_CONVERSATION_MISMATCH');
     if (typeof content.b64!=='string' || content.b64.length>1100000 || !['image/png','image/jpeg','image/webp'].includes(content.mime)) throw new Error('INVALID_IMAGE_DATA');
     const data=Buffer.from(content.b64,'base64');
     if (!data.length || data.length>768*1024 || data.toString('base64')!==content.b64 || crypto.createHash('sha256').update(data).digest('hex')!==content.sha256) throw new Error('IMAGE_INTEGRITY_FAILED');
     const attachment=await attachments.saveImage({data,mediaType:content.mime,name:'wechat-image-'+image.id.slice(0,12)});
     const block={type:'image',attachment};
-    return content.sourceQuality==='thumbnail' ? [
+    const source=image.sourceLabel?[{type:'text',text:`[附图 I${index+1} 来源：${image.sourceLabel}。这是引用或转发中的附件，不代表当前发送者亲自拍摄、创作或亲口陈述。]`}]:[];
+    return content.sourceQuality==='thumbnail' ? [...source,
       {type:'text',text:`[附图 I${index+1} 当前仅提供微信本地缩略图，细节和小字可能不清楚；不要把低清画面当作原图或猜测看不清的内容。需要细节时请用户先在电脑微信打开原图，再重新发送图片。]`},block,
-    ] : block;
+    ] : [...source,block];
     },{timeoutMs:12000,signal});
     } catch(error) {
       return unavailableBlock(image,index,error);

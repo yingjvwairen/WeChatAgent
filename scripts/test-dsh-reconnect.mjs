@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import {MessageBuffer,replyDeliveryParts} from '../components/qq-bridge/src/core/message-buffer.js';
 import {SocialEngine} from '../components/qq-bridge/src/core/social-engine.js';
 import {DshConnectionGuard} from '../components/qq-bridge/src/core/dsh-connection.js';
@@ -21,7 +22,7 @@ function fixture(t,options={}){
     const engine=new SocialEngine({buffer,connection:guard,batchMs:1,privateMinIntervalMs:0,minIntervalMs:0,maxPerMinute:100,maxPerTenMinutes:1000,assistantAccess:()=>true,workModeFor:()=>options.assistant?'assistant':'social',
       stickerPolicyFor:()=>({enabled:false,labelCache:false}),
       decide:async(...args)=>{calls.push(args);return options.decide?options.decide(...args):'RESPOND: fixture response';},
-      send:async(...args)=>{sent.push(args);return {delivered:'database-confirmed'};},log:line=>logs.push(line)});
+      send:async(...args)=>{sent.push(args);return options.send?options.send(...args):{delivered:'database-confirmed'};},deliveryRetry:{receiptDelayMs:5},log:line=>logs.push(line)});
     engines.push(engine);guards.push(guard);return {buffer,guard,engine};
   };
   t.after(()=>{for(const e of engines)e.stop();for(const g of guards)g.stop();assert(path.resolve(root).startsWith(path.resolve(os.tmpdir())+path.sep));fs.rmSync(root,{recursive:true,force:true});});
@@ -87,6 +88,37 @@ test('offline drafts are cancelled while uncertain submitted text stays recorded
  const item={result,throughId:row.id,message:{...incoming('draft',f.now),work_mode:'social'},deliveryId,parts:replyDeliveryParts(result,deliveryId),connectionEpoch:f.guard.epoch,sending:true};item.parts[0].state='sending';f.buffer.rememberReply(key,item);f.engine.decisions.set(key,item);
  f.setHealth({ready:false});await f.guard.check({force:true});
  assert.equal(f.buffer.pendingReplies.size,0);assert.equal(f.buffer.recent(key).find(row=>row.outgoing).delivery_status,'unconfirmed');assert.equal(f.sent.length,0);
+});
+
+function scopedIncoming(time){
+ const scope={version:1,accountRef:'1'.repeat(64),account:'fixture-self',target:'fixture-friend',eventId:'original-ui-event',selectionVersion:1,grantId:'2'.repeat(64),token:'3'.repeat(64)};
+ const wire=value=>String(Number(crypto.createHash('sha256').update(value).digest().readBigUInt64BE(0)%2147483647n+1n));
+ return {...incoming('native-ui',time),self_id:wire(scope.account),sender_id:wire(scope.target),conversation_id:wire(scope.target),ui_selection_required:true,ui_reply_scope:scope};
+}
+test('a submitted native UI reply survives a DSH outage and bridge restart as receipt-only work',async t=>{
+ let confirmed=false;
+ const f=fixture(t,{decide:async()=> 'RESPOND: first native part\n\nsecond native part',send:async(_message,text,options)=>({protocol:'durable-ui-v1',deliveryId:options.deliveryId,state:confirmed?'confirmed':'waiting_for_idle',pending:!confirmed,confirmed})});
+ await f.guard.check();const message=scopedIncoming(f.now+1000),uiKey='wechat:private:'+message.conversation_id;
+ f.engine.receive(message);await until(()=>f.buffer.pendingReplies.get(uiKey)?.parts?.[0].state==='submitted');
+ const originalId=f.sent[0][2].deliveryId;assert.equal(f.sent[0][2].receiptOnly,false);
+ f.setHealth({ready:false});await f.guard.check({force:true});
+ const old=f.buffer.pendingReplies.get(uiKey);assert(old.offlineCancelled);assert.equal(old.parts[0].state,'submitted');assert.equal(old.parts[1].state,'cancelled');
+ f.engine.stop();f.guard.stop();const restored=f.make();await restored.guard.check();confirmed=true;restored.engine.replay(uiKey);
+ await until(()=>!restored.buffer.pendingReplies.size&&restored.buffer.recent(uiKey).some(row=>row.delivery_status==='confirmed'));
+ assert.equal(f.calls.length,1);assert(f.sent.slice(1).length>0);assert(f.sent.slice(1).every(([,text,options])=>text==='first native part'&&options.receiptOnly===true&&options.deliveryId===originalId));
+ assert.equal(restored.buffer.recent(uiKey).filter(row=>row.outgoing).length,1);assert.equal(restored.guard.ready,false);
+});
+test('a DSH disconnect during the initial native submission never loses its later receipt or submits the next part',async t=>{
+ let release,confirmed=false;
+ const f=fixture(t,{decide:async()=> 'RESPOND: first native part\n\nsecond native part',send:async(_message,_text,options)=>{
+   if(!options.receiptOnly)return await new Promise(resolve=>release=()=>resolve({protocol:'durable-ui-v1',deliveryId:options.deliveryId,state:'queued',pending:true}));
+   return {protocol:'durable-ui-v1',deliveryId:options.deliveryId,state:confirmed?'confirmed':'waiting_for_idle',pending:!confirmed,confirmed};
+ }});
+ await f.guard.check();const message=scopedIncoming(f.now+1000),uiKey='wechat:private:'+message.conversation_id;f.engine.receive(message);await until(()=>release);
+ f.setHealth({ready:false});await f.guard.check({force:true});assert.equal(f.buffer.pendingReplies.get(uiKey).parts[0].state,'sending');release();
+ await until(()=>f.buffer.pendingReplies.get(uiKey)?.parts[0].state==='submitted');confirmed=true;
+ await until(()=>!f.buffer.pendingReplies.size&&f.buffer.recent(uiKey).some(row=>row.delivery_status==='confirmed'));
+ assert.equal(f.sent.filter(([, ,options])=>!options.receiptOnly).length,1);assert(f.sent.every(([,text])=>text==='first native part'));assert.equal(f.calls.length,1);
 });
 test('fresh input after a recovered instance is not dropped by a second request in flight',async t=>{
  let finish;const f=fixture(t,{decide:(_key,prompt)=>prompt.includes('original')?new Promise(resolve=>finish=resolve):'RESPOND: fresh result'});await f.guard.check();f.engine.receive(incoming('original',f.now+1000));await until(()=>finish);

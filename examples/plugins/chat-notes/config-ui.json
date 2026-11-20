@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "sections": [
+    {"id":"retention","title":"便签保存","fields":["maxNotes"]}
+  ],
+  "fieldOptions": {
+    "maxNotes": {"help":"每个聊天可保留 1 到 50 条便签。"}
+  }
+}

@@ -1,0 +1,6 @@
+# The reviewed first-party ZIP is compared byte-for-byte with these sources.
+# Keep their bytes stable on Windows checkouts with core.autocrlf enabled.
+optional-extensions/fish-notebook/** text eol=lf
+optional-extensions/packages/*.zip -text
+# Runtime verifies this public UI template bundle by its exact reviewed bytes.
+scripts/wechat-navigation-templates.json text eol=lf

@@ -4,19 +4,15 @@ import {PluginProcess} from './process.mjs';
 import {configuration,scanPlugins,allowedChat,validateValue,atomicJson,directory,hash,json,fail} from './catalog.mjs';
 import {safeFetch} from '../../components/qq-bridge/src/safe-fetch.js';
 import {PluginDocuments} from './documents.mjs';
-import {createAudioReader} from './audio.mjs';
 import {boundedTask} from '../dsh-social-bridge-plugin/deadline.mjs';
-import {FEATURE_ENTRIES,adapterOwnsPlugin,featureConfigured} from './contract.mjs';
 export {createPluginModelUtility} from './model-utility.mjs';
 export const TOOL_POLICY=Symbol.for('wechatagent.extension-tools.v1');
 
 const text=value=>String(value??'').slice(0,12000);
 export class PluginRuntime{
-  constructor({root,accountScope='unbound',isAllowed=()=>true,historyFor=()=>[],rowsForDate=()=>[],personaFor=()=>{throw fail('PLUGIN_PERSONA_UNAVAILABLE');},generateText,readAudio,isBusy=()=>false,canSchedule=()=>true,now=Date.now,log=()=>{},fetchText=safeFetch,toolTimeoutMs=8000,onlyFeatures=[]}){
+  constructor({root,accountScope='unbound',isAllowed=()=>true,historyFor=()=>[],rowsForDate=()=>[],personaFor=()=>{throw fail('PLUGIN_PERSONA_UNAVAILABLE');},generateText,isBusy=()=>false,canSchedule=()=>true,now=Date.now,log=()=>{},fetchText=safeFetch,toolTimeoutMs=8000}){
     this.root=path.resolve(root);this.accountScope=hash(accountScope);this.isAllowed=isAllowed;this.historyFor=historyFor;this.log=log;this.fetchText=fetchText;
     this.records=new Map();this.dirty=true;this.revision='';this.closed=false;
-    this.onlyFeatures=onlyFeatures;
-    this.readAudio=readAudio??createAudioReader(root);
     this.accountBound=accountScope!=='unbound'&&!!accountScope;this.accountId=/^[a-f0-9]{64}$/.test(accountScope)?accountScope:hash(accountScope);Object.assign(this,{rowsForDate,personaFor,generateText,isBusy,canSchedule,now});this.utilityCalls=0;this.scheduleRetry=new Map();
     this.toolTimeoutMs=Math.max(20,Math.min(8000,toolTimeoutMs));
     const base=directory(root,'plugins');try{this.watcher=fs.watch(base,{recursive:true},()=>{this.dirty=true;});this.watcher.on('error',()=>{this.dirty=true;});this.watcher.unref();}catch{}
@@ -38,10 +34,7 @@ export class PluginRuntime{
   async reconcile(){
     const saved=this.policy(),changed=saved.revision!==this.revision;
     if(!this.dirty&&!changed)return;
-    const catalog=scanPlugins(this.root).filter(item=>this.onlyFeatures.length
-      ? this.onlyFeatures.some(feature=>item.requiresHostFeatures?.includes(feature))
-      : !adapterOwnsPlugin(item));
-    this.catalog=catalog;this.dirty=false;this.revision=saved.revision;
+    const catalog=this.dirty||changed||!this.catalog?scanPlugins(this.root):this.catalog;this.catalog=catalog;this.dirty=false;this.revision=saved.revision;
     for(const [id,record]of this.records){
       const next=catalog.find(item=>item.id===id),setting=saved.config.plugins[id];
       if(!next||next.revision!==record.revision||record.generation!==setting?.generation||!setting?.enabled){await record.process?.dispose();this.records.delete(id);}
@@ -51,7 +44,7 @@ export class PluginRuntime{
       if(this.closed)break;
       const setting=saved.config.plugins[item.id];if(this.records.has(item.id))continue;
       const record={...item,generation:setting?.generation};this.records.set(item.id,record);
-      if(item.invalid||!setting?.enabled||item.requiresAccount&&!this.accountBound||item.permissions.some(p=>!setting.permissions?.includes(p)))continue;
+      if(item.invalid||!setting?.enabled||item.permissions.some(p=>!setting.permissions?.includes(p)))continue;
       if(started>=8||Date.now()>=deadline){record.failure='启用的插件过多或加载超时，请停用部分插件后重新保存。';continue;}
       started++;
       try{
@@ -61,7 +54,7 @@ export class PluginRuntime{
     }
   }
   list(){
-    return [...this.records.values()].map(record=>({id:record.id,actions:record.process?.actions??[],loaded:!!record.process&&!record.process.closed,active:this.active(record),reason:record.invalid?record.reason:record.failure??(!this.policy().config.plugins[record.id]?.enabled?'已关闭':record.requiresAccount&&!this.accountBound?'请先绑定微信账号':!this.active(record)?'权限未授予或等待加载':'已生效')}));
+    return [...this.records.values()].map(record=>({id:record.id,actions:record.process?.actions??[],loaded:!!record.process&&!record.process.closed,active:this.active(record),reason:record.invalid?record.reason:record.failure??(!this.policy().config.plugins[record.id]?.enabled?'已关闭':!this.active(record)?'权限未授予或等待加载':'已生效')}));
   }
   toolDefinitions(key){if(typeof key!=='string'||!/^wechat:(private|group):[1-9]\d*$/.test(key))return [];return [...this.records.values()].filter(record=>this.active(record,key)).flatMap(record=>(record.process.tools??[]).map(tool=>({...tool,name:record.id+'__'+tool.id,pluginId:record.id})));}
   bindingRevision(key){return this.toolDefinitions(key).map(tool=>tool.name+':'+this.records.get(tool.pluginId).revision+':'+this.records.get(tool.pluginId).generation).join('|');}
@@ -70,22 +63,8 @@ export class PluginRuntime{
   service(record,turn,signal,readOnly=false){
     const check=permission=>{if(signal.aborted||!this.active(record,turn.conversationKey,permission))throw fail('PLUGIN_PERMISSION_DENIED');};
     return async(method,args)=>{
-      const limit=method.startsWith('documents.')?1100000:method==='model.generate'?128*1024:method==='audio.write'?384*1024:64*1024;
+      const limit=method.startsWith('documents.')?1100000:method==='model.generate'?128*1024:64*1024;
       if(!Array.isArray(args)||Buffer.byteLength(JSON.stringify(args))>limit)throw fail('PLUGIN_SERVICE_ARGUMENT_INVALID');
-      if(method==='audio.read'){
-        check('audio_read');if(readOnly)throw fail('PLUGIN_HOOK_READ_ONLY');
-        const [id,options]=args;
-        if(!this.accountBound||!turn.voiceIds?.includes(id)||!options||Object.keys(options).some(key=>key!=='format')||!['wav','silk'].includes(options.format??'wav'))throw fail('VOICE_REFERENCE_NOT_ALLOWED');
-        const result=await this.readAudio(id,turn.conversationKey,record.id,{...options,signal});
-        check('audio_read');return result;
-      }
-      if(method==='audio.write'){
-        check('audio_synthesize');
-        if(readOnly||!this.accountBound||typeof turn.writeVoice!=='function')throw fail('PLUGIN_SERVICE_UNAVAILABLE');
-        if(args.length!==1||typeof args[0]!=='string')throw fail('PLUGIN_SERVICE_ARGUMENT_INVALID');
-        turn.writeVoice(args[0]);
-        return {ok:true};
-      }
       if(method.startsWith('documents.')){
         check('documents');const documents=new PluginDocuments(this.root,this.accountScope,this.accountId,record);
         if(method==='documents.get')return documents.get(turn.conversationKey,args[0]);
@@ -174,29 +153,8 @@ export class PluginRuntime{
   async invokeAction(id,name,args,turn,{signal,timeoutMs=35000,requireReply=false}={}){
     if(!allowedChat(this.root,turn.conversationKey))throw fail('PLUGIN_CHAT_UNAVAILABLE');await this.sync();const record=this.records.get(id);
     if(!record||!this.active(record,turn.conversationKey))return {handled:false};
-    if(['voice-output-v1','voice-dialogue-v1'].some(feature=>name===FEATURE_ENTRIES[feature].action&&record.requiresHostFeatures.includes(feature)))throw fail('PLUGIN_ACTION_UNAVAILABLE');
     const action=record.process.actions.find(action=>action.id===name);if(!action)throw fail('PLUGIN_ACTION_UNAVAILABLE');validateValue(args,action.parameters);
     return this.invoke(record,'action',name,args,turn,{signal,timeoutMs,requireReply});
-  }
-  // FEATURE_ENTRIES routing: active plugins for this chat that declare the
-  // feature, hold its permission and register its action.
-  featureHandlers(feature,key){
-    const entry=FEATURE_ENTRIES[feature];if(!entry)return [];
-    const saved=this.policy().config.plugins;
-    return [...this.records.values()].filter(record=>this.active(record,key,entry.permission)&&featureConfigured(record,saved[record.id],feature)&&record.process.actions?.some(action=>action.id===entry.action)).sort((a,b)=>a.id.localeCompare(b.id));
-  }
-  async invokeFeature(feature,args,turn,options={}){
-    const entry=FEATURE_ENTRIES[feature];if(!entry)throw fail('PLUGIN_FEATURE_UNAVAILABLE');
-    if(['voice-output-v1','voice-dialogue-v1'].includes(feature)&&typeof turn.writeVoice!=='function')throw fail('PLUGIN_SERVICE_UNAVAILABLE');
-    if(!allowedChat(this.root,turn.conversationKey))throw fail('PLUGIN_CHAT_UNAVAILABLE');await this.sync();
-    const handlers=this.featureHandlers(feature,turn.conversationKey);
-    if(!handlers.length)return {handled:false};
-    // Two handlers for one chat is a configuration conflict; never pick one silently.
-    if(handlers.length>1)throw Object.assign(fail('PLUGIN_FEATURE_CONFLICT'),{plugins:handlers.map(record=>record.id)});
-    const [record]=handlers,action=record.process.actions.find(action=>action.id===entry.action);validateValue(args,action.parameters);
-    const result=await this.invoke(record,'action',action.id,args,turn,options);
-    if(!this.active(record,turn.conversationKey,entry.permission))throw fail('PLUGIN_PERMISSION_DENIED');
-    return {handled:true,plugin:record.id,generation:record.generation,result};
   }
   async invoke(record,kind,name,args,turn,{signal,timeoutMs=35000,requireReply=false}={}){
     const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();

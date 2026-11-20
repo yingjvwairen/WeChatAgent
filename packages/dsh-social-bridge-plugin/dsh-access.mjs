@@ -1,3 +1,4 @@
+import {selectedWechat} from './ui-selection-policy.mjs';
 import fs from 'node:fs';import path from 'node:path';
 import {conversationAccess,conversationWorkMode} from './conversation-policy.mjs';
 import {decorateToolCatalog} from './plugin-catalog.mjs';
@@ -6,7 +7,7 @@ const reserved=new Set(['skill','wechat_web_search','wechat_file_receive','wecha
 const controlTool=/^(?:bash|shell|pwsh|powershell|terminal|exec_command|apply_patch|read|write|edit|glob|grep|job|file|read_file|write_file|edit_file|agent|task|config|plugin|session|schedule|automation)(?:$|[_.:-])/i;
 export const assignableTool=(name,mode='social')=>typeof name==='string'&&!reserved.has(name)&&(mode==='assistant'||!controlTool.test(name))&&/^[\w.:-]{1,120}$/.test(name);
 const esc=text=>String(text??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
-const readPolicy=(root,key)=>{try{const file=path.join(root,'config/wechatagent.json'),stat=fs.lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>1048576)return {skills:[],tools:[]};const w=JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'' )).wechat;return {...conversationAccess(w,key),workMode:conversationWorkMode(w,key)};}catch{return {skills:[],tools:[]};}};
+const readPolicy=(root,key)=>{try{const file=path.join(root,'config/wechatagent.json'),stat=fs.lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>1048576)return {skills:[],tools:[]};const w=selectedWechat(root,JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'' )).wechat);return {...conversationAccess(w,key),workMode:conversationWorkMode(w,key)};}catch{return {skills:[],tools:[]};}};
 export {readPolicy as readDshAccess};
 export async function dshCatalog(ctx,{scope,cwd,signal,workMode='social',includePlugins=true}={}){
   const skillsService=scope?.ctx?.get?.('skills')??ctx.get?.('skills'),toolsService=ctx.get?.('tools')??ctx.tools;

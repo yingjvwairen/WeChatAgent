@@ -1,0 +1,60 @@
+#bot-maintenance-controls, #bot-speech-controls { display: grid; gap: 18px; min-width: 0; }
+.bot-control-panel .form-grid > .field { min-width: 0; }
+.bot-control-panel .form-grid > .full { grid-column: 1 / -1; }
+#speech-provider-form { display: grid; gap: 16px; margin-top: 12px; }
+#speech-provider-form > button { justify-self: start; }
+.speech-provider-group { min-width: 0; }
+.speech-profile-editor { margin-top: 4px; }
+.speech-profile-editor > summary { width: fit-content; color: var(--muted); font-size: 13px; }
+.speech-profile-editor [data-asr-fields] { display: grid; gap: 12px; }
+.speech-provider-row > * { min-width: 0; }
+.speech-provider-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 12px; }
+.speech-provider-group [data-speech-cloud]:not([hidden]) { display: grid; gap: 10px; margin-top: 12px; }
+.speech-provider-group [data-speech-cloud] > button { justify-self: start; }
+#speech-provider-form [hidden] { display: none; }
+.voice-choice-row { display: flex; align-items: center; gap: 8px; }
+.voice-choice-row select { flex: 1; min-width: 0; }
+.voice-choice-row button { flex: none; }
+#bot-asr-status, #bot-voice-status { margin: 4px 0 0; }
+.bot-control-panel .field input, .bot-control-panel .field select, .bot-control-panel .field textarea { width: 100%; }
+.bot-control-panel .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.bot-control-panel .toggle-row strong, .bot-control-panel .toggle-row small { display: block; }
+.bot-control-panel .toggle-row small { color: var(--muted); margin-top: 6px; line-height: 1.7; }
+.bot-control-panel input[role="switch"] { appearance: none; flex: 0 0 42px; width: 42px; height: 24px; border-radius: 15px; border: 1px solid var(--border); background: var(--surface-2); position: relative; }
+.bot-control-panel input[role="switch"]::after { content: ""; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); }
+.bot-control-panel input[role="switch"]:checked { background: var(--accent-soft); }
+.bot-control-panel input[role="switch"]:checked::after { left: 21px; background: var(--accent); }
+.bot-control-panel input[role="switch"]:disabled { opacity: .65; cursor: not-allowed; }
+#page-body:has(.bot-control-panel[inert]) { cursor: progress; }
+.bot-control-panel details > summary { cursor: pointer; padding: 10px 0; }
+.bot-control-panel [inert] { opacity: .7; }
+.bot-control-panel .button-row { flex-wrap: wrap; }
+#bot-runtime-card .runtime-heading { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#bot-runtime-card .runtime-heading h3 { margin: 0; }
+#bot-runtime-card .runtime-heading .status-tag { margin: 0; }
+#bot-runtime-card .runtime-copy { min-width: 0; }
+#bot-runtime-card .runtime-blockers { color: var(--muted); font-size: 12px; margin: 8px 0 0; padding-left: 18px; }
+#bot-runtime-card .notice { display: grid; gap: 10px; margin-top: 14px; }
+#bot-runtime-card .notice p { margin: 0; }
+#bot-runtime-audio:not(:empty) { display: grid; gap: 10px; margin-top: 14px; }
+#bot-runtime-audio > button { justify-self: start; }
+.bot-control-panel .maintenance-result { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.bot-control-panel .maintenance-result:not(:empty) { margin-top: 12px; }
+.bot-control-panel .maintenance-result p { margin: 0; }
+.bot-control-panel .maintenance-result > * + * { margin-top: 10px; }
+@media (max-width: 640px) {
+  #bot-runtime-card .card-header { align-items: flex-start; flex-wrap: wrap; }
+  #bot-runtime-card .runtime-row { align-items: flex-start; flex-direction: column; }
+}
+#bot-interaction-card .card-header { margin-bottom: 4px; }
+#bot-interaction-card .toggle-row { margin: 0; padding: 10px 0; }
+#bot-interaction-card .toggle-row + .toggle-row { border-top: 1px solid var(--border); }
+#bot-interaction-card .toggle-row small { margin-top: 3px; line-height: 1.5; }
+#bot-interaction-help { margin: 4px 0; }
+#bot-interaction-help:empty { display: none; }
+#bot-foreground-timing { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+#bot-foreground-timing h3 { margin: 0 0 10px; font-size: 14px; }
+#bot-foreground-timing .timing-record + .timing-record { margin-top: 12px; }
+#bot-foreground-timing .timing-record p { margin: 0; }
+#bot-foreground-timing .timing-record { font-size: 13px; font-variant-numeric: tabular-nums; }
+#bot-foreground-timing .timing-record ul { margin: 4px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }

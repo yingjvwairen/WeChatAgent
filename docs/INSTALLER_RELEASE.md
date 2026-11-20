@@ -1,46 +1,9 @@
 # Windows 安装发行版 0.4.5
 
-安装器为 WeChatAgent-Setup-0.4.5-x64.exe，适用 Windows 10/11 x64。包含桌面应用、Node.js、Python、读取依赖，以及维护者已授权的匹配微信与原生发送/自动连接组件。全新安装匹配微信 4.2.0.12，安装包仅包含这一个微信版本及对应发送组件，桥接插件 SDK 为 0.2.0-rc.2；DSH 桌面程序独立安装，不包含在安装包中。公开发布标识为 0.4.5，npm/Electron 内部版本为 0.4.5。
+Windows x64 安装包包括桌面控制台、控制台运行环境、Reader 源码和 UIA/OCR 所用的本机辅助程序。安装包构建时从随包源码编译辅助程序，首次启动和升级时按发行清单校验后部署。
 
-## 安装与升级
+安装后选择本机已安装的 DSH 程序和微信程序。保存 DSH 路径后，Reader、媒体和 OCR 可使用该 DSH 自带的 Python 3.12 创建独立环境。在连接设置中核验账号和数据库，在准备组件页安装 OCR 依赖、校验识别模型。完成本机窗口标定和音频设置后再启用发送。操作入口见[日常使用](DAILY_USE.md)。
 
-只需选择一次根目录：程序放入 app，WeChatAgent 数据放入同级 data。同位置升级保留已有数据路径；更换位置时首次启动确认来源与目标后复制并校验，原副本保留。微信原始数据库不搬动，DSH 保持自己的数据位置。建议预留至少 6 GiB，迁移保留旧副本需要额外空间。
+原位置升级保留账号数据、人格、会话授权和本机标定。升级前先停止后台服务并退出桌面控制台，防止正在运行的助手占用旧文件。使用源码迁移到另一台电脑时，按[副机部署说明](SECONDARY_PC_DEPLOYMENT.md)重新准备依赖和本机标定。
 
-升级前停止服务并完整退出旧版助手、DSH 和匹配微信；安装后准备连接配置并完整重开 DSH，以加载新版插件。新用户在首次配置中登录微信、验证数据库、安装或选择 DSH 并启用本机插件，再添加允许的聊天。初始允许范围为空。
-
-窗口“×”仍收起到托盘；“退出应用”先停止本实例后台服务，停止失败保留窗口供重试。微信和外部 DSH 保持运行。卸载默认保留独立数据目录。详见[数据位置与迁移](DATA_STORAGE.md)、[退出与后台服务](EXIT_SHUTDOWN.md)。
-
-## 0.4.5 功能入口
-
-语音识别 API 1.6.0 和语音对话 API 1.7.0 随安装包预置，默认关闭，可从能力目录直接配置。已有同名插件及其设置在升级时保留。
-
-安装包内置支持原生语音发送的 4.2.0.12 Hook。升级后从托盘退出旧微信，再由控制台打开匹配微信以加载新版组件。配置及实验性后端见 [语音输出](VOICE_OUTPUT.md)。
-
-安装包同时提供前台模拟输入的 Python 依赖。在「设置 → 连接设置 → 微信发送方式」可以切换，无需另装 Python 包。切换后请退出带 Hook 的微信，再打开干净客户端。[前台模拟输入说明](FOREGROUND_INPUT.md)
-
-六项主导航为概览、聊天、人格、能力、表情包、设置。单聊任务、授权和工作区集中在聊天详情；管理员和反馈语录位于助手设置，搜索与网页阅读位于能力，诊断与日志位于设置。详见[界面导航](UI_LAYOUT.md)、[远程助手](ASSISTANT_REMOTE.md)、[文件收发](FILE_TRANSFER.md)、[语录管理](ASSISTANT_FEEDBACK.md)。
-
-## 构建
-
-维护者准备已授权的匹配微信、Hook 编译产物、wx_key.dll 和锁定依赖后，按根 package.json 的版本构建。无需准备 DSH 桌面程序或设置 WECHATAGENT_DSH_SOURCE；发行清单标记 dshBundled=false。
-
-```powershell
-npm run desktop:build
-npm run installer:runtime
-npm run installer:build
-npm run source:build
-node scripts/verify-plugin-release.mjs
-npm run privacy:check
-```
-
-源码额外包含已校验的 fish-notebook-1.1.1.zip、speech-recognition-1.6.0.zip 和 speech-synthesis-1.7.0.zip，以及固定版本、保留许可的 SILK 解码最小载荷；不包含完整安装器、vendor 程序及个人数据。安装器、源码包、可选插件、SHA256SUMS.txt 与 VERIFICATION-0.4.5.json 随版本发布。[GitHub Releases](https://github.com/sourcepro5/WeChatAgent/releases)
-
-## 验证范围
-
-构建资源哈希、公开源码检查及安装包内容见 `VERIFICATION-0.4.5.json`。4.2 原生组件已实测冷启动登录，并在文件传输助手核对文字、普通图片、原生动画 GIF 和语音气泡的服务器回执。前台模式的安装包校验覆盖 Python 运行依赖和工作进程入口。[微信适配说明](WECHAT_4_2_0_12.md)
-
-## 新版微信与升级保留
-
-0.4.5 全新安装使用独立微信 4.2.0.12 和外置原生发送组件。打开匹配微信会自动开启程序目录保护。旧安装升级保留已有的微信版本选择、账号、凭据、人格和允许的聊天；新版客户端同时准备就绪，可在连接设置中切换。维护程序文件前通过客户端维护入口解除保护。
-
-图片和真实 @ 为新增底层原生 API，尚未提供完整的默认 OneBot/模型工具发送链路。4.2 原生 GIF 表情已接入 dsh-meme 和共享表情池发送，保持动画并核对服务器回执；普通文件与引用发送仍未支持。具体范围见 [4.2.0.12 适配](WECHAT_4_2_0_12.md)和[客户端保护](CLIENT_PROTECTION.md)。
+从源码创建安装程序时，使用 `npm run installer:runtime` 准备内置控制台运行环境，再执行 `npm run installer:build`。构建输出位于 `release/installer/`。

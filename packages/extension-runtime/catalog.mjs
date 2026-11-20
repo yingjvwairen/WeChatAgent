@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import {selectedWechat} from '../dsh-social-bridge-plugin/ui-selection-policy.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -169,7 +170,7 @@ export function allowedChat(root,key) {
   try {
     const match = /^wechat:(private|group):([1-9]\d*)$/.exec(key ?? '');
     const config = readJson(path.join(root,'config/wechatagent.json'));
-    return !!match && (config.wechat?.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(match[2]);
+    return !!match && (selectedWechat(root,config.wechat)?.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(match[2]);
   } catch { return false; }
 }
 export function updateExtension(root,id,body) {

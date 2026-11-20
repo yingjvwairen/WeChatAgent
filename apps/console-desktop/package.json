@@ -5,6 +5,5 @@
   "description": "WeChatAgent Windows desktop console",
   "productName": "WeChatAgent",
   "main": "main.cjs",
-  "license": "SEE LICENSES.md",
-  "releaseVersion": "0.4.5"
+  "license": "SEE LICENSES.md"
 }

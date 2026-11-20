@@ -1,7 +1,8 @@
+import {uiSelectionDecision} from './ui-selection-policy.mjs';
 export const MEME_LIBRARY_POLICY=Symbol.for('wechatagent.meme-library.v1');
 export function memeLibraryPolicy(wechat,key){
   const match=/^wechat:(private|group):([1-9]\d{0,15})$/.exec(key??''),settings=wechat?.memeLibrary??{};
-  const allowed=!!match&&Number.isSafeInteger(Number(match[2]))&&(wechat.whitelist?.[match[1]==='group'?'groups':'private']??[]).some(id=>String(id)===match[2]);
+  const allowed=!!match&&Number.isSafeInteger(Number(match[2]))&&(uiSelectionDecision(key)??(wechat.whitelist?.[match[1]==='group'?'groups':'private']??[]).some(id=>String(id)===match[2]));
   return {enabled:allowed&&(settings.chats?.[key]??settings.enabled??false)===true&&(wechat.stickers?.chats?.[key]??wechat.stickers?.enabled??true)===true,allowImport:settings.allowImport===true};
 }
 export function validateMemeLibrarySettings(settings){

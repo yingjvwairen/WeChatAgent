@@ -1,3 +1,4 @@
+import {selectedWechat} from './ui-selection-policy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { webReaderEnabled, WEB_READER_TOOL, WEB_READER_POLICY, WEB_READER_LIMITS, normalizeWebUrl, webUrls } from './web-reader-policy.mjs';
@@ -16,7 +17,7 @@ export function localWebReaderEnabled(root, key) {
     const stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) return false;
     const config = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
-    return !!webReaderEnabled(config.wechat, key);
+    return !!webReaderEnabled(selectedWechat(root,config.wechat), key);
   } catch { return false; }
 }
 

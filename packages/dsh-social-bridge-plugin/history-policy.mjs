@@ -1,3 +1,4 @@
+import {uiSelectionDecision,selectedWechat} from './ui-selection-policy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -27,12 +28,13 @@ export function validateHistorySettings(value){
 }
 export function historyPolicy(wechat={},key){
   const value=wechat.history??{};validateHistorySettings(value);
-  const match=/^wechat:(private|group):([1-9]\d*)$/.exec(key),allowed=match&&(wechat.whitelist?.[match[1]==='group'?'groups':'private']??[]).map(String).includes(match[2]);
+  const match=/^wechat:(private|group):([1-9]\d*)$/.exec(key),allowed=match&&(uiSelectionDecision(key)??(wechat.whitelist?.[match[1]==='group'?'groups':'private']??[]).map(String).includes(match[2]));
   return {...HISTORY_DEFAULTS,...value,enabled:!!allowed&&value.enabled===true&&value.chats?.[key]!==false};
 }
 export function readHistoryPolicy(root,key){
   const file=path.join(root,'config/wechatagent.json');
-  return historyPolicy(fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')).wechat:{},key);
+  const wechat=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')).wechat:{};
+  return historyPolicy(selectedWechat(root,wechat),key);
 }
 export function sessionSize(session){
   const events=session.snapshotEvents(),nodes=new Set(session.surface.nodes);

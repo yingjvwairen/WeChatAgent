@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
+import {nativeQuoteKind} from './native-quote-source.mjs';
 const {usageMetrics,summarizeUsage}=await import(new URL('./usage-summary.mjs'+new URL(import.meta.url).search,import.meta.url));
 
 const hash=value=>crypto.createHash('sha256').update(value).digest('hex');
@@ -54,12 +55,12 @@ export class HistoryStore{
     });
   }
   transaction(action){this.db.exec('BEGIN IMMEDIATE');try{const result=action();this.db.exec('COMMIT');return result;}catch(error){this.db.exec('ROLLBACK');throw error;}}
-  hasIncoming(key,message){
+  hasIncoming(key,message,{replayOnly=false}={}){
     if(!validKey(key)||!message.message_id)return false;
     const row=this.db.prepare('SELECT body FROM records WHERE chat=? AND id=?').get(key,'message:'+String(message.sender_id??'')+':'+String(message.message_id));
     if(!row)return false;
     const body=JSON.parse(row.body);
-    return !body.outgoing;
+    return !body.outgoing&&(!replayOnly||['context','reply'].includes(body.offline_replay));
   }
   append(key,row,{source='bridge',fullText=row.text}={}){
     if(!validKey(key))throw Error('HISTORY_CHAT_INVALID');
@@ -69,11 +70,17 @@ export class HistoryStore{
     // objects never enter the archive. Text itself is not buffer-truncated.
     const body=Object.fromEntries(['id','platform','kind','conversation_id','conversation_name','sender_id','sender_name','sender_key','self_id','message_id','timestamp','outgoing','delivery_id','delivery_status','proactive','interaction','sticker_id','forwardedRecord','quoteReply'].filter(k=>row[k]!==undefined).map(k=>[k,row[k]]));
     body.text=String(fullText??'');body.images=(row.images??[]).filter(x=>/^[a-f0-9]{64}$/.test(x?.id??'')).map(x=>({id:x.id}));
+    if(row.contextOnly)body.contextOnly=true;
+    const kind=nativeQuoteKind(row);
+    if(kind&&kind!=='text')body.quoteKind=kind;
+    if(row.offline_replay)body.offline_replay=row.offline_replay;
     const at=Number(row.timestamp)||Date.now()/1000;
     return this.transaction(()=>{
       const previous=this.db.prepare('SELECT seq,body,text FROM records WHERE chat=? AND id=?').get(key,id);
       // A restart backfill must never replace a full text with its 4000-char buffer copy.
       if(previous){const old=JSON.parse(previous.body);if(old.text.length>body.text.length&&old.text.startsWith(body.text))body.text=old.text;
+        if(old.quoteKind&&!body.quoteKind)body.quoteKind=old.quoteKind;
+        if(old.contextOnly)body.contextOnly=true;
         if(old.delivery_status==='confirmed'&&body.delivery_status!=='confirmed')return previous.seq;
         if(old.delivery_status==='confirmed')body.delivery_status='confirmed';
         if(JSON.stringify(body)!==previous.body){

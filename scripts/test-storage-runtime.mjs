@@ -28,7 +28,7 @@ test('new and upgraded bundled runtimes keep the selected DSH home and preserve 
  const write=(relative,value)=>{const file=path.join(resources,relative);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,typeof value==='string'?value:JSON.stringify(value));};
  const config=JSON.parse(fs.readFileSync(path.join(source,'config/wechatagent.example.json'),'utf8'));
  write('project/config/wechatagent.example.json',config);write('project/deployment.json',{version:'test-1',files:['config/wechatagent.example.json']});
- for(const file of ['runtime/python/python.exe','runtime/node.exe','vendor/dsh/DeepSeek Harness.exe','vendor/wechat/Weixin.exe','vendor/hook/version.dll'])write(file,'fixture');write('vendor/hook/build.json',{});
+ for(const file of ['runtime/python/python.exe','runtime/node.exe','vendor/dsh/DeepSeek Harness.exe'])write(file,'fixture');
  const first=await deployment.bootstrapDeployment(resources,home),file=path.join(first.root,'config/distribution.json');assert.equal(JSON.parse(fs.readFileSync(file)).dshHome,path.join(home,'dsh'));
  const configFile=path.join(first.root,'config/wechatagent.json'),saved=JSON.parse(fs.readFileSync(configFile));saved.runtime.dshDesktop=path.join(base,'independent/Harness.exe');saved.wechat.whitelist.private=['123'];fs.writeFileSync(configFile,JSON.stringify(saved));
  write('project/deployment.json',{version:'test-2',files:['config/wechatagent.example.json']});await deployment.bootstrapDeployment(resources,home);

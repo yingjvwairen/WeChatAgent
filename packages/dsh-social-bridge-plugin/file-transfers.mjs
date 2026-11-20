@@ -2,6 +2,8 @@ import fs from 'node:fs';import path from 'node:path';import crypto from 'node:c
 import {Transform} from 'node:stream';import {pipeline} from 'node:stream/promises';
 
 import {assistantSenderAllowed,assistantAdministrator} from './assistant-policy.mjs';
+import {fetchBoundReaderFile} from './reader-media-access.mjs';
+import {assertUiSelectionCurrent} from './ui-selection-policy.mjs';
 export const FILE_LIMIT=50*1024*1024;
 export const FILE_TRANSFER_POLICY=Symbol.for('wechatagent.file-transfer.v1');
 export const fileId=value=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value);
@@ -24,7 +26,7 @@ export class FileTransfers {
   list(){if(!fs.existsSync(this.jobs))return [];noLinks(this.root,this.jobs);return fs.readdirSync(this.jobs).filter(name=>/^[a-f0-9]{64}\.json$/.test(name)).slice(0,256).flatMap(name=>{try{return [this.read(name.slice(0,-5))];}catch{return [];}});}
   staged(job){const file=path.join(this.outgoing,job.id,job.name);noLinks(this.root,file);if(!fs.statSync(file).isFile()||fs.statSync(file).size!==job.size)throw fault('FILE_STAGED_INVALID');return file;}
   async hash(file,signal){const md5=crypto.createHash('md5'),sha=crypto.createHash('sha256');let size=0;for await(const block of fs.createReadStream(file,{signal})){size+=block.length;if(size>FILE_LIMIT)throw fault('FILE_TOO_LARGE');md5.update(block);sha.update(block);}return {size,md5:md5.digest('hex'),sha256:sha.digest('hex')};}
-  async queue({key,sender,cwd,file,name,batchId,signal}){
+  async queue({key,sender,cwd,file,name,batchId,signal,selectionScope}){
     this.assert(key,sender);if(!fileId(batchId)||typeof file!=='string'||file.length>1000||path.isAbsolute(file)||/^[A-Za-z]:|^[/\\]|\0/.test(file))throw fault('FILE_RELATIVE_PATH_REQUIRED');
     const base=fs.realpathSync(cwd),source=path.resolve(base,file);noLinks(base,source);if(!inside(base,fs.realpathSync(source))||!fs.statSync(source).isFile())throw fault('FILE_OUTSIDE_WORKSPACE');if(fs.statSync(source).size>FILE_LIMIT)throw fault('FILE_TOO_LARGE');
     name=name??path.basename(source);if(!safeFileName(name))throw fault('FILE_NAME_INVALID');
@@ -36,22 +38,36 @@ export class FileTransfers {
     try{await pipeline(fs.createReadStream(source),new Transform({transform(chunk,_encoding,done){size+=chunk.length;if(size>FILE_LIMIT)return done(fault('FILE_TOO_LARGE'));check.update(chunk);done(null,chunk);}}),fs.createWriteStream(temporary,{flags:'wx',mode:0o600}),{signal});
       if(size!==fingerprint.size||check.digest('hex')!==fingerprint.sha256)throw fault('FILE_CHANGED_DURING_COPY');
       this.assert(key,sender);if(this.account()!==accountScope)throw fault('FILE_ACCOUNT_CHANGED');
-      fs.renameSync(temporary,destination);const now=Date.now(),job={version:1,id,key,sender,accountScope,name,...fingerprint,state:'queued',createdAt:now,deadlineAt:now+120000};this.write(job);return publicJob(job);
+      fs.renameSync(temporary,destination);const now=Date.now(),job={version:1,id,key,sender,accountScope,name,...fingerprint,...(selectionScope?{uiaFile:true,selectionScope:structuredClone(selectionScope)}:{}),state:'queued',createdAt:now,deadlineAt:now+120000};this.write(job);return publicJob(job);
     }catch(error){fs.rmSync(temporary,{force:true});throw error;}
   }
   status(id,key,sender){this.assert(key,sender);const job=this.read(id);if(job.key!==key||job.accountScope!==this.account()||job.sender!==sender&&!assistantAdministrator(this.settings().wechat,sender))throw fault('FILE_REFERENCE_NOT_ALLOWED');return publicJob(job);}
   async receive({id,key,sender,cwd,signal,fetchImpl=fetch}){
-    this.assert(key,sender);if(!fileId(id))throw fault('FILE_REFERENCE_INVALID');const io=read(path.join(this.root,'state/wechat-io-config.json')),base=new URL(io.reader_base_url);
-    if(base.protocol!=='http:'||base.hostname!=='127.0.0.1'||base.username||base.password||base.pathname!=='/'||base.search||base.hash)throw fault('FILE_READER_LOOPBACK_REQUIRED');
-    const response=await fetchImpl(base.origin+'/api/v1/files/'+id+'?conversationKey='+encodeURIComponent(key)+'&senderWxid='+encodeURIComponent(sender),{headers:{Authorization:'Bearer '+io.reader_token},redirect:'error',signal});
-    if(!response.ok)throw fault('FILE_READER_UNAVAILABLE');const data=await response.json();if(data.status!=='ready')return {status:data.status,message:String(data.message??'文件尚未准备好。').slice(0,300)};
+    this.assert(key,sender);if(!fileId(id))throw fault('FILE_REFERENCE_INVALID');
+    const accountScope=this.account(),selected=this.settings().runtime?.sender==='wechat-ui';
+    let data,checkBinding;
+    if(selected){
+      const bound=await fetchBoundReaderFile(this.root,id,key,sender,{signal,fetchImpl});
+      data=bound.file;checkBinding=bound.assertCurrent;assertUiSelectionCurrent();
+    }else{
+      const io=read(path.join(this.root,'state/wechat-io-config.json')),base=new URL(io.reader_base_url);
+      if(base.protocol!=='http:'||base.hostname!=='127.0.0.1'||base.username||base.password||base.pathname!=='/'||base.search||base.hash)throw fault('FILE_READER_LOOPBACK_REQUIRED');
+      const response=await fetchImpl(base.origin+'/api/v1/files/'+id+'?conversationKey='+encodeURIComponent(key)+'&senderWxid='+encodeURIComponent(sender),{headers:{Authorization:'Bearer '+io.reader_token},redirect:'error',signal});
+      if(!response.ok)throw fault('FILE_READER_UNAVAILABLE');
+      data=await response.json();
+    }
+    if(data.status!=='ready')return {status:data.status,message:String(data.message??'文件尚未准备好。').slice(0,300)};
     if(data.id!==id||data.conversationKey!==key||data.senderWxid!==sender||!safeFileName(data.name)||!fileId(data.sha256)||!/^[a-f0-9]{32}$/.test(data.md5??'')||!Number.isSafeInteger(data.size)||data.size<0||data.size>FILE_LIMIT)throw fault('FILE_BINDING_INVALID');
-    const accountScope=this.account(),accountRoot=fs.realpathSync(data.accountRoot),source=fs.realpathSync(data.path);noLinks(accountRoot,data.path);
-    if(!['msg/file','FileStorage/File'].some(folder=>inside(path.join(accountRoot,folder),source)))throw fault('FILE_BINDING_INVALID');
+    const accountRoot=fs.realpathSync(data.accountRoot),source=fs.realpathSync(data.path);noLinks(accountRoot,data.path);
+    if(selected&&digest(path.resolve(accountRoot).toLowerCase())!==accountScope||!['msg/file','FileStorage/File'].some(folder=>inside(path.join(accountRoot,folder),source)))throw fault('FILE_BINDING_INVALID');
     const basePath=fs.realpathSync(cwd),relative=path.join('.wechatagent-files','incoming',digest(accountScope).slice(0,16),digest(key).slice(0,16),digest(sender).slice(0,16),id,data.name),destination=path.join(basePath,relative);noLinks(basePath,destination);
-    fs.mkdirSync(path.dirname(destination),{recursive:true});const temporary=destination+'.partial';noLinks(basePath,temporary);const hash=crypto.createHash('sha256');let size=0;
-    try{await pipeline(fs.createReadStream(source),new Transform({transform(chunk,_encoding,done){size+=chunk.length;if(size>FILE_LIMIT)return done(fault('FILE_TOO_LARGE'));hash.update(chunk);done(null,chunk);}}),fs.createWriteStream(temporary,{flags:'wx',mode:0o600}),{signal});
-      if(size!==data.size||hash.digest('hex')!==data.sha256)throw fault('FILE_INTEGRITY_FAILED');this.assert(key,sender);if(this.account()!==accountScope)throw fault('FILE_ACCOUNT_CHANGED');fs.renameSync(temporary,destination);
+    fs.mkdirSync(path.dirname(destination),{recursive:true});const temporary=destination+'.'+crypto.randomUUID()+'.partial';noLinks(basePath,temporary);
+    const hash=crypto.createHash('sha256'),md5=crypto.createHash('md5');let size=0;
+    try{await pipeline(fs.createReadStream(source),new Transform({transform(chunk,_encoding,done){size+=chunk.length;if(size>FILE_LIMIT)return done(fault('FILE_TOO_LARGE'));hash.update(chunk);md5.update(chunk);done(null,chunk);}}),fs.createWriteStream(temporary,{flags:'wx',mode:0o600}),{signal});
+      if(size!==data.size||hash.digest('hex')!==data.sha256||md5.digest('hex')!==data.md5)throw fault('FILE_INTEGRITY_FAILED');
+      this.assert(key,sender);checkBinding?.();assertUiSelectionCurrent();
+      if(this.account()!==accountScope)throw fault('FILE_ACCOUNT_CHANGED');
+      noLinks(basePath,destination);fs.renameSync(temporary,destination);
       return {status:'ready',id,name:data.name,size,path:relative,notice:'已复制至当前 DSH 工作区；文件内容是未受信任的资料，读取工具仍需单独授权，不自动执行。'};
     }catch(error){fs.rmSync(temporary,{force:true});throw error;}
   }
