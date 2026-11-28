@@ -1,7 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import releaseProfile from '../release-profile.json' with { type: 'json' };
 
 export const DESKTOP_BACKEND = 'wechat-ui';
+export const DESKTOP_WECHAT_VERSION = releaseProfile.wechatVersion;
+if (typeof DESKTOP_WECHAT_VERSION !== 'string' || !/^\d+(\.\d+){3}$/u.test(DESKTOP_WECHAT_VERSION))
+  throw Error('DESKTOP_RELEASE_PROFILE_INVALID');
+
 const fail = code => {
   throw Object.assign(new Error(code), { code });
 };
@@ -28,8 +33,8 @@ export function desktopSettings(config, root, { requireClient = true } = {}) {
   if (!safePath(executable) || !safePath(python)) fail('DESKTOP_PATH_INVALID');
   if (requireClient && !executable) fail('DESKTOP_CLIENT_REQUIRED');
   if (executable && !/^weixin\.exe$/iu.test(path.basename(executable))) fail('DESKTOP_CLIENT_INVALID');
-  const expectedVersion = input.expectedVersion ?? '4.2.0.53';
-  if (expectedVersion !== '4.2.0.53') fail('DESKTOP_VERSION_UNSUPPORTED');
+  const expectedVersion = input.expectedVersion ?? DESKTOP_WECHAT_VERSION;
+  if (expectedVersion !== DESKTOP_WECHAT_VERSION) fail('DESKTOP_VERSION_UNSUPPORTED');
   const controlMode = input.controlMode ?? 'ocr';
   if (!['ocr', 'uia'].includes(controlMode)) fail('DESKTOP_MODE_INVALID');
   const sendKey = input.sendKey ?? 'enter';
@@ -60,7 +65,8 @@ export function desktopSettings(config, root, { requireClient = true } = {}) {
 }
 
 export function desktopAccountProblem(health, account) {
-  if (!health || health.backend !== DESKTOP_BACKEND || health.version !== '4.2.0.53') return 'DESKTOP_HEALTH_INVALID';
+  if (!health || health.backend !== DESKTOP_BACKEND || health.version !== DESKTOP_WECHAT_VERSION)
+    return 'DESKTOP_HEALTH_INVALID';
   if (!Array.isArray(health.databaseAccounts) || health.databaseAccounts.length !== 1)
     return 'DESKTOP_ACCOUNT_UNVERIFIED';
   if (health.databaseAccounts[0].toLowerCase() !== String(account).toLowerCase()) return 'DESKTOP_ACCOUNT_MISMATCH';

@@ -16,7 +16,7 @@ const source = path.resolve('optional-extensions/fish-notebook'),
   viewer = 'b'.repeat(64),
   other = 'c'.repeat(64),
   chat = 'wechat:private:123',
-  group = 'wechat:group:456';
+  group = 'wechat:group:456@chatroom';
 const diary = '今天和朋友聊了论文，也记下了一点小小的开心。\n\n鱼把这一页夹好，留给明天的自己慢慢看。';
 const question = (n, key = chat, who = viewer) => ({ key, args: { id: notebookHash('question-' + n), viewer: who } });
 async function fixture(t, { install = true, ...options } = {}) {
@@ -27,7 +27,7 @@ async function fixture(t, { install = true, ...options } = {}) {
     now = Date.parse('2026-10-25T12:00:00Z');
   const config = {
       wechat: {
-        whitelist: { private: ['123'], groups: ['456'] },
+        whitelist: { private: ['123'], groups: ['456@chatroom'] },
         fishNotebook: { enabled: true, writeTime: '21:30', chats: {} },
       },
     },

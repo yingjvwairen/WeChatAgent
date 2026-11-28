@@ -2,12 +2,13 @@ import { featurePlugins } from '../packages/plugin-api/catalog.mjs';
 import { PluginRuntime } from '../packages/plugin-api/index.mjs';
 import { createAudioReader } from '../packages/plugin-api/audio.mjs';
 import { voicePcm } from './decode-wechat-voice.mjs';
+import modelFields from '../packages/speech-contract/local-model-fields.json' with { type: 'json' };
 
 export const outputFeature = 'voice-output-v1';
 export const dialogueFeature = 'voice-dialogue-v1';
-const maximumBytes = 2 * 1024 * 1024;
+const maximumBytes = 32 * 1024 * 1024;
 const chunkBytes = 256 * 1024;
-export const maxReplyChars = 600;
+export const maxReplyChars = modelFields.speechLimits.maxReplyChars;
 const fault = (code, status) => Object.assign(new Error(code), { code, status });
 
 export class VoiceSynthesis {
@@ -31,7 +32,7 @@ export class VoiceSynthesis {
   // voice reference or a text message; the plugin returns the chosen form and
   // text, with WAV only for a voice reply.
   async generate({
-    account,
+    accountRef,
     key,
     text,
     voiceId,
@@ -41,16 +42,16 @@ export class VoiceSynthesis {
     textAllowed = true,
   }) {
     let runtime = this.runtime;
-    if (!runtime || this.account !== account) {
+    if (!runtime || this.account !== accountRef) {
       const previous = runtime;
       runtime = new PluginRuntime({
         root: this.root,
-        accountScope: account,
+        accountScope: accountRef,
         readAudio: this.readAudio,
         onlyFeatures: [outputFeature, dialogueFeature],
       });
       this.runtime = runtime;
-      this.account = account;
+      this.account = accountRef;
       await previous?.dispose();
     }
     const allowed = () => {
@@ -78,7 +79,7 @@ export class VoiceSynthesis {
         bytes.toString('base64') !== base64 ||
         bytes.length > chunkBytes ||
         size + bytes.length > maximumBytes ||
-        chunks.length >= 8
+        chunks.length >= 128
       )
         throw fault('VOICE_TTS_INVALID_AUDIO', 502);
       size += bytes.length;
@@ -95,7 +96,9 @@ export class VoiceSynthesis {
           : voiceId
             ? { id: voiceId }
             : { text };
-      invocation = await runtime.invokeFeature(feature, args, turn, { timeoutMs: 35000 });
+      invocation = await runtime.invokeFeature(feature, args, turn, {
+        timeoutMs: feature === outputFeature ? 600000 : 35000,
+      });
     } catch (error) {
       if (typeof error.code === 'string' && error.code.startsWith('VOICE_TTS_')) throw error;
       if (error.message === 'PLUGIN_TIMEOUT') throw fault('VOICE_TTS_TIMEOUT', 504);
@@ -149,7 +152,7 @@ export class VoiceSynthesis {
     }
     const wav = Buffer.concat(chunks, size);
     try {
-      voicePcm(wav);
+      voicePcm(wav, { maxSeconds: 1024 });
     } catch {
       throw fault('VOICE_TTS_INVALID_AUDIO', 502);
     }

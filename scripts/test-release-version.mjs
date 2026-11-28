@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { releaseIdentity } from './release-version.mjs';
+import { launcherAssemblyInfo, releaseIdentity } from './release-version.mjs';
 
 test('a plus release has an exact public label, valid package alias and numeric Windows build version', () => {
   assert.deepEqual(releaseIdentity({ version: '0.4.1+plus', releaseVersion: '0.4.1+' }), {
@@ -24,4 +24,16 @@ test('invalid or mismatched labels are rejected before packaging', () => {
     { version: '0.4.1', releaseVersion: '0.4.2' },
   ])
     assert.throws(() => releaseIdentity(pkg), /RELEASE_VERSION/);
+});
+
+test('the launcher preserves the public label and has a numeric Windows file version', () => {
+  for (const [pkg, numeric, label] of [
+    [{ version: '0.4.5' }, '0.4.5.0', '0.4.5'],
+    [{ version: '0.4.1+plus', releaseVersion: '0.4.1+' }, '0.4.1.2', '0.4.1+'],
+    [{ version: '0.4.1-fix' }, '0.4.1.1', '0.4.1-fix'],
+  ]) {
+    const info = launcherAssemblyInfo(pkg);
+    assert.ok(info.includes('AssemblyFileVersion("' + numeric + '")'));
+    assert.ok(info.includes('AssemblyInformationalVersion("' + label + '")'));
+  }
 });

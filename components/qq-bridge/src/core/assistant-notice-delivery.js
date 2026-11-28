@@ -1,6 +1,7 @@
 import { assistantNotificationText } from './decision-format.js';
 import { isSilentAssistantNotification } from '../../../../packages/dsh-social-bridge-plugin/assistant-notifications.mjs';
 import { assistantSenderAllowed } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
+import { matchesConversationGrant } from '../../../../packages/wechat-identity.mjs';
 import { conversationWorkMode } from '../../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 
 export function createAssistantNoticeDelivery({ adapter, plugin, settingsFor, isReady = () => true, log = () => {} }) {
@@ -19,7 +20,8 @@ export function createAssistantNoticeDelivery({ adapter, plugin, settingsFor, is
           const w = settingsFor();
           if (
             conversationWorkMode(w, notice.key) !== 'assistant' ||
-            !assistantSenderAllowed(w, notice.key, notice.sender)
+            !assistantSenderAllowed(w, notice.key, notice.sender) ||
+            !matchesConversationGrant(w, notice.key, notice.rosterGrant)
           )
             continue;
           const [platform, kind, target] = notice.key.split(':');
@@ -29,7 +31,13 @@ export function createAssistantNoticeDelivery({ adapter, plugin, settingsFor, is
             await plugin.assistantTask(undefined, 'notification-ack', { localControl: true, id: notice.id });
             continue;
           }
-          const receipt = await adapter.sendText({ kind, target, text, deliveryId: notice.id });
+          const receipt = await adapter.sendText({
+            kind,
+            target,
+            text,
+            deliveryId: notice.id,
+            rosterGrant: notice.rosterGrant ?? 'legacy',
+          });
           const confirmed =
             receipt?.confirmed === true ||
             (receipt?.accepted === true &&

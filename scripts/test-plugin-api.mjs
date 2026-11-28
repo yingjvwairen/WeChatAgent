@@ -18,10 +18,11 @@ import {
 import { packZip, unpackZip } from '../packages/plugin-api/zip.mjs';
 import { createConsole } from './console-server.mjs';
 import { createExtensionUI } from '../public/console/extensions.js';
+import { fixturePluginAccount, selectPluginAccount } from './test-fixtures/plugin-account.mjs';
 
 const project = path.resolve(import.meta.dirname, '..'),
   chat = 'wechat:private:123',
-  other = 'wechat:group:456';
+  other = 'wechat:group:456@chatroom';
 const round = (key = chat, actorId = 'wxid_fixture') => ({
   conversationKey: key,
   conversationName: 'Fixture',
@@ -35,8 +36,9 @@ const runtimes = new Map();
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-plugin-v2-'));
   atomicJson(path.join(root, 'config/wechatagent.json'), {
-    wechat: { whitelist: { private: ['123'], groups: ['456'] } },
+    wechat: { whitelist: { private: ['123'], groups: ['456@chatroom'] } },
   });
+  selectPluginAccount(root);
   const installer = new PluginInstaller(root);
   t.after(async () => {
     for (const r of runtimes.get(root) ?? []) await r.dispose();
@@ -83,7 +85,7 @@ function enable(root, id, permissions = [], chats = [chat], settings = {}) {
   });
 }
 async function runtime(t, root, options = {}) {
-  const r = new PluginRuntime({ root, accountScope: 'fixture-account', ...options });
+  const r = new PluginRuntime({ root, accountScope: fixturePluginAccount, ...options });
   runtimes.set(root, [...(runtimes.get(root) ?? []), r]);
   t.after(() => r.dispose());
   await r.sync();
@@ -223,11 +225,18 @@ test('model tools are namespaced and current chat/account/actor storage remains 
   const otherActor = JSON.parse((await r.execute('fixture__run', {}, round(chat, 'wxid_other'))).content);
   assert.equal(otherActor.actor, null);
   assert.equal(otherActor.chat, 'only-this-chat');
-  const second = await runtime(t, f.root, { accountScope: 'second-account' });
+  const otherAccount = 'b'.repeat(64);
+  selectPluginAccount(f.root, otherAccount);
+  assert.deepEqual(r.toolDefinitions(chat), []);
+  assert.deepEqual(pluginCatalog(f.root).plugins[0].chats, []);
+  enable(f.root, 'fixture', ['storage'], null);
+  const second = await runtime(t, f.root, { accountScope: otherAccount });
   assert.deepEqual(JSON.parse((await second.execute('fixture__run', {}, round())).content), {
     chat: null,
     actor: null,
   });
+  selectPluginAccount(f.root);
+  await r.sync();
   const registered = new Map(),
     agent = {
       tools: {
@@ -250,6 +259,47 @@ test('model tools are namespaced and current chat/account/actor storage remains 
     settings: {},
   });
   await assert.rejects(r.execute('fixture__run', {}, round()), /UNAVAILABLE/);
+});
+
+test('explicit plugin chat grants belong to one account and one whitelist entry', async t => {
+  const f = fixture(t);
+  install(f, bundle());
+  enable(f.root, 'fixture', [], [other]);
+  const original = configuration(f.root).revision;
+  const first = await runtime(t, f.root);
+  assert.equal(first.toolDefinitions(other).length, 1);
+  selectPluginAccount(f.root, 'b'.repeat(64));
+  const second = await runtime(t, f.root, { accountScope: 'b'.repeat(64) });
+  assert.equal(second.toolDefinitions(other).length, 0);
+  assert.throws(
+    () =>
+      updatePlugin(f.root, 'fixture', {
+        revision: original,
+        enabled: true,
+        permissions: [],
+        chats: [other],
+        settings: {},
+      }),
+    { status: 409 },
+  );
+  selectPluginAccount(f.root);
+  assert.equal(first.toolDefinitions(other).length, 1);
+  atomicJson(path.join(f.root, 'config/wechatagent.json'), {
+    wechat: { whitelist: { private: ['123'], groups: ['456@chatroom'] }, rosterGrants: { [other]: 'new-grant' } },
+  });
+  assert.equal(first.toolDefinitions(other).length, 0);
+  assert.deepEqual(pluginCatalog(f.root).plugins[0].chats, []);
+  assert.throws(
+    () =>
+      updatePlugin(f.root, 'fixture', {
+        revision: original,
+        enabled: true,
+        permissions: [],
+        chats: [other],
+        settings: {},
+      }),
+    { status: 409 },
+  );
 });
 
 test('host history cannot choose another chat and readonly hooks cannot write or send', async t => {

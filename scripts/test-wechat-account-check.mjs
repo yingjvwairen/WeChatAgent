@@ -3,23 +3,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { hookAccountProblem, verifyWeChatAccount } from './wechat-account-check.mjs';
+import { verifyWeChatAccount } from './wechat-account-check.mjs';
+import { desktopAccountProblem } from './desktop-settings.mjs';
 import { createConsole } from './console-server.mjs';
-import { needsWeChatRepair } from '../public/console/process-recovery.js';
 const source = path.resolve(import.meta.dirname, '..'),
   health = {
-    integration: 'WeChatAgent-1',
-    backend: 'wechat-hook',
-    version: '4.1.10.27',
-    startupState: 'ready',
+    backend: 'wechat-ui',
+    version: '4.2.0.53',
+    visible: true,
+    ready: true,
     pid: 123,
     databaseAccounts: ['wxid_b'],
   };
-function fixture(t, version = '4.1.10.27') {
+function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-live-account-')),
     config = JSON.parse(fs.readFileSync(path.join(source, 'config/wechatagent.example.json'), 'utf8'));
-  config.hook.expectedVersion = version;
-  config.hook.wechatExecutable = 'state/hook/wechat-' + version + '/Weixin.exe';
   config.ports = { weflow: 0, onebot: 0, adapter: 0, dshPlugin: 0 };
   const write = (relative, value) => {
     const file = path.join(root, relative);
@@ -32,38 +30,24 @@ function fixture(t, version = '4.1.10.27') {
   write('config/wechatagent.json', config);
   write('state/weflow/WeFlow-config.json', a);
   write('state/wechat-io-config.json', { self_wxid: 'wxid_a' });
-  write('state/hook/native-token.txt', 'c'.repeat(64));
-  t.after(() => {
-    assert(root.startsWith(os.tmpdir() + path.sep));
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return { root, config, a, b, write };
 }
 const response = value => new Response(JSON.stringify(value));
 
-test('the account gate requires one exact account and distinguishes login, mismatch, ambiguity and invalid metadata', () => {
-  assert.equal(hookAccountProblem(health, 'WXID_B'), '');
-  for (const [override, code] of [
-    [{ databaseAccounts: [] }, 'HOOK_LOGIN_REQUIRED'],
-    [{ databaseAccounts: ['wxid_a'] }, 'HOOK_ACCOUNT_MISMATCH'],
-    [{ databaseAccounts: ['wxid_a', 'wxid_b'] }, 'HOOK_MULTIPLE_ACCOUNT_DATABASES'],
-    [{ databaseAccounts: null }, 'HOOK_ACCOUNT_METADATA_INVALID'],
-    [{ databaseAccounts: [null] }, 'HOOK_ACCOUNT_METADATA_INVALID'],
-    [{ version: '4.1.15.13' }, 'HOOK_VERSION_MISMATCH'],
-    [{ backend: 'foreign' }, 'REVIEWED_HOOK_BUILD_REQUIRED'],
-    [{ startupState: 'waiting' }, 'HOOK_INITIALIZATION_PENDING'],
+test('desktop account readiness uses the exact selected account and current supported version', () => {
+  assert.equal(desktopAccountProblem(health, 'WXID_B'), '');
+  for (const override of [
+    { databaseAccounts: [] },
+    { databaseAccounts: ['wxid_a'] },
+    { databaseAccounts: ['wxid_a', 'wxid_b'] },
+    { version: '4.1.15.56' },
+    { backend: 'foreign' },
+    { ready: false },
   ])
-    assert.equal(hookAccountProblem({ ...health, ...override }, 'wxid_b'), code);
+    assert.notEqual(desktopAccountProblem({ ...health, ...override }, 'wxid_b'), '');
 });
-
-test('ambiguous and mismatched accounts offer the existing confirmed repair flow rather than a generic port action', () => {
-  for (const code of ['HOOK_MULTIPLE_ACCOUNT_DATABASES', 'HOOK_ACCOUNT_MISMATCH', 'HOOK_ACCOUNT_METADATA_INVALID'])
-    assert.equal(needsWeChatRepair('[' + code + ']'), true);
-  for (const code of ['HOOK_LOGIN_REQUIRED', 'READER_KEY_INVALID', 'SERVICE_PORT_IN_USE'])
-    assert.equal(needsWeChatRepair(code), false);
-});
-
-test('connection tolerates a bounded startup/login wait, authenticates locally and accepts only the selected account', async t => {
+test('login wait is bounded and only the already running client is observed', async t => {
   const f = fixture(t);
   let now = 0,
     calls = 0;
@@ -77,101 +61,44 @@ test('connection tolerates a bounded startup/login wait, authenticates locally a
     },
     timeoutMs: 30,
     intervalMs: 2,
-    onProgress: message => progress.push(message),
-    fetchImpl: async (url, options) => {
-      assert.equal(new URL(url).hostname, '127.0.0.1');
-      assert.equal(options.headers.Authorization, 'Bearer ' + 'c'.repeat(64));
-      assert.equal(options.redirect, 'error');
-      if (++calls === 1) throw new TypeError('fixture', { cause: { code: 'ECONNREFUSED' } });
-      return response({ ...health, databaseAccounts: calls < 4 ? [] : ['wxid_b'] });
+    onProgress: value => progress.push(value),
+    probe: async () => {
+      if (++calls < 4) throw Object.assign(Error('INPUT_ACCOUNT_UNVERIFIED'), { code: 'INPUT_ACCOUNT_UNVERIFIED' });
+      return health;
     },
   });
   assert.equal(result.ready, true);
   assert.equal(calls, 4);
   assert.equal(progress.length, 1);
-  assert(!progress.join('').includes('c'.repeat(64)));
+  assert.match(progress[0], /勿重复打开/);
 });
-
-test('offline databases cannot satisfy live confirmation, while a soft preflight can allow login to proceed', async t => {
+test('offline databases do not replace login and a soft preflight can leave login pending', async t => {
   const f = fixture(t);
   let now = 0;
   const options = {
     ...f,
     settings: f.b,
-    fetchImpl: async () => response({ ...health, databaseAccounts: [] }),
     timeoutMs: 4,
     intervalMs: 2,
     now: () => now,
     sleep: async ms => {
       now += ms;
     },
+    probe: async () => {
+      throw Object.assign(Error('INPUT_ACCOUNT_UNVERIFIED'), { code: 'INPUT_ACCOUNT_UNVERIFIED' });
+    },
   };
   assert.equal((await verifyWeChatAccount({ ...options, wait: false, requireReady: false })).ready, false);
-  await assert.rejects(verifyWeChatAccount(options), /HOOK_LOGIN_REQUIRED/);
-  await assert.rejects(verifyWeChatAccount({ ...options, wait: false }), /HOOK_LOGIN_REQUIRED/);
+  await assert.rejects(verifyWeChatAccount(options), /INPUT_ACCOUNT_UNVERIFIED/);
   await assert.rejects(
-    verifyWeChatAccount({
-      ...options,
-      wait: false,
-      requireReady: false,
-      fetchImpl: async () => {
-        throw new TypeError('fixture', { cause: { code: 'ECONNREFUSED' } });
-      },
-    }),
-    /HOOK_NOT_LISTENING/,
+    verifyWeChatAccount({ ...options, probe: async () => ({ ...health, databaseAccounts: ['wxid_a'] }) }),
+    /DESKTOP_ACCOUNT_MISMATCH/,
+  );
+  await assert.rejects(
+    verifyWeChatAccount({ ...options, probe: async () => ({ ...health, visible: false }) }),
+    /DESKTOP_WINDOW_NOT_READY/,
   );
 });
-
-test('authentication, invalid versions and multiple accounts never retry or expose authentication values', async t => {
-  const f = fixture(t);
-  for (const [body, code] of [
-    [new Response('{}', { status: 401 }), 'HOOK_AUTH_FAILED'],
-    [{ ...health, version: 'other' }, 'HOOK_VERSION_MISMATCH'],
-    [{ ...health, databaseAccounts: ['wxid_a', 'wxid_b'] }, 'HOOK_MULTIPLE_ACCOUNT_DATABASES'],
-  ]) {
-    let calls = 0;
-    await assert.rejects(
-      verifyWeChatAccount({
-        ...f,
-        settings: f.b,
-        fetchImpl: async () => {
-          calls++;
-          return body instanceof Response ? body : response(body);
-        },
-      }),
-      error => error.code === code && !error.message.includes('c'.repeat(64)),
-    );
-    assert.equal(calls, 1);
-  }
-});
-
-test('a body timeout remains a timeout, malformed JSON stays invalid, and remote Hook addresses are refused', async t => {
-  const f = fixture(t);
-  await assert.rejects(
-    verifyWeChatAccount({
-      ...f,
-      settings: f.b,
-      wait: false,
-      fetchImpl: async () => ({
-        status: 200,
-        ok: true,
-        json: async () => {
-          throw new DOMException('fixture', 'AbortError');
-        },
-      }),
-    }),
-    /HOOK_HEALTH_TIMEOUT/,
-  );
-  await assert.rejects(
-    verifyWeChatAccount({ ...f, settings: f.b, fetchImpl: async () => new Response('invalid') }),
-    /HOOK_HEALTH_INVALID_RESPONSE/,
-  );
-  await assert.rejects(
-    verifyWeChatAccount({ ...f, settings: f.b, config: { hook: { baseUrl: 'https://example.com/' } } }),
-    /HOOK_LOOPBACK_REQUIRED/,
-  );
-});
-
 async function consoleFixture(t, { live, setup, stop } = {}) {
   const f = fixture(t);
   let setups = 0,
@@ -191,7 +118,7 @@ async function consoleFixture(t, { live, setup, stop } = {}) {
             protectedKey: request.decryptKey || 'userdpapi:Yg==',
           };
     },
-    fetchImpl: async () => response(live ? live(++calls) : health),
+    accountVerifier: options => verifyWeChatAccount({ ...options, probe: async () => (live ? live(++calls) : health) }),
     runner: async () => {
       stops++;
       return stop ? stop() : 0;
@@ -248,7 +175,7 @@ test('a wrong live account fails before capture or stopping services and leaves 
     before = fs.readFileSync(path.join(f.root, 'state/weflow/WeFlow-config.json'));
   const job = await f.wait((await f.connect()).id);
   assert.equal(job.state, 'failed');
-  assert.equal(job.code, 'HOOK_ACCOUNT_MISMATCH');
+  assert.equal(job.code, 'DESKTOP_ACCOUNT_MISMATCH');
   assert.equal(job.phase, 'checking-wechat');
   assert.equal(f.setups, 0);
   assert.equal(f.stops, 0);
@@ -285,8 +212,7 @@ test('a valid cached database still cannot commit when the live account becomes 
     before = fs.readFileSync(path.join(f.root, 'state/weflow/WeFlow-config.json'));
   const job = await f.wait((await f.connect()).id);
   assert.equal(job.state, 'failed');
-  assert.equal(job.code, 'HOOK_MULTIPLE_ACCOUNT_DATABASES');
-  assert(job.message.includes('修复微信连接'));
+  assert.equal(job.code, 'DESKTOP_ACCOUNT_MISMATCH');
   assert.equal(f.setups, 1);
   assert.equal(f.stops, 0);
   assert.deepEqual(fs.readFileSync(path.join(f.root, 'state/weflow/WeFlow-config.json')), before);
@@ -305,7 +231,7 @@ test('a login change while old services stop is caught by the final check before
     before = fs.readFileSync(path.join(f.root, 'state/weflow/WeFlow-config.json'));
   const job = await f.wait((await f.connect()).id);
   assert.equal(job.state, 'failed');
-  assert.equal(job.code, 'HOOK_ACCOUNT_MISMATCH');
+  assert.equal(job.code, 'DESKTOP_ACCOUNT_MISMATCH');
   assert.equal(f.stops, 1);
   assert.deepEqual(fs.readFileSync(path.join(f.root, 'state/weflow/WeFlow-config.json')), before);
   assert(!fs.existsSync(path.join(f.root, 'state/weflow/active-account.json')));
@@ -353,35 +279,4 @@ test('A to B to A uses each live account and restores only that account settings
     f.a.decryptKey,
   );
   assert.equal(f.stops, 2);
-});
-
-test('current client account verification accepts only the exact ready profile and selected account', async t => {
-  const f = fixture(t, '4.1.15.13'),
-    current = { ...health, version: '4.1.15.13', profile: '4.1.15.13-media-mentions-v2', nativeTextSend: true };
-  assert.equal(
-    (await verifyWeChatAccount({ ...f, settings: f.b, wait: false, fetchImpl: async () => response(current) })).ready,
-    true,
-  );
-  await assert.rejects(
-    verifyWeChatAccount({ ...f, settings: f.b, wait: false, fetchImpl: async () => response(health) }),
-    /HOOK_VERSION_MISMATCH/,
-  );
-  await assert.rejects(
-    verifyWeChatAccount({
-      ...f,
-      settings: f.b,
-      wait: false,
-      fetchImpl: async () => response({ ...current, profile: 'unknown' }),
-    }),
-    /HOOK_INITIALIZATION_PENDING/,
-  );
-  await assert.rejects(
-    verifyWeChatAccount({
-      ...f,
-      settings: f.b,
-      wait: false,
-      fetchImpl: async () => response({ ...current, databaseAccounts: ['wxid_a', 'wxid_b'] }),
-    }),
-    /HOOK_MULTIPLE_ACCOUNT_DATABASES/,
-  );
 });

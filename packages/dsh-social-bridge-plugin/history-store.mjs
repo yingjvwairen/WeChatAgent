@@ -1,3 +1,4 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -7,8 +8,13 @@ const { usageMetrics, summarizeUsage } = await import(
 );
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
-const validKey = key => /^(wechat|qq):(private|group):[^\0\r\n]{1,256}$/.test(key);
+const validKey = key =>
+  typeof key === 'string' &&
+  (validChatKey(key.replace(/:(assistant|assistant-chat)$/u, '')) || /^qq:(private|group):[^\0\r\n]{1,256}$/.test(key));
 const decode = text => text.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
+const readerOrder = "COALESCE(json_extract(body,'$.readerOrder'),'')";
+const historyOrder = `at,${readerOrder},seq`;
+const reverseHistoryOrder = `at DESC,${readerOrder} DESC,seq DESC`;
 function searchableText(body) {
   const quote = body.quoteReply,
     forward = body.forwardedRecord;
@@ -150,12 +156,16 @@ export class HistoryStore {
         'sticker_id',
         'forwardedRecord',
         'quoteReply',
+        'readerOrder',
       ]
         .filter(k => row[k] !== undefined)
         .map(k => [k, row[k]]),
     );
     body.text = String(fullText ?? '');
     body.images = (row.images ?? []).filter(x => /^[a-f0-9]{64}$/.test(x?.id ?? '')).map(x => ({ id: x.id }));
+    if (row.contextOnly === true) body.contextOnly = true;
+    if (row.attachmentUnavailable === true) body.attachmentUnavailable = true;
+    if (row.quoteKind) body.quoteKind = row.quoteKind;
     const at = Number(row.timestamp) || Date.now() / 1000;
     return this.transaction(() => {
       const previous = this.db.prepare('SELECT seq,body,text FROM records WHERE chat=? AND id=?').get(key, id);
@@ -241,7 +251,7 @@ export class HistoryStore {
   }
   rows(key) {
     return this.db
-      .prepare('SELECT seq,at,body,source FROM records WHERE chat=? ORDER BY at,seq')
+      .prepare(`SELECT seq,at,body,source FROM records WHERE chat=? ORDER BY ${historyOrder}`)
       .all(key)
       .map(r => ({ ...JSON.parse(r.body), archiveSeq: r.seq, archiveSource: r.source }));
   }
@@ -254,7 +264,7 @@ export class HistoryStore {
     }
     return this.db
       .prepare(
-        "SELECT seq,body,source FROM records WHERE chat=? AND source!='legacy-context' AND seq<? ORDER BY at DESC,seq DESC LIMIT ?",
+        `SELECT seq,body,source FROM records WHERE chat=? AND source!='legacy-context' AND seq<? ORDER BY ${reverseHistoryOrder} LIMIT ?`,
       )
       .all(key, before, policy.recentMessages + excludeIds.length)
       .filter(r => !excluded.has(JSON.parse(r.body).id))
@@ -287,22 +297,25 @@ export class HistoryStore {
       context > 2
     )
       throw Error('HISTORY_MESSAGE_INVALID');
-    const record = this.db.prepare('SELECT seq,at,body,text,source FROM records WHERE chat=? AND seq=?').get(key, id);
+    const record = this.db
+      .prepare(`SELECT seq,at,body,text,source,${readerOrder} AS readerOrder FROM records WHERE chat=? AND seq=?`)
+      .get(key, id);
     if (!record) return [];
+    const neighborParams = [key, record.at, record.readerOrder, id, context];
     const prior = context
       ? this.db
           .prepare(
-            'SELECT seq,at,body,text,source FROM records WHERE chat=? AND (at<? OR at=? AND seq<?) ORDER BY at DESC,seq DESC LIMIT ?',
+            `SELECT seq,at,body,text,source FROM records WHERE chat=? AND (${historyOrder}) < (?,?,?) ORDER BY ${reverseHistoryOrder} LIMIT ?`,
           )
-          .all(key, record.at, record.at, id, context)
+          .all(...neighborParams)
           .reverse()
       : [];
     const next = context
       ? this.db
           .prepare(
-            'SELECT seq,at,body,text,source FROM records WHERE chat=? AND (at>? OR at=? AND seq>?) ORDER BY at,seq LIMIT ?',
+            `SELECT seq,at,body,text,source FROM records WHERE chat=? AND (${historyOrder}) > (?,?,?) ORDER BY ${historyOrder} LIMIT ?`,
           )
-          .all(key, record.at, record.at, id, context)
+          .all(...neighborParams)
       : [];
     return [...prior, record, ...next].map(r => {
       const body = JSON.parse(r.body),
@@ -324,7 +337,7 @@ export class HistoryStore {
     const excluded = new Set(excludeIds),
       selected = this.db
         .prepare(
-          "SELECT seq,body,source FROM records WHERE chat=? AND source!='legacy-context' ORDER BY at DESC,seq DESC LIMIT ?",
+          `SELECT seq,body,source FROM records WHERE chat=? AND source!='legacy-context' ORDER BY ${reverseHistoryOrder} LIMIT ?`,
         )
         .all(key, policy.recentMessages + excludeIds.length)
         .filter(r => !excluded.has(JSON.parse(r.body).id))

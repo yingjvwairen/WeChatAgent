@@ -8,6 +8,24 @@ import {
   effectiveChatFeature,
 } from './layout-model.mjs';
 
+export function deliveryPages(rows, page = 0) {
+  const pending = [],
+    history = [];
+  for (const row of rows.toSorted((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id))) {
+    if (
+      row.reviewed ||
+      (!row.recovery &&
+        !row.focusRecoveryRequired &&
+        ['confirmed', 'cancelled', 'expired', 'failed'].includes(row.state))
+    ) {
+      if (history.length < 128) history.push(row);
+    } else pending.push(row);
+  }
+  const pages = Math.ceil(history.length / 20);
+  const current = Math.max(0, Math.min(page, pages - 1));
+  return { pending, history: history.slice(current * 20, (current + 1) * 20), current, pages };
+}
+
 export function createWorkspaceLayout({
   api,
   state,
@@ -83,21 +101,22 @@ export function createWorkspaceLayout({
       )
       .join(
         '',
-      )}</div><details class="action-menu"><summary class="button primary">${icon('plus')}添加聊天</summary><div><button data-add-chat-kind="private">添加好友</button><button data-add-chat-kind="groups">添加群聊</button></div></details></div>`;
+      )}</div><button class="button primary" data-add-chat-kind="all">${icon('plus')}选择回复对象</button></div>`;
     const filters = `<form id="chat-filter-form" class="chat-filters"><div class="field"><label for="chat-search-query">查找聊天</label><input id="chat-search-query" type="search" value="${esc(state.chatQuery ?? '')}" placeholder="名称、人格或 ID"></div><div class="field"><label for="chat-mode-filter">工作模式</label><select id="chat-mode-filter"><option value="all">全部模式</option><option value="social" ${state.chatModeFilter === 'social' ? 'selected' : ''}>聊天模式</option><option value="assistant" ${state.chatModeFilter === 'assistant' ? 'selected' : ''}>助手模式</option></select></div></form>`;
     const list = `<section class="card chat-picker" aria-label="聊天列表">${filters}<p class="subtle" id="chat-filter-count">显示 ${rows.length} / ${all.length} 个聊天</p><div class="chat-picker-list" data-total="${all.length}">${scoped.map(row => `<button class="chat-picker-item" data-chat-select="${esc(row.key)}" data-chat-mode="${row.mode}" data-chat-search="${esc(chatSearchText(row))}" ${matching.has(row.key) ? '' : 'hidden'} ${row.key === selected?.key ? 'aria-current="true"' : ''}><span class="avatar">${icon(row.kind === 'groups' ? 'users' : 'person')}</span><span><strong>${esc(row.name)}</strong><small>${row.mode === 'assistant' ? '助手模式' : '聊天模式'} · ${esc(row.persona)}</small></span>${!savedKeys.has(row.key) ? '<span class="chat-row-status">待保存</span>' : row.session?.running ? '<span class="chat-row-status">执行中</span>' : ''}</button>`).join('')}<p class="empty-state" id="chat-filter-empty" ${rows.length ? 'hidden' : ''}>没有匹配的聊天，试试其他筛选。</p></div></section>`;
     const detail = selected
       ? await chatDetail(selected, savedKeys.has(selected.key))
       : `<section class="card">${empty('选择或添加一个聊天', '允许的好友和群聊，以及各自的会话都在这里管理。', '<button class="button" data-add-chat-kind="private">添加好友</button>', 'users')}</section>`;
-    return `<div class="section-stack">${toolbar}${sessionGroupUI.isAvailable() ? sessionGroupUI.toolbar() : ''}${dshNotice(!sessionGroupUI.isAvailable(), results[0].status === 'rejected')}<div class="chat-workspace">${list}${detail}</div>${scope('新增或移出聊天仍需保存设置并重启服务；单个聊天使用“设置此聊天”独立保存。')}</div>`;
+    return `<div class="section-stack">${toolbar}${sessionGroupUI.isAvailable() ? sessionGroupUI.toolbar() : ''}${dshNotice(!sessionGroupUI.isAvailable(), results[0].status === 'rejected')}<div class="chat-workspace">${list}${detail}</div>${scope('回复对象直接保存并用于后续消息，无需重启；单个聊天使用“设置此聊天”独立保存。')}</div>`;
   }
   async function chatDetail(row, saved) {
     const { key, session } = row,
-      tab = ['summary', 'tasks', 'usage'].includes(state.chatDetailTab) ? state.chatDetailTab : 'summary';
-    const headerHtml = `<div class="chat-detail-heading"><div><span class="status-tag">${row.kind === 'groups' ? '群聊' : '好友'} · ${row.mode === 'assistant' ? '助手模式' : '聊天模式'}</span><h2>${esc(row.name)}</h2><p class="subtle">仅管理此聊天；两种工作模式分别保留设置与历史。</p></div><div class="button-row"><button class="button" data-chat-settings="${esc(key)}" ${saved ? '' : 'disabled'}>设置此聊天</button><details class="action-menu"><summary class="button" aria-label="${esc(row.name)}的更多操作">更多</summary><div>${saved ? `<button data-action="sessions-configure" data-key="${esc(key)}">${session ? '同步会话名称' : '初始化会话'}</button>` : ''}${row.kind === 'groups' && saved ? `<button data-rebind-group="${esc(row.id)}">重新关联原群</button>` : ''}<button class="danger-text" data-remove-id="${esc(row.id)}" data-chat-kind="${row.kind}">移出允许范围</button></div></details></div></div>`;
+      tab = ['summary', 'tasks', 'deliveries', 'usage'].includes(state.chatDetailTab) ? state.chatDetailTab : 'summary';
+    const headerHtml = `<div class="chat-detail-heading"><div><span class="status-tag">${row.kind === 'groups' ? '群聊' : '好友'} · ${row.mode === 'assistant' ? '助手模式' : '聊天模式'}</span><h2>${esc(row.name)}</h2><p class="subtle">仅管理此聊天；两种工作模式分别保留设置与历史。</p></div><div class="button-row"><button class="button" data-chat-settings="${esc(key)}" ${saved ? '' : 'disabled'}>设置此聊天</button><details class="action-menu"><summary class="button" aria-label="${esc(row.name)}的更多操作">更多</summary><div>${saved ? `<button data-action="sessions-configure" data-key="${esc(key)}">${session ? '同步会话名称' : '初始化会话'}</button>` : ''}<button class="danger-text" data-remove-id="${esc(row.id)}" data-chat-kind="${row.kind}">移出允许范围</button></div></details></div></div>`;
     const navigation = `<nav class="workspace-tabs compact" aria-label="此聊天的详情">${[
       ['summary', '概况'],
       ['tasks', '任务与文件'],
+      ['deliveries', '发送队列'],
       ['usage', '历史与用量'],
     ]
       .map(([id, name]) => `<button data-chat-detail-tab="${id}" aria-pressed="${id === tab}">${name}</button>`)
@@ -122,11 +141,112 @@ export function createWorkspaceLayout({
       if (saved && !session)
         body += `<button class="button" data-action="sessions-configure" data-key="${esc(key)}">初始化此聊天的会话</button>`;
     } else if (tab === 'tasks') body = await taskPanel(row, saved);
+    else if (tab === 'deliveries') body = await deliveryPanel(key, saved);
     else
       body = session
         ? `<div class="chat-context">${contextStat(session, key)}<div class="button-row"><button class="button" data-action="sessions-compact" data-key="${esc(key)}">压缩上下文</button><button class="button" data-memory-open="${esc(key)}" data-memory-section="summaries">查看压缩记忆</button>${session.prefixRepairAvailable === true ? `<button class="button" data-context-repair="${esc(key)}" data-context-session="${esc(session.sessionId)}" ${session.running ? 'disabled title="请等待当前回复完成"' : ''}>修复上下文</button>` : ''}</div>${session.prefixRecovery?.status === 'required' ? '<p class="inline-error" role="status">人格前缀校验未通过，可使用“修复上下文”重新绑定。</p>' : session.prefixRecovery?.status === 'rebound' ? '<p class="subtle" role="status">已重新绑定，等待下一条新消息验证。</p>' : ''}<p class="subtle">压缩保留当前会话，需要额外调用模型；归档仍在 DSH 中完成。</p></div>${sessionUsage(session.usage)}<details class="technical-details"><summary>会话技术信息</summary><dl class="chat-facts"><div><dt>聊天 ID</dt><dd class="mono">${esc(key)}</dd></div><div><dt>DSH 会话</dt><dd class="mono">${esc(session.sessionId)}</dd></div><div><dt>人格初始化 / 压缩 / 历史会话</dt><dd>${session.initializations ?? 0} / ${session.compactions ?? 0} / ${session.previousSessionCount ?? 0}</dd></div></dl></details>`
         : '<p class="empty-state">此聊天尚未初始化 DSH 会话，已有配置会保留。</p>';
     return `<section class="card chat-detail">${headerHtml}${saved ? sessionGroupUI.control(key) : ''}${navigation}<div class="chat-detail-body">${body}</div></section>`;
+  }
+  async function deliveryPanel(key, saved) {
+    if (!saved) return '<p class="empty-state">请先保存聊天，再查看发送队列。</p>';
+    try {
+      const {
+        jobs,
+        replies = [],
+        native = [],
+        desktopAvailable,
+        account,
+        grant,
+        held,
+        holdRevision,
+      } = await api('/api/chat-deliveries?key=' + encodeURIComponent(key));
+      const holdButton = grant
+        ? `<button class="button" data-file-delivery="${held ? 'resume' : 'pause'}" data-channel="reply" data-account="${esc(account)}" data-grant="${esc(grant)}" data-key="${esc(key)}" data-revision="${esc(String(holdRevision))}">${held ? '继续' : '暂停'}本聊天的机器人回复</button>`
+        : '';
+      const all = [
+        ...jobs,
+        ...native,
+        ...replies.map(part => ({
+          ...part,
+          channel: 'reply',
+          name: part.kind === 'voice' ? '语音回复' : part.kind === 'sticker' ? '图片 / GIF / 表情回复' : '文字回复',
+        })),
+      ];
+      const disconnected =
+        desktopAvailable === false ? '<p class="subtle">桌面发送器已离线，显示最后保存的投递状态。</p>' : '';
+      if (!all.length) return holdButton + disconnected + '<p class="empty-state">此聊天暂无投递记录。</p>';
+      const labels = {
+        queued: '等待发送',
+        waiting: '等待操作条件',
+        typing: '正在输入',
+        recording: '正在录音',
+        conflict: '需要检查草稿',
+        submitting: '正在提交',
+        submitted: '等待回执',
+        confirmed: '已确认送达',
+        unconfirmed: '送达待核实',
+        failed: '发送失败',
+        cancelled: '已取消',
+        expired: '已过期',
+        paused: '已暂停',
+      };
+      const { pending, history, current, pages } = deliveryPages(
+        all,
+        state.deliveryHistory?.key === key ? state.deliveryHistory.page : 0,
+      );
+      const renderJobs = rows =>
+        '<div class="task-list">' +
+        rows
+          .map(job => {
+            const editable =
+              ['queued', 'paused'].includes(job.state) && (job.channel === 'reply' || Date.now() < job.deadlineAt);
+            const controls =
+              job.channel === 'native'
+                ? [
+                    ...(job.canCancel ? [['cancel', '取消']] : []),
+                    ...(job.canResume ? [['resume', '继续']] : job.canPause ? [['pause', '暂停']] : []),
+                  ]
+                : editable
+                  ? [['cancel', '取消'], job.state === 'paused' ? ['resume', '继续'] : ['pause', '暂停']]
+                  : [];
+            const buttons = controls
+              .map(
+                ([operation, label]) =>
+                  `<button class="button small" data-file-delivery="${operation}" data-channel="${['reply', 'native'].includes(job.channel) ? job.channel : 'file'}" data-grant="${esc(grant ?? '')}" data-job="${esc(job.id)}" data-revision="${esc(String(job.revision))}" data-key="${esc(key)}" data-account="${esc(account)}">${label}</button>`,
+              )
+              .join('');
+            const expiry =
+              job.state === 'paused' && job.deadlineAt
+                ? ' · 到期 ' + esc(new Date(job.deadlineAt).toLocaleTimeString())
+                : '';
+            const text = String(job.preview ?? job.name ?? '');
+            const draftNotice =
+              job.reason === 'UI_QT_EXISTING_DRAFT' ? '<p>微信输入框已有草稿。处理后点击继续。</p>' : '';
+            const preview =
+              text.length > 280
+                ? `<details class="delivery-preview"><summary>${esc(text.slice(0, 120))}…</summary><p>${esc(text)}</p></details>`
+                : `<p class="delivery-preview">${esc(text)}</p>`;
+            return (
+              `<article><strong>${esc(job.name)}</strong> <span class="status-tag">${esc(job.reason === 'DESKTOP_IMAGE_CONTENT_UNVERIFIED' ? '已观察到出站图片，内容待核实' : (labels[job.state] ?? job.state))}</span>` +
+              `<small>${esc(new Date(job.createdAt).toLocaleString())}${job.size === undefined ? '' : ' · ' + esc(String(job.size)) + ' B'}${expiry}</small>${preview}${draftNotice}${buttons}${job.recovery ? '<p><a href="#settings/connections">检查草稿或录音并解除占用</a></p>' : ''}</article>`
+            );
+          })
+          .join('') +
+        '</div>';
+      const pager =
+        pages > 1
+          ? `<div class="button-row"><button class="button small" data-delivery-page="${current - 1}" data-key="${esc(key)}" ${current ? '' : 'disabled'}>上一页</button><span>${current + 1} / ${pages}</span><button class="button small" data-delivery-page="${current + 1}" data-key="${esc(key)}" ${current + 1 < pages ? '' : 'disabled'}>下一页</button></div>`
+          : '';
+      return (
+        holdButton +
+        (pending.length ? '<h3>待处理</h3>' + renderJobs(pending) : '') +
+        (history.length ? '<h3>最近发送记录</h3>' + renderJobs(history) + pager : '') +
+        disconnected
+      );
+    } catch {
+      return '<p class="empty-state">无法读取此聊天的发送队列，请刷新后重试。</p>';
+    }
   }
   // 当前上下文与压缩阈值：数字 + 进度条（<progress> 元素，不需要内联样式，符合控制台的 CSP）
   function contextStat(session, key) {
@@ -169,9 +289,22 @@ export function createWorkspaceLayout({
     }
     return body;
   }
+  function readerProgress() {
+    const chats = state.status?.intakeProgress;
+    if (!Array.isArray(chats)) return '<p class="subtle">暂时无法读取收件进度。</p>';
+    if (!chats.length) return '<p class="subtle">尚未为当前名单建立读取记录。</p>';
+    const stamp = seconds => esc(new Date(seconds * 1000).toLocaleString());
+    const pending = chats.reduce((sum, chat) => sum + chat.pending, 0);
+    return `<p>共 ${pending} 条消息待桥接确认</p>${chats
+      .map(
+        chat =>
+          `<div class="tool-row"><div><h3>${esc(state.names?.get(chat.key) || chat.key)}</h3><p>已扫描至 ${stamp(chat.scannedThrough)} · 待确认 ${chat.pending}${chat.scannedThrough < chat.catchUpThrough ? ' · 待补读至 ' + stamp(chat.catchUpThrough) : ''}</p></div></div>`,
+      )
+      .join('')}`;
+  }
   function diagnostics() {
     const services = state.status?.services ?? [];
-    return `<section class="card">${header('连接诊断', '先检查，再决定是否修复。', '', 'plug')}<div class="diagnostic-status">${services.map(service => `<span class="status-tag ${service.ready ? 'ok' : 'warn'}">${esc(service.label ?? service.name ?? service.id)}：${service.ready ? '已就绪' : '未就绪'}</span>`).join('')}</div><div class="tool-row"><div><h3>检查数据库读取</h3><p>核对账号、目录与读取凭据。</p></div><button class="button" data-action="reader-check">检查读取</button></div><div class="tool-row"><div><h3>检查后台发送</h3><p>核对版本、发送组件与账号。</p></div><button class="button" data-action="hook-check">检查发送</button></div><div class="tool-row"><div><h3>修复微信连接</h3><p>保留现有检查与二次确认，可能需要重新登录微信。</p></div><button class="button" data-repair-wechat>修复微信连接…</button></div><div class="tool-row"><div><h3>准备连接配置</h3><p>更改模型或端口后更新配置，再完整重开 DSH。</p></div><div class="button-row"><button class="button" data-action="prepare">准备配置</button><button class="button" id="ack-dsh">确认已重开 DSH</button></div></div><a class="text-link" href="#settings/logs">查看原始运行日志 ${icon('arrow')}</a></section>`;
+    return `<section class="card">${header('连接诊断', '先检查，再决定是否修复。', '', 'plug')}<div class="diagnostic-status">${services.map(service => `<span class="status-tag ${service.ready ? 'ok' : 'warn'}">${esc(service.label ?? service.name ?? service.id)}：${service.ready ? '已就绪' : '未就绪'}</span>`).join('')}</div><div class="tool-row"><div><h3>检查数据库读取</h3><p>核对账号、目录与读取凭据。</p></div><button class="button" data-action="reader-check">检查读取</button></div><div class="tool-row"><div><h3>检查桌面发送</h3><p>核对版本、发送组件与账号。</p></div><button class="button" data-action="desktop-check">检查发送</button></div><div class="tool-row"><div><h3>修复微信连接</h3><p>检查配置中的微信窗口，按需重新打开客户端。</p></div><button class="button" data-restart-wechat>修复微信连接…</button></div><div class="tool-row"><div><h3>准备连接配置</h3><p>更改模型或端口后更新配置，再完整重开 DSH。</p></div><div class="button-row"><button class="button" data-action="prepare">准备配置</button><button class="button" id="ack-dsh">确认已重开 DSH</button></div></div><a class="text-link" href="#settings/logs">查看原始运行日志 ${icon('arrow')}</a></section>`;
   }
   async function settingsPage() {
     const section = state.settingsSection ?? 'chat',
@@ -193,7 +326,10 @@ export function createWorkspaceLayout({
       try {
         state.status = await api('/api/status');
       } catch {}
-      body = diagnostics() + recovery();
+      body =
+        diagnostics() +
+        `<section class="card">${header('读取进度', '', '', 'chat')}<div id="reader-intake-progress">${readerProgress()}</div></section>` +
+        recovery();
     } else if (section === 'logs') body = await logsPage();
     else if (section === 'advanced')
       body = `<details class="card technical-details"><summary>开发者工具</summary><p class="subtle">供已有源码与构建环境的维护者使用；安装版日常使用无需执行。</p>${toolsPage()}</details>`;
@@ -252,5 +388,5 @@ export function createWorkspaceLayout({
     const empty = document.getElementById('chat-filter-empty');
     if (empty) empty.hidden = shown > 0;
   }
-  return { chatsPage, settingsPage, networkPage, capabilityPage, stickersPage, applyChatFilter };
+  return { chatsPage, settingsPage, networkPage, capabilityPage, stickersPage, applyChatFilter, readerProgress };
 }

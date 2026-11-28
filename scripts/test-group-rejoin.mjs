@@ -11,15 +11,12 @@ test('the real session CLI keeps the same key and persona after a group changes 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-group-rejoin-'));
   let title = '原群名';
   const requests = [];
-  for (const folder of ['scripts', 'config', 'state', 'roles', 'components/qq-bridge/src'])
+  for (const folder of ['scripts', 'config', 'state', 'roles', 'components/qq-bridge/src', 'packages'])
     fs.mkdirSync(path.join(root, folder), { recursive: true });
+  fs.copyFileSync('packages/wechat-identity.mjs', path.join(root, 'packages/wechat-identity.mjs'));
   const source = path.resolve('scripts/manage-dsh-sessions.mjs');
   fs.copyFileSync(source, path.join(root, 'scripts/manage-dsh-sessions.mjs'));
   fs.writeFileSync(path.join(root, 'package.json'), '{"type":"module"}');
-  fs.writeFileSync(
-    path.join(root, 'scripts/hook-onebot.mjs'),
-    'export {conversationId} from ' + JSON.stringify(pathToFileURL(path.resolve('scripts/hook-onebot.mjs')).href) + ';',
-  );
   fs.writeFileSync(
     path.join(root, 'components/qq-bridge/src/role-card.js'),
     'export {selectRoleText} from ' +
@@ -34,9 +31,7 @@ test('the real session CLI keeps the same key and persona after a group changes 
     res.setHeader('content-type', 'application/json');
     if (req.url === '/health') return res.end(JSON.stringify({ contextMode: 'native-session-v1' }));
     if (req.url.startsWith('/api/v1/sessions'))
-      return res.end(
-        JSON.stringify({ sessions: [{ username: 'room@chatroom', displayName: title, conversationId: '123' }] }),
-      );
+      return res.end(JSON.stringify({ sessions: [{ username: 'room@chatroom', displayName: title }] }));
     if (req.url === '/configure') {
       requests.push(body);
       return res.end(JSON.stringify({ ok: true, sessionId: 'unchanged-fixture-session' }));
@@ -61,15 +56,15 @@ test('the real session CLI keeps the same key and persona after a group changes 
     path.join(root, 'config/wechatagent.json'),
     JSON.stringify({
       ports: { dshPlugin: port },
-      wechat: { whitelist: { private: [], groups: ['123'] } },
-      persona: { default: 'fixture', chats: { 'wechat:group:123': 'fixture' } },
+      wechat: { whitelist: { private: [], groups: ['room@chatroom'] } },
+      persona: { default: 'fixture', chats: { 'wechat:group:room@chatroom': 'fixture' } },
     }),
   );
   const run = () =>
     new Promise((resolve, reject) => {
       const child = spawn(
         process.execPath,
-        [path.join(root, 'scripts/manage-dsh-sessions.mjs'), 'configure', 'wechat:group:123'],
+        [path.join(root, 'scripts/manage-dsh-sessions.mjs'), 'configure', 'wechat:group:room@chatroom'],
         { windowsHide: true },
       );
       let output = '',
@@ -96,7 +91,7 @@ test('the real session CLI keeps the same key and persona after a group changes 
   const after = await run();
   assert.equal(before.sessionId, after.sessionId);
   assert.equal(requests.length, 2);
-  assert(requests.every(r => r.conversationKey === 'wechat:group:123' && r.personaName === 'fixture'));
+  assert(requests.every(r => r.conversationKey === 'wechat:group:room@chatroom' && r.personaName === 'fixture'));
   assert.deepEqual(
     requests.map(r => r.conversationName),
     ['原群名', '被踢后重进的新群名'],

@@ -1,3 +1,4 @@
+import { desktopManifest, seedDesktopPayloads } from './test-fixtures/desktop-deployment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,6 +14,42 @@ const {
   prepareDataHome,
   rebindExternalDsh,
 } = storage;
+
+test('moving data rebases model profiles and owned assets while preserving external models', async t => {
+  const f = fixture(t);
+  const owned = path.join(f.sourceRoot, 'state/models');
+  const external = path.join(f.base, 'external-models/voice.pth');
+  const profilesFile = path.join(f.sourceRoot, 'state/local-speech/tts.profiles.json');
+  f.cfg.runtime.localSpeech = { tts: { modelDirectory: owned, profiles: profilesFile } };
+  f.write(path.join(f.sourceRoot, 'config/wechatagent.json'), f.cfg);
+  f.write(profilesFile, {
+    voice: {
+      gptWeights: path.join(owned, 'voice.ckpt'),
+      sovitsWeights: external,
+      refAudio: path.join(owned, 'reference.wav'),
+      promptText: owned,
+    },
+  });
+  f.write(path.join(f.sourceRoot, 'state/local-speech/asr.profiles.json'), {
+    chinese: { modelDirectory: path.join(owned, 'whisper') },
+  });
+  await prepareDataHome(migrationPlan(f.location, { legacyDshHome: f.dsh }), { checkIdle: async () => {} });
+  const destination = path.join(f.home, 'workspace');
+  const read = relative => JSON.parse(fs.readFileSync(path.join(destination, relative)));
+  const tts = read('config/wechatagent.json').runtime.localSpeech.tts;
+  assert.equal(tts.modelDirectory, path.join(destination, 'state/models'));
+  assert.equal(tts.profiles, path.join(destination, 'state/local-speech/tts.profiles.json'));
+  const profile = read('state/local-speech/tts.profiles.json').voice;
+  assert.equal(profile.gptWeights, path.join(destination, 'state/models/voice.ckpt'));
+  assert.equal(profile.refAudio, path.join(destination, 'state/models/reference.wav'));
+  assert.equal(profile.sovitsWeights, external);
+  assert.equal(profile.promptText, owned);
+  assert.equal(
+    read('state/local-speech/asr.profiles.json').chinese.modelDirectory,
+    path.join(destination, 'state/models/whisper'),
+  );
+  assert.equal(JSON.parse(fs.readFileSync(profilesFile)).voice.gptWeights, path.join(owned, 'voice.ckpt'));
+});
 function fixture(t) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-data-layout-')),
     appDir = path.join(base, 'selected/app'),
@@ -24,7 +61,11 @@ function fixture(t) {
     fs.writeFileSync(file, typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data));
   };
   const cfg = {
-    runtime: { python: path.join(old, 'runtimes/old/python/python.exe'), dshDesktop: 'E:/independent/DSH.exe' },
+    runtime: {
+      sender: 'wechat-ui',
+      python: path.join(old, 'runtimes/old/python/python.exe'),
+      dshDesktop: 'E:/independent/DSH.exe',
+    },
     persona: { default: 'Owner', chats: {} },
     wechat: { whitelist: { private: ['123'], groups: [] } },
   };
@@ -245,7 +286,7 @@ test('retaining DSH leaves its history, external links, config and executable bi
     assert(!fs.existsSync(path.join(f.home, 'backups/dsh-home')));
     const resources = path.join(f.base, 'new app/resources');
     for (const [relative, value] of Object.entries({
-      'project/deployment.json': { version: 'new', dshBundled: false, files: [] },
+      'project/deployment.json': desktopManifest({ version: 'new', files: [] }),
       'runtime/python/python.exe': 'python',
       'runtime/node.exe': 'node',
       'vendor/wechat/Weixin.exe': 'wechat',
@@ -257,6 +298,7 @@ test('retaining DSH leaves its history, external links, config and executable bi
       const nextPlan = migrationPlan(f.location);
       assert.equal(nextPlan.needed, false);
       assert.equal(nextPlan.report.dshRetained, true);
+      seedDesktopPayloads((relative, value) => f.write(path.join(resources, relative), value));
       await deployment.bootstrapDeployment(
         resources,
         f.home,
@@ -447,3 +489,28 @@ test('changing a recognized backup link during copying cancels migration without
   assert(fs.existsSync(path.join(f.sourceRoot, 'config/wechatagent.json')));
   assert.equal(path.resolve(fs.readlinkSync(link.file)), path.resolve(replacement));
 });
+
+test(
+  'migration retries transient Windows sharing errors when publishing the verified workspace',
+  {
+    skip: process.platform !== 'win32',
+  },
+  async t => {
+    const f = fixture(t);
+    const plan = migrationPlan(f.location);
+    const original = fs.promises.rename;
+    const workspace = path.join(f.home, 'workspace');
+    let blocked = false;
+    t.mock.method(fs.promises, 'rename', async (from, to) => {
+      if (to === workspace && !blocked) {
+        blocked = true;
+        throw Object.assign(Error('fixture sharing violation'), { code: 'EPERM' });
+      }
+      return original.call(fs.promises, from, to);
+    });
+    const result = await prepareDataHome(plan, { checkIdle: async () => {} });
+    assert.equal(blocked, true);
+    assert.equal(result.migrated, true);
+    assert.equal(fs.existsSync(path.join(workspace, 'config/wechatagent.json')), true);
+  },
+);

@@ -1,15 +1,16 @@
 """A fifty-item, account-scoped sticker pool with model-reviewed admission."""
 
+from wechat_identity import parse_chat_key
 import hashlib, io, json, os, pathlib, re, threading, time, uuid
 from PIL import Image, ImageDraw
 from wechat_image_normalize import normalize_image
+from wechat_image_limits import MAX_BYTES as MAX_FILE, inspect_image
+from wechat_media_lock import MediaPoolLock
 
 MAX_ENTRIES = 50
 MAX_PENDING = 64
 MAX_WAITING = 8
-MAX_FILE = 8 * 1024 * 1024
 HEX = re.compile(r'[a-f0-9]{64}')
-CHAT = re.compile(r'wechat:(private|group):([1-9]\d{0,15})')
 
 
 def valid_md5(value):
@@ -26,7 +27,7 @@ class StickerCollection:
         self.folder = self.root / 'state/stickers/collected' / self.account_key[:32]
         self.index = self.folder / 'index.json'
         self.active = active
-        self.lock = threading.RLock()
+        self.lock = MediaPoolLock(self.folder / 'transaction.lock', self.safe)
         self.import_lock = threading.Lock()
 
     def safe(self, file):
@@ -36,7 +37,7 @@ class StickerCollection:
         for part in [file, *file.parents]:
             if part == self.root:
                 break
-            if part.is_symlink():
+            if part.is_symlink() or getattr(part, 'is_junction', lambda: False)():
                 raise RuntimeError('STICKER_COLLECTION_PATH_INVALID')
         return file
 
@@ -83,6 +84,8 @@ class StickerCollection:
                     or not valid_md5(fields.get('md5'))
                 ):
                     raise RuntimeError('STICKER_COLLECTION_INDEX_INVALID')
+                if 'format' in item and (item['format'] not in ('png', 'jpeg') or item.get('manual') is not True):
+                    raise RuntimeError('STICKER_COLLECTION_INDEX_INVALID')
                 if any(
                     type(fields.get(name)) is not int or not 0 < fields[name] <= maximum
                     for name, maximum in [('len', MAX_FILE), ('width', 4096), ('height', 4096)]
@@ -98,14 +101,14 @@ class StickerCollection:
                     type(item.get('receivedAt')) is not int
                     or not isinstance(item.get('sources'), dict)
                     or len(item['sources']) > 100
-                    or any(not CHAT.fullmatch(key) or type(at) is not int for key, at in item['sources'].items())
+                    or any(not parse_chat_key(key) or type(at) is not int for key, at in item['sources'].items())
                 ):
                     raise RuntimeError('STICKER_COLLECTION_INDEX_INVALID')
         for image_id, item in state['pending'].items():
             if (
                 not HEX.fullmatch(image_id)
                 or not isinstance(item, dict)
-                or not CHAT.fullmatch(str(item.get('key', '')))
+                or not parse_chat_key(item.get('key'))
                 or not isinstance(item.get('descriptor'), dict)
                 or item['descriptor'].get('localType') != 47
             ):
@@ -117,7 +120,7 @@ class StickerCollection:
                 not HEX.fullmatch(image_id)
                 or not isinstance(item, dict)
                 or not HEX.fullmatch(str(item.get('digest', '')))
-                or not CHAT.fullmatch(str(item.get('key', '')))
+                or not parse_chat_key(item.get('key'))
             ):
                 raise RuntimeError('STICKER_COLLECTION_INDEX_INVALID')
         removed = state.get('removed', {})
@@ -179,12 +182,12 @@ class StickerCollection:
         return settings.get('collectEnabled', settings.get('collectGroups', True)) is True
 
     def allowed(self, key, policy=None):
-        match = CHAT.fullmatch(key) if isinstance(key, str) else None
-        if not match or int(match[2]) > 9007199254740991:
+        match = parse_chat_key(key)
+        if not match:
             return False
         policy = policy if policy is not None else self.policy()
-        return match[2] in map(
-            str, policy.get('whitelist', {}).get('private' if match[1] == 'private' else 'groups', [])
+        return match[1] in map(
+            str, policy.get('whitelist', {}).get('private' if match[0] == 'private' else 'groups', [])
         )
 
     def usable(self, item, policy=None):
@@ -269,6 +272,7 @@ class StickerCollection:
             or not valid_md5(source_md5)
         ):
             raise RuntimeError('STICKER_COLLECTION_RESOURCE_INVALID')
+        inspect_image(raw)
         with Image.open(io.BytesIO(raw)) as image:
             if image.format != 'GIF' or not 0 < image.width <= 4096 or not 0 < image.height <= 4096:
                 raise RuntimeError('STICKER_COLLECTION_RESOURCE_INVALID')
@@ -327,16 +331,23 @@ class StickerCollection:
         shared = settings.get('shareEnabled', settings.get('shareGroups', True)) is True
         return item.get('manual') is True or key in item.get('sources', {}) or shared and self.usable(item, policy)
 
-    def verified_bytes(self, digest, item):
+    def asset_file(self, digest, item):
         if not HEX.fullmatch(digest):
             raise RuntimeError('STICKER_COLLECTION_INDEX_INVALID')
-        file = self.safe(self.folder / (digest + '.gif'))
+        suffix = item.get('format', 'gif')
+        if suffix not in ('gif', 'png', 'jpeg') or suffix != 'gif' and item.get('manual') is not True:
+            raise RuntimeError('STICKER_COLLECTION_INDEX_INVALID')
+        return self.safe(self.folder / f'{digest}.{suffix}')
+
+    def verified_bytes(self, digest, item):
+        file = self.asset_file(digest, item)
         fields = item['fields']
         if not file.is_file() or file.stat().st_size > MAX_FILE:
             raise RuntimeError('STICKER_COLLECTION_RESOURCE_UNAVAILABLE')
         raw = file.read_bytes()
+        headers = {'gif': (b'GIF87a', b'GIF89a'), 'png': (b'\x89PNG\r\n\x1a\n',), 'jpeg': (b'\xff\xd8\xff',)}
         if (
-            not raw.startswith((b'GIF87a', b'GIF89a'))
+            not raw.startswith(headers[item.get('format', 'gif')])
             or hashlib.sha256(raw).hexdigest() != digest
             or hashlib.md5(raw).hexdigest() != fields['md5']
             or len(raw) != fields['len']
@@ -356,9 +367,9 @@ class StickerCollection:
             'id': image_id,
             'conversationKey': key,
             'sourceMd5': item['sourceMd5'],
-            'format': 'gif',
+            'format': item.get('format', 'gif'),
             'fields': item['fields'],
-            'path': str(self.safe(self.folder / (digest + '.gif'))),
+            'path': str(self.asset_file(digest, item)),
             'origin': 'sticker-pool',
         }
 
@@ -370,7 +381,7 @@ class StickerCollection:
                     return self.resource_from(state, digest, key, image_id)
         return None
 
-    def candidates(self, key, limit=20, rank=lambda item: 0):
+    def candidates(self, key, limit=20, rank=lambda item: 0, include_images=False):
         if not self.active() or not self.allowed(key):
             return []
         with self.lock:
@@ -388,6 +399,8 @@ class StickerCollection:
             )
             for digest in ordered:
                 item = state['entries'][digest]
+                if item.get('format') and not include_images:
+                    continue
                 if not self.eligible(item, key, policy):
                     continue
                 image_id = self.bound_id(key, digest)
@@ -404,6 +417,7 @@ class StickerCollection:
                         'sourceMd5s': item.get('sourceMd5s', [item['sourceMd5']]),
                         'nativeMd5': item['fields']['md5'],
                         'origin': 'sticker-pool',
+                        **({'format': item['format']} if item.get('format') else {}),
                         **({'manualLabel': item['manualLabel']} if item.get('manualLabel') else {}),
                     }
                 )
@@ -423,7 +437,7 @@ class StickerCollection:
                 return None
             resource = self.resource_from(state, alias['digest'], alias['key'], image_id)
             raw = self.safe(resource['path']).read_bytes()
-        result = normalize_image(raw, animated=True)
+        result = normalize_image(raw, animated=True, max_source_bytes=MAX_FILE)
         self.resource(image_id, alias['key'])
         return {**result, 'imageId': image_id, 'conversationKey': alias['key']}
 
@@ -582,7 +596,7 @@ class StickerCollection:
             self.write(state)
             for digest in (replaced | considered) - set(selected):
                 if digest not in state['waiting'] and digest not in state['archive']:
-                    self.safe(self.folder / (digest + '.gif')).unlink(missing_ok=True)
+                    self.asset_file(digest, items[digest]).unlink(missing_ok=True)
             return state['lastReview']
 
     def review_failed(self, ticket):

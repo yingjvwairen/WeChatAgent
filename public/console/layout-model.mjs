@@ -20,6 +20,8 @@ export const CAPABILITY_SECTIONS = { catalog: '能力目录', network: '联网�
 // 保存后立即生效的 wechat 配置分区（服务器对比时忽略这些分区，其余改动需重启服务）。
 // 服务器判断是否需要重启与页面上的"需重启"标记共用这一份列表。
 export const LIVE_WECHAT_SECTIONS = [
+  'whitelist',
+  'rosterGrants',
   'fishNotebook',
   'replyLayout',
   'stickers',
@@ -32,15 +34,18 @@ export const LIVE_WECHAT_SECTIONS = [
   'memeLibrary',
   'assistant',
 ];
+// The sender reads these preferences for each desktop request. A change does
+// not require a service restart or change the entry mode halfway through text.
+export const LIVE_INPUT_FIELDS = ['paused', 'controlMode', 'typeText', 'offscreen'];
 export const requiresRestart = path =>
-  path !== 'input.paused' &&
+  !LIVE_INPUT_FIELDS.some(field => path === 'input.' + field) &&
   !LIVE_WECHAT_SECTIONS.some(section => path === 'wechat.' + section || path.startsWith('wechat.' + section + '.'));
 export function withoutLiveSettings(config) {
   const copy = structuredClone(config);
   for (const section of LIVE_WECHAT_SECTIONS) delete copy.wechat?.[section];
-  // Pausing foreground input applies to the next desktop operation without a restart.
+  // Retain runtime/interpreter/client selection in the restart comparison.
   if (copy.input) {
-    delete copy.input.paused;
+    for (const field of LIVE_INPUT_FIELDS) delete copy.input[field];
     if (!Object.keys(copy.input).length) delete copy.input;
   }
   return copy;
@@ -58,7 +63,7 @@ export function consoleRoute(hash = '') {
   if (page === 'setup') return { page: 'setup' };
   // Package-provided page; the id is checked again against the installed catalog.
   if (page === 'plugin' && /^[a-z][a-z0-9-]{0,39}$/.test(section ?? '')) return { page, section };
-  if (page === 'memory') return { page, section: ['summaries'].includes(section) ? section : 'members' };
+  if (page === 'memory') return { page, section: ['summaries', 'notebook'].includes(section) ? section : 'members' };
   if (page === 'settings') return { page, section: Object.hasOwn(SETTINGS_SECTIONS, section) ? section : 'chat' };
   if (page === 'stickers') return { page, section: Object.hasOwn(STICKER_SECTIONS, section) ? section : 'library' };
   if (page === 'extensions')

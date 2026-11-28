@@ -1,3 +1,4 @@
+import { validChatKey } from '../../../../packages/wechat-identity.mjs';
 export const STICKER_CANDIDATE_LIMIT = 8;
 export const STICKER_CANDIDATE_MAX = 20;
 export function stickerCandidateLimit(value = STICKER_CANDIDATE_LIMIT) {
@@ -15,12 +16,7 @@ export function validateStickerSettings(settings) {
     if (!settings.chats || typeof settings.chats !== 'object' || Array.isArray(settings.chats))
       throw Error('Invalid sticker chats');
     for (const [key, value] of Object.entries(settings.chats))
-      if (
-        !/^wechat:(private|group):[1-9]\d{0,15}$/.test(key) ||
-        !Number.isSafeInteger(Number(key.split(':').at(-1))) ||
-        typeof value !== 'boolean'
-      )
-        throw Error('Invalid sticker chat override');
+      if (!validChatKey(key) || typeof value !== 'boolean') throw Error('Invalid sticker chat override');
   }
 }
 export function stickerPolicy(wechat, key) {
@@ -58,8 +54,11 @@ export function selectStickerChoices(
 ) {
   const limit = stickerCandidateLimit(candidateLimit);
   const requested = /表情|贴纸|梗图/.test(text);
-  const score = item => (labelCache ? (item.tags?.filter(tag => text.includes(tag)).length ?? 0) : 0);
-  const labelled = choices.filter(item => labelCache && cleanStickerLabel(item)).sort((a, b) => score(b) - score(a));
+  const labelledFor = item => labelCache || item.source === 'local-library';
+  const score = item => (labelledFor(item) ? (item.tags?.filter(tag => text.includes(tag)).length ?? 0) : 0);
+  const labelled = choices
+    .filter(item => labelledFor(item) && cleanStickerLabel(item))
+    .sort((a, b) => score(b) - score(a));
   const visible = choices.filter(item => seenIds.has(item.id) && !labelled.some(other => other.id === item.id));
   const unknown = requested && !labelled.length && !visible.length ? choices.slice(0, 2) : [];
   const unique = new Set();

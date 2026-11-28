@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { assistantAdministrator, assistantSenderAllowed, assistantGroupChatAllowed } from './assistant-policy.mjs';
+import { matchesConversationGrant, conversationGrant } from '../wechat-identity.mjs';
 import { conversationAccess, conversationWorkMode } from './conversation-policy.mjs';
 import { dshCatalog } from './dsh-access.mjs';
 import { taskFault, liveTask, assistantHelp, formatAssistantTask } from './assistant-tasks.mjs';
@@ -32,10 +33,14 @@ export function createAssistantControl({
           : 'ASSISTANT_SENDER_DENIED',
         403,
       );
+    if (body.localControl !== true && !matchesConversationGrant(w, body.conversationKey, body.rosterGrant))
+      throw taskFault('ASSISTANT_GRANT_CHANGED', 403);
     return w;
   };
+  const currentOrigin = (w, job) => matchesConversationGrant(w, job.key, job.request?.rosterGrant);
   const own = (body, w, job) => {
     if (!job || job.key !== body.conversationKey) throw taskFault('ASSISTANT_TASK_NOT_FOUND', 404);
+    if (!currentOrigin(w, job)) throw taskFault('ASSISTANT_GRANT_CHANGED', 403);
     if (body.localControl !== true && !assistantAdministrator(w, body.senderWxid) && job.sender !== body.senderWxid)
       throw taskFault('ASSISTANT_TASK_NOT_ALLOWED', 403);
     return job;
@@ -49,9 +54,11 @@ export function createAssistantControl({
       const sid = String(req.agent?.session?.id ?? ''),
         turn = pending.get(sid),
         job = tasks.get(turn?.taskId);
-      if (!job || !accountReady() || conversationAccess(settings(), job.key).remoteApproval !== true) return next();
+      if (!job) return next();
       const w = settings();
-      if (!assistantSenderAllowed(w, job.key, job.sender) || !assistantAdministrator(w, job.sender)) return next();
+      if (!accountReady() || !currentOrigin(w, job) || !assistantSenderAllowed(w, job.key, job.sender))
+        return 'cancelled';
+      if (conversationAccess(w, job.key).remoteApproval !== true) return next();
       // An approval always names the actual native tool call. Oversized or
       // unavailable actions stay in DSH rather than approving an unseen command.
       const events = req.agent.session.snapshotEvents(),
@@ -104,10 +111,11 @@ export function createAssistantControl({
       const sid = String(req.agent?.session?.id ?? ''),
         job = tasks.get(pending.get(sid)?.taskId);
       // Native confirmation intents retain their own reviewed approval flow.
+      if (!job) return next();
+      const w = settings();
+      if (!accountReady() || !currentOrigin(w, job) || !assistantSenderAllowed(w, job.key, job.sender))
+        throw taskFault('ASSISTANT_GRANT_CHANGED', 403);
       if (
-        !job ||
-        !accountReady() ||
-        !assistantSenderAllowed(settings(), job.key, job.sender) ||
         !Array.isArray(req.questions) ||
         !req.questions.length ||
         req.questions.length > 5 ||
@@ -172,7 +180,11 @@ export function createAssistantControl({
       if (typeof body.message !== 'string' || !body.message.trim() || body.message.length > 18000)
         throw taskFault('invalid_request', 400);
       const exists = [...tasks.jobs.values()].some(
-        job => job.key === key && job.sender === body.assistantSender && job.batchId === body.batchId,
+        job =>
+          job.key === key &&
+          job.sender === body.assistantSender &&
+          job.batchId === body.batchId &&
+          currentOrigin(w, job),
       );
       if (!exists) await beforeSubmit(key);
       const current = allowed(body);
@@ -304,6 +316,7 @@ export function createAssistantControl({
         sender: body.senderWxid,
         groupId: group.id,
         sid: mappings[key] ?? null,
+        rosterGrant: conversationGrant(w, key),
         expiresAt: Date.now() + 300000,
       });
       return {
@@ -314,7 +327,12 @@ export function createAssistantControl({
     if (action === 'workspace-confirm') {
       prune();
       const item = confirmations.get(body.token);
-      if (!item || item.key !== key || item.sender !== body.senderWxid)
+      if (
+        !item ||
+        item.key !== key ||
+        item.sender !== body.senderWxid ||
+        !matchesConversationGrant(w, key, item.rosterGrant)
+      )
         throw taskFault('ASSISTANT_CONFIRMATION_EXPIRED');
       if ([...tasks.jobs.values()].some(job => job.key === key && liveTask(job)))
         throw taskFault('SESSION_GROUP_SESSION_BUSY');

@@ -18,9 +18,7 @@ import { stableChatInstructions } from '../packages/dsh-social-bridge-plugin/pro
 import { createConsole } from './console-server.mjs';
 import { createWorkspaceLayout } from '../public/console/workspace-layout.js';
 const sender = 'wxid_part_fixture',
-  senderId = String(
-    Number((crypto.createHash('sha256').update(sender).digest().readBigUInt64BE(0) % 2147483647n) + 1n),
-  ),
+  senderId = sender,
   key = 'wechat:private:' + senderId;
 const message = {
   platform: 'wechat',

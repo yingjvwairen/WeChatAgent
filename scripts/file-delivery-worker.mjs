@@ -1,42 +1,52 @@
-import { FileTransfers } from '../packages/dsh-social-bridge-plugin/file-transfers.mjs';
-const terminal = new Set(['confirmed', 'failed', 'unconfirmed', 'cancelled', 'expired']);
-const rowKey = row => JSON.stringify([row.localId, row.serverId, row.createTime]);
+import { validChatId } from '../packages/wechat-identity.mjs';
+import {
+  FileTransfers,
+  fileDeliveryFinished,
+  awaitsFileReceipt,
+} from '../packages/dsh-social-bridge-plugin/file-transfers.mjs';
+const validId = value => /^[1-9]\d{0,31}$/.test(String(value ?? ''));
 const safeError = error =>
   /^[A-Z][A-Z0-9_]{2,80}$/.test(error?.code ?? error?.message) ? (error.code ?? error.message) : 'FILE_DELIVERY_FAILED';
 export class FileDeliveryWorker {
-  constructor(adapter, { log = () => {}, pollMs = 1000 } = {}) {
+  constructor(adapter, { log = () => {}, now = Date.now } = {}) {
     this.adapter = adapter;
     this.store = new FileTransfers(adapter.directory);
     this.log = log;
-    this.pollMs = pollMs;
+    this.now = now;
     this.running = new Set();
     this.targets = new Set();
+    this.lastScheduled = null;
     this.stopped = false;
   }
-  save(job) {
-    this.store.write(job);
+  save(job, options) {
+    if (!this.store.saveProgress(job, options)) return false;
     this.log('[File] ' + job.id.slice(0, 12) + ' state=' + job.state + (job.error ? ' code=' + job.error : ''));
+    return true;
   }
   tick() {
-    if (
-      this.stopped ||
-      this.running.size >= 2 ||
-      (this.adapter.status.backend === 'wechat-input' && this.adapter.status.paused)
-    )
-      return;
-    for (const job of this.store.list().sort((a, b) => a.createdAt - b.createdAt)) {
-      if (terminal.has(job.state) || this.running.has(job.id) || this.targets.has(job.key) || this.running.size >= 2)
-        continue;
+    if (this.stopped || this.running.size >= 2) return;
+    const active = this.store.list().sort((a, b) => a.createdAt - b.createdAt);
+    const heads = new Map();
+    const now = this.now();
+    for (const job of [...active, ...this.store.history.due(now)])
+      if (!(job.queuePaused && now < job.deadlineAt) && !heads.has(job.key)) heads.set(job.key, job);
+    const jobs = [...heads.values()];
+    // Pick up after the previous chat so waiting jobs cannot occupy every tick.
+    const offset = jobs.findIndex(job => job.key === this.lastScheduled) + 1;
+    for (const job of [...jobs.slice(offset), ...jobs.slice(0, offset)]) {
+      if (this.running.size >= 2) break;
+      if (this.running.has(job.id) || this.targets.has(job.key)) continue;
+      if (awaitsFileReceipt(job)) this.store.history.defer(job.id, now + 10000);
+      this.lastScheduled = job.key;
       this.running.add(job.id);
       this.targets.add(job.key);
       void this.run(job)
         .catch(error => {
-          if (job.state === 'queued' && (error.code ?? error.message) === 'INPUT_PAUSED') return;
-          job.state = job.state === 'queued' ? 'failed' : 'unconfirmed';
-          job.error = safeError(error);
           try {
-            this.save(job);
-          } catch {}
+            this.recordWait(job, safeError(error));
+          } catch {
+            this.log('[File] ' + job.id.slice(0, 12) + ' progress unavailable');
+          }
         })
         .finally(() => {
           this.running.delete(job.id);
@@ -44,118 +54,205 @@ export class FileDeliveryWorker {
         });
     }
   }
+  finish(job, state, error) {
+    job.state = state;
+    job.error = error;
+    this.save(job);
+  }
+
   async run(job) {
     const adapter = this.adapter;
-    if (job.accountScope !== this.store.account() || !this.store.allowed(job.key, job.sender)) {
-      job.state = 'cancelled';
-      job.error = 'FILE_ACCESS_CHANGED';
-      this.save(job);
+    if (awaitsFileReceipt(job)) {
+      if (!this.store.allowedJob(job) || job.accountRef !== adapter.accountRef) return;
+      const [, kind, target] = job.key.split(':');
+      const result = await adapter.desktopSender.request('lookup', {
+        account: job.account,
+        accountRef: job.accountRef,
+        kind,
+        target,
+        rosterGrant: job.rosterGrant,
+        deliveryId: job.id,
+        observeOnly: true,
+      });
+      if (result?.confirmed) this.applyNative(job, result);
+      else if (result?.reviewed || result?.recovery?.recovered) {
+        job.nativeReviewed = true;
+        this.save(job);
+      }
       return;
     }
-    if (Date.now() >= job.deadlineAt) {
-      job.state = job.state === 'queued' ? 'expired' : 'unconfirmed';
-      job.error = 'FILE_DELIVERY_TIMEOUT';
-      this.save(job);
+    if (fileDeliveryFinished(job.state) || (job.queuePaused && this.now() < job.deadlineAt)) return;
+    const beforeIntent = job.state === 'queued' && !job.nativeAdmitted;
+    if (beforeIntent && this.now() >= job.deadlineAt) {
+      this.finish(job, 'expired', 'FILE_DELIVERY_TIMEOUT');
+      return;
+    }
+    if (!this.store.allowedJob(job)) {
+      this.finish(job, beforeIntent ? 'cancelled' : 'unconfirmed', 'FILE_ACCESS_CHANGED');
       return;
     }
     const [, kind, target] = job.key.split(':');
-    if (!['private', 'group'].includes(kind) || !/^\d+$/.test(target)) throw Error('FILE_JOB_INVALID');
-    const identity = await adapter.checkNative();
-    if (adapter.status.backend === 'wechat-input' && adapter.status.paused) throw Error('INPUT_PAUSED');
-    if ((adapter.status.file_send ?? adapter.status.native_file_send) !== true)
-      throw Error('FILE_NATIVE_SENDER_NOT_READY');
-    const wxid = await adapter.resolveTarget(kind, target);
-    if ((job.wxid && job.wxid !== wxid) || (job.account && job.account !== identity.account))
-      throw Error('FILE_ACCOUNT_CHANGED');
-    if (job.state === 'queued') {
-      const source = this.store.staged(job),
-        proof = await this.store.hash(source, AbortSignal.timeout(10000));
-      if (proof.sha256 !== job.sha256 || proof.md5 !== job.md5 || proof.size !== job.size)
-        throw Error('FILE_STAGED_INVALID');
-      job.wxid = wxid;
-      job.account = identity.account;
-      job.baseline = (await adapter.messages(wxid)).map(rowKey);
-      job.startedAt = Date.now();
-      if (this.stopped || !this.store.allowed(job.key, job.sender) || job.accountScope !== this.store.account()) {
-        job.state = 'cancelled';
-        job.error = 'FILE_ACCESS_CHANGED';
-        this.save(job);
-        return;
-      }
+    if (!validChatId(kind, target))
+      return this.finish(job, beforeIntent ? 'failed' : 'unconfirmed', 'FILE_JOB_INVALID');
+    let identity;
+    try {
+      identity = await adapter.checkNative();
+      await adapter.lookupTarget(kind, target);
+    } catch (error) {
+      // Readiness and target discovery are observations. Losing the Reader does
+      // not tell us whether an existing task was submitted.
+      this.recordWait(job, safeError(error));
+      return;
+    }
+    if ((job.account && job.account !== identity.account) || (job.accountRef && job.accountRef !== adapter.accountRef))
+      return this.finish(job, beforeIntent ? 'failed' : 'unconfirmed', 'FILE_ACCOUNT_CHANGED');
+
+    const scope = {
+      account: identity.account,
+      accountRef: adapter.accountRef,
+      kind,
+      target,
+      rosterGrant: job.rosterGrant,
+      deliveryId: job.id,
+    };
+    if ((job.nativeAdmitted || job.state !== 'queued') && !(await this.awaitingAdmission(job, scope))) return;
+    if (this.stopped || adapter.status.paused) return;
+    if (adapter.status.file_send !== true) {
+      this.recordWait(job, 'FILE_NATIVE_SENDER_NOT_READY');
+      return;
+    }
+    let source, proof;
+    try {
+      source = this.store.staged(job);
+      proof = await this.store.hash(source, AbortSignal.timeout(10000));
+    } catch (error) {
+      if (
+        error.code === 'ENOENT' ||
+        ['FILE_STAGED_INVALID', 'FILE_OUTSIDE_WORKSPACE', 'FILE_LINK_NOT_ALLOWED', 'FILE_TOO_LARGE'].includes(
+          error.code,
+        )
+      )
+        return this.finish(job, 'failed', 'FILE_STAGED_INVALID');
+      throw error;
+    }
+    if (proof.sha256 !== job.sha256 || proof.md5 !== job.md5 || proof.size !== job.size)
+      return this.finish(job, 'failed', 'FILE_STAGED_INVALID');
+    if (this.stopped || adapter.status.paused) return;
+    if (!this.store.allowedJob(job) || this.now() >= job.deadlineAt) {
+      const expired = this.now() >= job.deadlineAt;
+      this.finish(job, expired ? 'expired' : 'cancelled', expired ? 'FILE_DELIVERY_TIMEOUT' : 'FILE_ACCESS_CHANGED');
+      return;
+    }
+
+    if (!job.dispatchPending) {
+      job.account = scope.account;
+      job.accountRef = scope.accountRef;
+      job.startedAt = this.now();
       job.state = 'submitting';
-      this.save(job); // Persist BEFORE native submission.
-      try {
-        const result = await adapter.native(
-          '/SendFileMsg',
-          { wxidorgid: wxid, path: source, md5: job.md5, size: job.size },
-          identity.account,
-        );
-        if (result?.ret !== 0) {
-          job.state = 'failed';
-          job.error = 'FILE_NATIVE_REJECTED';
-          this.save(job);
-          return;
-        }
-      } catch (error) {
-        // An explicit pre-submission 429 can be retried a bounded number of
-        // times. Network failures remain uncertain and are never resubmitted.
-        if (error.message === 'API_HTTP_429' && (job.busyAttempts ?? 0) < 3) {
-          job.state = 'queued';
-          job.busyAttempts = (job.busyAttempts ?? 0) + 1;
-          delete job.startedAt;
-          this.save(job);
-          return;
-        }
-        if (/^API_HTTP_(400|401|403|409|429)$/.test(error.message)) {
-          job.state = 'failed';
-          job.error = safeError(error);
-          this.save(job);
-          return;
-        }
-        job.error = 'FILE_SUBMISSION_UNCERTAIN';
-      }
-      job.state = 'submitted';
-      this.save(job);
+      job.nativeAdmitted = true;
+      job.dispatchPending = true;
+      if (!this.save(job, { claim: true })) return; // A control action won during source verification.
     }
-    if (!Array.isArray(job.baseline) || job.baseline.length > 500 || !Number.isFinite(job.startedAt))
-      throw Error('FILE_RECEIPT_STATE_INVALID');
-    const baseline = new Set(job.baseline);
-    // Receipt waits never hold the text/sticker sender's target lock.
-    while (!this.stopped && Date.now() < job.deadlineAt) {
-      if (!this.store.allowed(job.key, job.sender) || job.accountScope !== this.store.account()) {
-        job.state = 'unconfirmed';
-        job.error = 'FILE_ACCESS_CHANGED_AFTER_SUBMISSION';
-        this.save(job);
+    let result;
+    try {
+      result = await adapter.dispatchDesktop(
+        'file',
+        {
+          ...scope,
+          fileDeliveryId: job.id,
+          inputDeadlineAt: job.deadlineAt,
+          expectedSha256: job.sha256,
+          fileName: job.name,
+          path: source,
+          md5: job.md5,
+          size: job.size,
+        },
+        scope.account,
+      );
+    } catch (error) {
+      if (error.attempted === false) {
+        const expired = error.senderCode === 'DESKTOP_INPUT_EXPIRED';
+        this.finish(job, expired ? 'expired' : 'failed', expired ? 'FILE_DELIVERY_TIMEOUT' : safeError(error));
         return;
       }
-      for (const row of await adapter.messages(wxid))
-        if (
-          row.isSend &&
-          (row.localType === 25769803825 || (row.localType === 49 && row.fileKind === 'appmsg-6')) &&
-          row.fileName === job.name &&
-          row.fileSize === job.size &&
-          (!row.fileMd5 || row.fileMd5 === job.md5) &&
-          !baseline.has(rowKey(row)) &&
-          row.createTime >= Math.floor(job.startedAt / 1000) - 30 &&
-          /^\d+$/.test(String(row.serverId)) &&
-          BigInt(row.serverId) > 0n
-        ) {
-          job.state = 'confirmed';
-          job.receipt = { messageId: String(row.localId), type: 'wechat-file', serverConfirmed: true };
-          delete job.error;
-          this.save(job);
-          adapter.status.confirmed_sends++;
-          return;
-        }
-      await new Promise(resolve =>
-        setTimeout(resolve, Math.min(this.pollMs, Math.max(1, job.deadlineAt - Date.now()))),
-      );
-    }
-    if (!this.stopped) {
-      job.state = 'unconfirmed';
-      job.error = 'FILE_DELIVERY_TIMEOUT';
+      // Persist uncertainty before consulting the same active/archived job.
+      // Only the next tick can resume an intent proved absent from both.
+      job.state = 'submitted';
+      job.error = 'FILE_SUBMISSION_UNCERTAIN';
       this.save(job);
+      if (!this.stopped) await this.awaitingAdmission(job, scope);
+      return;
     }
+    try {
+      this.applyNative(job, result);
+    } catch (error) {
+      this.recordWait(job, safeError(error));
+    }
+  }
+
+  recordWait(job, reason) {
+    if (job.error === reason) return;
+    job.error = reason;
+    this.save(job);
+  }
+
+  async awaitingAdmission(job, scope) {
+    try {
+      const result = await this.adapter.desktopSender.request('lookup', scope);
+      if (result !== null) this.applyNative(job, result);
+      else if (this.now() >= job.deadlineAt) {
+        // Only a successful scoped lookup can prove that no native task is
+        // still waiting to send. An unavailable Reader is not that proof.
+        this.finish(job, job.dispatchPending ? 'expired' : 'unconfirmed', 'FILE_DELIVERY_TIMEOUT');
+      } else if (job.dispatchPending) return true;
+      else this.recordWait(job, 'FILE_NATIVE_JOB_NOT_FOUND');
+    } catch (error) {
+      this.recordWait(job, safeError(error));
+    }
+    return false;
+  }
+
+  applyNative(job, result) {
+    if (
+      result?.admitted !== true ||
+      result.deliveryId !== job.id ||
+      typeof result.state !== 'string' ||
+      (result.state === 'confirmed') !== (result.confirmed === true)
+    )
+      throw Error('FILE_NATIVE_RESULT_INVALID');
+    let receipt;
+    if (result.confirmed === true) {
+      const r = result.receipt;
+      if (!validId(r?.localId) || !validId(r?.serverId) || r.fileName !== job.name || r.fileSize !== job.size)
+        throw Error('FILE_NATIVE_RECEIPT_INVALID');
+      receipt = {
+        messageId: String(r.localId),
+        serverId: String(r.serverId),
+        type: 'wechat-file',
+        serverConfirmed: true,
+      };
+    }
+    delete job.dispatchPending;
+    job.nativeState = result.state;
+    job.nativeRecovery = result.recovery ?? null;
+    if (receipt) {
+      job.state = 'confirmed';
+      job.receipt = receipt;
+      delete job.error;
+      if (this.save(job)) this.adapter.status.confirmed_sends++;
+      return;
+    }
+    job.state =
+      result.state === 'cancelled' && result.reason === 'DESKTOP_INPUT_EXPIRED'
+        ? 'expired'
+        : ['cancelled', 'failed', 'unconfirmed'].includes(result.state)
+          ? result.state
+          : result.submitted === true || ['attempted', 'submitted', 'unknown'].includes(result.submission)
+            ? 'submitted'
+            : 'queued';
+    if (result.reason) job.error = result.reason;
+    else delete job.error;
+    this.save(job);
   }
   stop() {
     this.stopped = true;

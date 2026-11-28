@@ -1,3 +1,4 @@
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -316,7 +317,7 @@ export function createLayoutAwareQtDriver({
     }
     const missingAdaptiveMetadata =
       typeof resolveUnknownLayout === 'function' &&
-      identity.executableVersion === '4.2.0.53' &&
+      identity.executableVersion === DESKTOP_WECHAT_VERSION &&
       (!driver.config.searchPopupCalibration ||
         (driver.config.sharedDesktop !== true &&
           (!driver.config.selfSurface?.popupCalibration || !driver.config.profileSurface?.popupCalibration)));

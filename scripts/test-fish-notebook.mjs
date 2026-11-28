@@ -24,7 +24,7 @@ import { SocialEngine } from '../components/qq-bridge/src/core/social-engine.js'
 import { MessageBuffer } from '../components/qq-bridge/src/core/message-buffer.js';
 import { DshPluginClient } from '../components/qq-bridge/src/dsh/plugin-client.js';
 const key = 'wechat:private:123',
-  group = 'wechat:group:456',
+  group = 'wechat:group:456@chatroom',
   account = 'a'.repeat(64),
   viewer = 'b'.repeat(64),
   other = 'c'.repeat(64),
@@ -38,7 +38,7 @@ function fixture(t) {
     fs.rmSync(root, { recursive: true, force: true });
   });
   const config = JSON.parse(fs.readFileSync('config/wechatagent.example.json', 'utf8'));
-  config.wechat.whitelist = { private: ['123'], groups: ['456'] };
+  config.wechat.whitelist = { private: ['123'], groups: ['456@chatroom'] };
   config.wechat.fishNotebook = { enabled: true, writeTime: '21:30', chats: {} };
   for (const dir of ['config', 'roles', 'state/weflow']) fs.mkdirSync(path.join(root, dir), { recursive: true });
   fs.writeFileSync(path.join(root, 'config/wechatagent.json'), JSON.stringify(config));
@@ -87,7 +87,7 @@ const until = async fn => {
   throw Error('condition not reached');
 };
 test('notebook defaults stay off, settings validate and authored queries keep stable per-person identity', () => {
-  const w = { whitelist: { private: ['123'], groups: ['456'] } };
+  const w = { whitelist: { private: ['123'], groups: ['456@chatroom'] } };
   assert(!fishNotebookEnabled(w, key));
   validateFishNotebook({ enabled: true, writeTime: '21:30', chats: { [group]: false } });
   for (const value of [{ enabled: 'true' }, { writeTime: '25:30' }, { extra: 1 }, { chats: { bad: true } }])
@@ -323,7 +323,7 @@ test('Bridge routes diary questions through the existing reliable text outbox wi
   assert(!sent.some(text => text.startsWith('RESPOND:')));
   assert.equal(f.calls.length, 3);
 });
-test('legacy journals stay in place while the console only offers the package page and the plugin revision owns settings', async t => {
+test('stored journals are available offline and the plugin revision owns generation settings', async t => {
   const f = fixture(t);
   await f.note.ask(key, request(1));
   const installer = new PluginInstaller(f.root),
@@ -369,5 +369,11 @@ test('legacy journals stay in place while the console only offers the package pa
   const listed = new FishNotebookStore(f.root, account).list(key);
   assert.equal(listed.entries.length, 1);
   assert.equal(listed.entries[0].text, diary);
-  assert.deepEqual(consoleRoute('#memory/notebook'), { page: 'memory', section: 'members' });
+  const stored = await fetch(
+    base + '/api/memory/notebook?' + new URLSearchParams({ scope: account, conversationKey: key }),
+    { headers },
+  );
+  assert.equal(stored.status, 200);
+  assert.deepEqual((await stored.json()).entries, listed.entries);
+  assert.deepEqual(consoleRoute('#memory/notebook'), { page: 'memory', section: 'notebook' });
 });

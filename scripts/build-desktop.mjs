@@ -4,8 +4,10 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { projectRoot } from './project-config.mjs';
 import { buildIcons, embedExecutableIcon } from './build-icons.mjs';
+import { launcherAssemblyInfo } from './release-version.mjs';
 
 const root = projectRoot;
+const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const runtime = path.join(root, 'node_modules/electron/dist');
 if (!fs.existsSync(path.join(runtime, 'electron.exe')))
   throw new Error('未找到已有 Electron 运行环境，请先在源码目录安装开发依赖。');
@@ -53,6 +55,8 @@ const iconFile = await buildIcons(root, appDir, sharp);
 embedExecutableIcon(path.join(output, 'WeChatAgent.exe'), iconFile, require('resedit'));
 const compiler = path.join(process.env.WINDIR ?? 'C:/Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
 const launcher = path.join(root, 'WeChatAgent.exe');
+const versionFile = path.join(root, 'release', 'LauncherVersion.cs');
+fs.writeFileSync(versionFile, launcherAssemblyInfo(pkg));
 const built = spawnSync(
   compiler,
   [
@@ -62,6 +66,7 @@ const built = spawnSync(
     `/out:${launcher}`,
     `/win32icon:${iconFile}`,
     '/reference:System.Windows.Forms.dll',
+    versionFile,
     path.join(root, 'apps/console-desktop/launcher.cs'),
   ],
   { encoding: 'utf8', windowsHide: true },
@@ -74,7 +79,7 @@ fs.writeFileSync(
   JSON.stringify(
     {
       product: 'WeChatAgent',
-      version: JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version,
+      version: pkg.version,
       electron: fs.readFileSync(path.join(runtime, 'version'), 'utf8').trim(),
       node: process.version,
       entry: 'WeChatAgent.exe',

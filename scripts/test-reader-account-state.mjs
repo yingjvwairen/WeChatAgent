@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -31,10 +32,10 @@ function fixture(t) {
   const b = { dbPath: path.join(root, 'wechat/wxid_b'), myWxid: 'wxid_b', decryptKey: 'userdpapi:Yg==' };
   for (const reader of [a, b]) fs.mkdirSync(path.join(reader.dbPath, 'db_storage'), { recursive: true });
   const config = structuredClone(example);
-  config.wechat.whitelist = { private: ['123'], groups: ['456'] };
+  config.wechat.whitelist = { private: ['123'], groups: ['456@chatroom'] };
   config.persona.chats = { 'wechat:private:123': config.persona.default };
-  config.wechat.chatModes = { 'wechat:group:456': 'mention' };
-  config.wechat.dshAccess = { chats: { 'wechat:group:456': { skills: ['sample'], tools: ['lookup'] } } };
+  config.wechat.chatModes = { 'wechat:group:456@chatroom': 'mention' };
+  config.wechat.dshAccess = { chats: { 'wechat:group:456@chatroom': { skills: ['sample'], tools: ['lookup'] } } };
   config.wechat.search.chats = { 'wechat:private:123': { enabled: true } };
   write(path.join(root, 'config/wechatagent.json'), config);
   write(path.join(root, 'state/weflow/WeFlow-config.json'), a);
@@ -49,8 +50,31 @@ test('account directory and parent-directory selections have the same account id
   assert.notEqual(readerAccountId(root, a), readerAccountId(root, b));
 });
 
+test('Reader and bridge use the same account scope for a Unicode database path', t => {
+  const { root } = fixture(t);
+  const dbPath = path.join(root, 'Straße', 'wxid_sample');
+  fs.mkdirSync(path.join(dbPath, 'db_storage'), { recursive: true });
+  const settings = { dbPath, myWxid: 'wxid_sample', decryptKey: 'userdpapi:YQ==' };
+  const expected = applyReaderAccount(root, {}, settings, structuredClone(example)).id;
+  const result = spawnSync(
+    process.env.WECHATAGENT_TEST_PYTHON || 'python',
+    [
+      '-B',
+      '-c',
+      'import sys; from wechat_identity import reader_account_scope; print(reader_account_scope(sys.argv[1],sys.argv[2]))',
+      dbPath,
+      root,
+    ],
+    { cwd: path.join(import.meta.dirname), encoding: 'utf8', windowsHide: true },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), expected);
+});
+
 test('switching A to B isolates chats and pending state, then switching back restores A', t => {
   const { root, a, b, config } = fixture(t);
+  config.wechat.rosterGrants = { 'wechat:private:123': 'd8b51595-8c32-4378-9e83-7ee7eccbe836' };
+  config.wechat.history.chats = { 'wechat:private:123': false };
   write(path.join(root, 'state/social-messages.json'), { from: 'a' });
   write(path.join(root, 'state/text-deliveries/pending.json'), { from: 'a' });
   write(path.join(root, 'state/media/image.json'), { from: 'a' });
@@ -65,6 +89,7 @@ test('switching A to B isolates chats and pending state, then switching back res
   });
   const switched = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json')));
   assert.deepEqual(switched.wechat.chatModes, {});
+  assert.deepEqual(switched.wechat.history.chats, {});
   assert.deepEqual(switched.wechat.dshAccess, { chats: {} });
   for (const file of ['social-messages.json', 'text-deliveries', 'media'])
     assert.equal(fs.existsSync(path.join(root, 'state', file)), false);
@@ -76,11 +101,13 @@ test('switching A to B isolates chats and pending state, then switching back res
   const second = applyReaderAccount(root, first.reader, { ...first.reader, ...a }, bConfig);
   assert.equal(second.reader.imageAesKey, a.imageAesKey);
   const restored = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json')));
+  assert.deepEqual(restored.wechat.rosterGrants, config.wechat.rosterGrants);
   assert.deepEqual(restored.wechat.whitelist, config.wechat.whitelist);
   assert.deepEqual(restored.persona.chats, config.persona.chats);
   assert.deepEqual(restored.wechat.chatModes, config.wechat.chatModes);
   assert.deepEqual(restored.wechat.dshAccess, config.wechat.dshAccess);
   assert.deepEqual(restored.wechat.search.chats, config.wechat.search.chats);
+  assert.deepEqual(restored.wechat.history.chats, config.wechat.history.chats);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'state/social-messages.json'))), { from: 'a' });
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'state/text-deliveries/pending.json'))), { from: 'a' });
   assert.equal(cachedReaderAccount(root, readerAccountId(root, b)).chats.whitelist.private[0], '789');

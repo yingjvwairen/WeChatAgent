@@ -1,3 +1,4 @@
+import { allowedConversation, validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -62,7 +63,7 @@ export function validateHistorySettings(value) {
         !item ||
         typeof item !== 'object' ||
         Array.isArray(item) ||
-        Object.entries(item).some(([k, v]) => !/^wechat:(private|group):[1-9]\d*$/.test(k) || typeof v !== 'boolean')
+        Object.entries(item).some(([k, v]) => !validChatKey(k) || typeof v !== 'boolean')
       )
         throw Error('history chats invalid');
     } else if (!ranges[key] || !Number.isSafeInteger(item) || item < ranges[key][0] || item > ranges[key][1])
@@ -75,9 +76,7 @@ export function validateHistorySettings(value) {
 export function historyPolicy(wechat = {}, key) {
   const value = wechat.history ?? {};
   validateHistorySettings(value);
-  const match = /^wechat:(private|group):([1-9]\d*)$/.exec(key),
-    allowed =
-      match && (wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(match[2]);
+  const allowed = allowedConversation(wechat, key);
   return {
     ...HISTORY_DEFAULTS,
     ...value,

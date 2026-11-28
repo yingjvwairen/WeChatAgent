@@ -1,11 +1,13 @@
+import { allowedConversation, validUserId } from '../packages/wechat-identity.mjs';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { activeReaderAccount } from './reader-account-state.mjs';
 import { MEMBER_TAGS, memberMemoryEnabled } from '../packages/dsh-social-bridge-plugin/member-memory-policy.mjs';
+import { FishNotebookStore } from '../packages/dsh-social-bridge-plugin/fish-notebook-store.mjs';
 
 const HEX = /^[a-f0-9]{64}$/,
-  KEY = /^wechat:(private|group):[1-9]\d{0,15}$/,
   AGE = 90 * 86400000;
 const fault = (message, status = 400) => Object.assign(Error(message), { status });
 function readHistory(file, keys, source) {
@@ -53,15 +55,8 @@ export function createMemoryConsole({ root, configFor, plugin, now = Date.now })
     return id;
   }
   function chat(key) {
-    const config = configFor(),
-      match = KEY.exec(key ?? '');
-    if (
-      !match ||
-      !(config.wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? [])
-        .map(String)
-        .includes(key.split(':')[2])
-    )
-      throw fault('请选择已保存聊天范围中的会话。', 403);
+    const config = configFor();
+    if (!allowedConversation(config.wechat, key)) throw fault('请选择已保存聊天范围中的会话。', 403);
     return config;
   }
   function overview() {
@@ -91,7 +86,7 @@ export function createMemoryConsole({ root, configFor, plugin, now = Date.now })
       status = params.get('status') ?? 'all';
     if (query.length > 80 || !['all', 'observed', 'tentative', 'untagged'].includes(status))
       throw fault('群友筛选参数无效。');
-    const file = safeFile(root, 'member-memory', id, key.split(':')[2] + '.json');
+    const file = safeFile(root, 'member-memory', id, crypto.createHash('sha256').update(key).digest('hex') + '.json');
     let entries = [];
     if (fs.existsSync(file)) {
       if (!fs.statSync(file).isFile() || fs.statSync(file).size > 4 * 1024 * 1024)
@@ -150,7 +145,7 @@ export function createMemoryConsole({ root, configFor, plugin, now = Date.now })
             .filter(tag => tag.evidenceCount > 0);
           return {
             memberId,
-            senderId: /^[1-9]\d{0,15}$/.test(m.senderId ?? '') ? m.senderId : '',
+            senderId: validUserId(m.senderId) ? m.senderId : '',
             names: m.names,
             tags,
             firstSeenAt: Number.isSafeInteger(m.firstSeenAt) ? m.firstSeenAt : null,
@@ -248,5 +243,15 @@ export function createMemoryConsole({ root, configFor, plugin, now = Date.now })
       summaries: rows.slice(offset, offset + 24),
     };
   }
-  return { overview, members, summaries };
+  function notebook(params) {
+    const id = scope(params.get('scope')),
+      key = params.get('conversationKey');
+    chat(key);
+    const result = new FishNotebookStore(root, id).list(key, {
+      offset: pageNumber(params.get('offset'), 0, 10000),
+      limit: 24,
+    });
+    return { accountScope: id, conversationKey: key, ...result };
+  }
+  return { overview, members, summaries, notebook };
 }

@@ -3,39 +3,49 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { DatabaseSync } from 'node:sqlite';
 
 import { assistantSenderAllowed, assistantAdministrator } from './assistant-policy.mjs';
-export const FILE_LIMIT = 50 * 1024 * 1024;
+import { FileReceiptHistory, fault, inside, noLinks, removeEmptyDirectory } from './file-storage.mjs';
+import { conversationGrant, validChatKey } from './conversation-policy.mjs';
+import { validUserId } from '../wechat-identity.mjs';
+import { FILE_LIMIT, fileId, safeFileName } from '../wechat-file-reference.mjs';
+export { FILE_LIMIT, fileId, safeFileName } from '../wechat-file-reference.mjs';
+const terminalFileStates = new Set(['confirmed', 'failed', 'unconfirmed', 'cancelled', 'expired']);
+export const fileDeliveryFinished = state => terminalFileStates.has(state);
+export const awaitsFileReceipt = job => job.state === 'unconfirmed' && job.nativeAdmitted && !job.nativeReviewed;
+const activeLimit = 128;
+const byteLimit = 512 * 1024 * 1024;
 export const FILE_TRANSFER_POLICY = Symbol.for('wechatagent.file-transfer.v1');
-export const fileId = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-export const safeFileName = value =>
-  typeof value === 'string' &&
-  value.length > 0 &&
-  value.length <= 180 &&
-  !/[\\/:*?"<>|\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/.test(value) &&
-  !/[. ]$/.test(value) &&
-  !/^\.{1,2}$/.test(value) &&
-  !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(value);
 export const filesAllowed = (w, key, sender) =>
   w?.workModes?.[key] === 'assistant' &&
   w?.assistant?.fileTransferChats?.[key] === true &&
   assistantSenderAllowed(w, key, sender);
+const grantAllowsJob = (settings, job) =>
+  filesAllowed(settings, job.key, job.sender) && conversationGrant(settings, job.key) === (job.rosterGrant ?? 'legacy');
+const busyFile = error => ['EBUSY', 'EACCES', 'EPERM'].includes(error.code);
+const damagedCheckpoint = error =>
+  error instanceof SyntaxError || ['FILE_JOB_INVALID', 'FILE_LINK_NOT_ALLOWED', 'EISDIR'].includes(error.code);
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
-const fault = code => Object.assign(Error(code), { code });
-const inside = (root, target) => {
-  const rel = path.relative(root, target);
-  return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
-};
-function noLinks(root, target) {
-  if (target !== root && !inside(root, target)) throw fault('FILE_OUTSIDE_WORKSPACE');
-  let current = target;
-  for (;;) {
-    if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) throw fault('FILE_LINK_NOT_ALLOWED');
-    if (current === root) break;
-    current = path.dirname(current);
-  }
-}
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+async function copyVerified(source, destination, expected, signal, mismatch) {
+  const hash = crypto.createHash('sha256');
+  let size = 0;
+  await pipeline(
+    fs.createReadStream(source),
+    new Transform({
+      transform(chunk, _encoding, done) {
+        size += chunk.length;
+        if (size > FILE_LIMIT) return done(fault('FILE_TOO_LARGE'));
+        hash.update(chunk);
+        done(null, chunk);
+      },
+    }),
+    fs.createWriteStream(destination, { flags: 'wx', mode: 0o600, flush: true }),
+    { signal },
+  );
+  if (size !== expected.size || hash.digest('hex') !== expected.sha256) throw fault(mismatch);
+}
 const publicJob = job => ({
   id: job.id,
   name: job.name,
@@ -54,6 +64,7 @@ export class FileTransfers {
     this.directory = path.join(this.root, 'state/files');
     this.jobs = path.join(this.directory, 'deliveries');
     this.outgoing = path.join(this.directory, 'outgoing');
+    this.history = new FileReceiptHistory(this.root, this.directory);
   }
   settings() {
     return read(path.join(this.root, 'config/wechatagent.json'));
@@ -71,18 +82,37 @@ export class FileTransfers {
       return false;
     }
   }
+  allowedJob(job) {
+    return job.accountScope === this.account() && grantAllowsJob(this.settings().wechat, job);
+  }
   assert(key, sender) {
     if (!this.allowed(key, sender)) throw fault('FILE_TRANSFER_NOT_ALLOWED');
   }
-  read(id) {
+  grant(key, sender) {
+    const settings = this.settings().wechat;
+    if (!filesAllowed(settings, key, sender)) throw fault('FILE_TRANSFER_NOT_ALLOWED');
+    return { key, sender, accountScope: this.account(), rosterGrant: conversationGrant(settings, key) };
+  }
+  find(id) {
     if (!fileId(id)) throw fault('FILE_REFERENCE_INVALID');
     const file = path.join(this.jobs, id + '.json');
     noLinks(this.root, file);
-    if (fs.statSync(file).size > 16384) throw fault('FILE_JOB_INVALID');
-    const job = read(file);
+    let job;
+    try {
+      if (fs.statSync(file).size > 16384) throw fault('FILE_JOB_INVALID');
+      job = read(file);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      job = this.history.find(id);
+      if (!job) return;
+    }
     if (
+      !job ||
       job.version !== 1 ||
       job.id !== id ||
+      (!fileId(job.accountScope) && job.accountScope !== 'legacy') ||
+      !validChatKey(job.key) ||
+      !validUserId(job.sender) ||
       !safeFileName(job.name) ||
       !Number.isSafeInteger(job.size) ||
       job.size < 0 ||
@@ -100,29 +130,202 @@ export class FileTransfers {
       throw fault('FILE_JOB_INVALID');
     return job;
   }
+  read(id) {
+    const job = this.find(id);
+    if (!job) throw fault('ENOENT');
+    return job;
+  }
+  // Save the terminal checkpoint before removing its private copy. A crash or
+  // a busy file leaves the checkpoint available for cleanup on the next scan.
+  retire(job) {
+    this.history.save(job, awaitsFileReceipt(job));
+    const directory = path.join(this.outgoing, job.id),
+      source = path.join(directory, job.name);
+    try {
+      noLinks(this.root, directory);
+      fs.rmSync(source, { force: true });
+      removeEmptyDirectory(directory);
+      fs.rmSync(path.join(this.jobs, job.id + '.json'), { force: true });
+      return true;
+    } catch (error) {
+      if (!busyFile(error) && !['FILE_LINK_NOT_ALLOWED', 'ERR_FS_EISDIR'].includes(error.code)) throw error;
+      return false;
+    }
+  }
   write(job) {
     noLinks(this.root, this.jobs);
     fs.mkdirSync(this.jobs, { recursive: true });
     const target = path.join(this.jobs, job.id + '.json');
     noLinks(this.root, target);
-    const temporary = target + '.' + process.pid + '.tmp';
-    fs.writeFileSync(temporary, JSON.stringify(job), { mode: 0o600 });
-    fs.renameSync(temporary, target);
+    const temporary = target + '.' + crypto.randomUUID() + '.tmp';
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(job), { flag: 'wx', mode: 0o600, flush: true });
+      fs.renameSync(temporary, target);
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+    if (fileDeliveryFinished(job.state)) this.retire(job);
+  }
+  // A .ready copy and its active JSON are published under the same writer
+  // lock. After a process exit we can complete the rename, or discard the
+  // uncommitted copy without ever guessing the name of a user's file.
+  publishCopy(job, ready) {
+    const directory = path.join(this.outgoing, job.id),
+      destination = path.join(directory, job.name);
+    noLinks(this.root, destination);
+    fs.mkdirSync(directory, { recursive: true });
+    fs.renameSync(ready, destination);
+  }
+  recoverCopies() {
+    const busy = new Set();
+    noLinks(this.root, this.outgoing);
+    if (!fs.existsSync(this.outgoing)) return busy;
+    for (const entry of fs.readdirSync(this.outgoing, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const file = path.join(this.outgoing, entry.name);
+      const partial = /^(\d{1,10})\.[\da-f-]{36}\.partial$/.exec(entry.name);
+      if (partial) {
+        try {
+          process.kill(Number(partial[1]), 0);
+        } catch (error) {
+          if (error.code === 'ESRCH') fs.rmSync(file, { force: true });
+        }
+        continue;
+      }
+      const id = entry.name.slice(0, -6);
+      if (!fileId(id) || entry.name !== id + '.ready') continue;
+      try {
+        const job = this.find(id);
+        if (job && !fileDeliveryFinished(job.state)) this.publishCopy(job, file);
+        else fs.rmSync(file, { force: true });
+      } catch (error) {
+        if (!busyFile(error) && !damagedCheckpoint(error)) throw error;
+        busy.add(id);
+      }
+    }
+    return busy;
+  }
+  inspectActive() {
+    const usage = { jobs: [], count: 0, bytes: 0 };
+    const busy = this.recoverCopies();
+    noLinks(this.root, this.jobs);
+    if (!fs.existsSync(this.jobs)) return usage;
+    for (const name of fs.readdirSync(this.jobs)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      let job;
+      try {
+        job = this.read(name.slice(0, -5));
+      } catch (error) {
+        // Reserve capacity for damaged checkpoints while other jobs continue.
+        if (!busyFile(error) && !damagedCheckpoint(error)) throw error;
+        usage.count++;
+        usage.bytes += FILE_LIMIT;
+        continue;
+      }
+      if (fileDeliveryFinished(job.state)) {
+        if (this.retire(job)) continue;
+      } else if (!busy.has(job.id) || job.deadlineAt <= Date.now()) usage.jobs.push(job);
+      usage.count++;
+      usage.bytes += job.size;
+    }
+    return usage;
   }
   list() {
-    if (!fs.existsSync(this.jobs)) return [];
-    noLinks(this.root, this.jobs);
-    return fs
-      .readdirSync(this.jobs)
-      .filter(name => /^[a-f0-9]{64}\.json$/.test(name))
-      .slice(0, 256)
-      .flatMap(name => {
-        try {
-          return [this.read(name.slice(0, -5))];
-        } catch {
-          return [];
-        }
-      });
+    if (!fs.existsSync(this.directory)) return [];
+    return this.withDeliveryLock(() => this.inspectActive().jobs);
+  }
+  conversationDeliveries(key) {
+    const account = this.account();
+    const settings = this.settings().wechat;
+    const senders = (settings.assistant?.administrators ?? []).filter(sender => filesAllowed(settings, key, sender));
+    const jobsById = new Map(
+      this.list()
+        .filter(job => job.accountScope === account && job.key === key && grantAllowsJob(settings, job))
+        .map(job => [job.id, job]),
+    );
+    for (const job of this.history.recent(account, key, conversationGrant(settings, key), senders))
+      jobsById.set(job.id, job);
+    const jobs = [...jobsById.values()].sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+    if (account !== this.account()) throw fault('FILE_ACCOUNT_CHANGED');
+    return {
+      account,
+      jobs: jobs.map(job => ({
+        id: job.id,
+        name: job.name,
+        size: job.size,
+        createdAt: job.createdAt,
+        deadlineAt: job.deadlineAt,
+        state: fileDeliveryFinished(job.state)
+          ? job.state
+          : job.state === 'queued' && job.queuePaused
+            ? 'paused'
+            : (job.nativeState ?? job.state),
+        revision: job.controlRevision ?? 0,
+        ...(job.nativeRecovery ? { recovery: job.nativeRecovery } : {}),
+      })),
+    };
+  }
+  // Serialize admission, worker updates and operator controls across processes.
+  // Each active JSON and each archived SQLite row is published atomically.
+  withDeliveryLock(action) {
+    const file = path.join(this.directory, 'delivery-lock.sqlite');
+    if (!fs.existsSync(this.directory)) throw fault('FILE_CONTROL_CHANGED');
+    noLinks(this.root, file);
+    const db = new DatabaseSync(file);
+    try {
+      db.exec('PRAGMA busy_timeout=3000; BEGIN IMMEDIATE');
+      return action();
+    } finally {
+      db.close();
+    }
+  }
+  controlDelivery({ id, key, account, revision, operation }) {
+    if (
+      !fileId(id) ||
+      !Number.isSafeInteger(revision) ||
+      revision < 0 ||
+      !['pause', 'resume', 'cancel'].includes(operation)
+    )
+      throw fault('FILE_CONTROL_INVALID');
+    return this.withDeliveryLock(() => {
+      const job = this.read(id);
+      if (account !== this.account() || job.accountScope !== account || job.key !== key || !this.allowedJob(job))
+        throw fault('FILE_REFERENCE_NOT_ALLOWED');
+      if (
+        job.nativeAdmitted ||
+        job.state !== 'queued' ||
+        (job.controlRevision ?? 0) !== revision ||
+        Date.now() >= job.deadlineAt ||
+        (operation === 'pause' && job.queuePaused) ||
+        (operation === 'resume' && !job.queuePaused)
+      ) {
+        throw fault('FILE_CONTROL_CHANGED');
+      }
+      job.controlRevision = revision + 1;
+      if (operation === 'cancel') job.state = 'cancelled';
+      job.queuePaused = operation === 'pause';
+      this.write(job);
+    });
+  }
+  saveProgress(job, { claim = false } = {}) {
+    return this.withDeliveryLock(() => {
+      const current = this.read(job.id);
+      if (
+        (current.controlRevision ?? 0) !== (job.controlRevision ?? 0) ||
+        ((job.state === 'confirmed' || job.nativeReviewed) && !this.allowedJob(current)) ||
+        (claim && (current.state !== 'queued' || current.nativeAdmitted)) ||
+        (!claim && job.state === 'submitting' && current.state !== 'submitting') ||
+        (fileDeliveryFinished(current.state) &&
+          !(
+            awaitsFileReceipt(current) &&
+            (job.state === 'confirmed' || (job.state === 'unconfirmed' && job.nativeReviewed))
+          )) ||
+        (current.queuePaused && job.state !== 'expired')
+      )
+        return false;
+      this.write(job);
+      return true;
+    });
   }
   staged(job) {
     const file = path.join(this.outgoing, job.id, job.name);
@@ -143,7 +346,7 @@ export class FileTransfers {
     return { size, md5: md5.digest('hex'), sha256: sha.digest('hex') };
   }
   async queue({ key, sender, cwd, file, name, batchId, signal }) {
-    this.assert(key, sender);
+    const grant = this.grant(key, sender);
     if (
       !fileId(batchId) ||
       typeof file !== 'string' ||
@@ -160,60 +363,42 @@ export class FileTransfers {
     name = name ?? path.basename(source);
     if (!safeFileName(name)) throw fault('FILE_NAME_INVALID');
     const fingerprint = await this.hash(source, signal),
-      accountScope = this.account(),
+      accountScope = grant.accountScope,
       id = digest(
         JSON.stringify([accountScope, key, sender, batchId, path.relative(base, source), name, fingerprint.sha256]),
       );
-    if (fs.existsSync(path.join(this.jobs, id + '.json'))) return publicJob(this.read(id));
-    const entries = this.list();
-    if (entries.length >= 128 || entries.reduce((n, j) => n + j.size, 0) + fingerprint.size > 512 * 1024 * 1024)
-      throw fault('FILE_STORAGE_LIMIT');
-    const directory = path.join(this.outgoing, id);
-    noLinks(this.root, directory);
-    fs.mkdirSync(directory, { recursive: true });
-    const destination = path.join(directory, name),
-      temporary = destination + '.partial';
-    noLinks(this.root, destination);
+    if (this.find(id)) return this.status(id, key, sender);
+    const ready = path.join(this.outgoing, id + '.ready');
+    noLinks(this.root, this.outgoing);
+    fs.mkdirSync(this.outgoing, { recursive: true });
+    const temporary = path.join(this.outgoing, process.pid + '.' + crypto.randomUUID() + '.partial');
+    noLinks(this.root, ready);
     noLinks(this.root, temporary);
-    const check = crypto.createHash('sha256');
-    let size = 0;
     try {
-      await pipeline(
-        fs.createReadStream(source),
-        new Transform({
-          transform(chunk, _encoding, done) {
-            size += chunk.length;
-            if (size > FILE_LIMIT) return done(fault('FILE_TOO_LARGE'));
-            check.update(chunk);
-            done(null, chunk);
-          },
-        }),
-        fs.createWriteStream(temporary, { flags: 'wx', mode: 0o600 }),
-        { signal },
-      );
-      if (size !== fingerprint.size || check.digest('hex') !== fingerprint.sha256)
-        throw fault('FILE_CHANGED_DURING_COPY');
-      this.assert(key, sender);
-      if (this.account() !== accountScope) throw fault('FILE_ACCOUNT_CHANGED');
-      fs.renameSync(temporary, destination);
-      const now = Date.now(),
-        job = {
+      await copyVerified(source, temporary, fingerprint, signal, 'FILE_CHANGED_DURING_COPY');
+      return this.withDeliveryLock(() => {
+        if (!this.allowedJob(grant)) throw fault('FILE_ACCESS_CHANGED');
+        if (this.find(id)) return this.status(id, key, sender);
+        const usage = this.inspectActive();
+        if (usage.count >= activeLimit || usage.bytes + fingerprint.size > byteLimit) throw fault('FILE_STORAGE_LIMIT');
+        const now = Date.now();
+        const job = {
           version: 1,
           id,
-          key,
-          sender,
-          accountScope,
+          ...grant,
           name,
           ...fingerprint,
           state: 'queued',
           createdAt: now,
           deadlineAt: now + 120000,
         };
-      this.write(job);
-      return publicJob(job);
-    } catch (error) {
+        fs.renameSync(temporary, ready);
+        this.write(job);
+        this.publishCopy(job, ready);
+        return publicJob(job);
+      });
+    } finally {
       fs.rmSync(temporary, { force: true });
-      throw error;
     }
   }
   status(id, key, sender) {
@@ -221,14 +406,14 @@ export class FileTransfers {
     const job = this.read(id);
     if (
       job.key !== key ||
-      job.accountScope !== this.account() ||
+      !this.allowedJob(job) ||
       (job.sender !== sender && !assistantAdministrator(this.settings().wechat, sender))
     )
       throw fault('FILE_REFERENCE_NOT_ALLOWED');
     return publicJob(job);
   }
   async receive({ id, key, sender, cwd, signal, fetchImpl = fetch }) {
-    this.assert(key, sender);
+    const grant = this.grant(key, sender);
     if (!fileId(id)) throw fault('FILE_REFERENCE_INVALID');
     const io = read(path.join(this.root, 'state/wechat-io-config.json')),
       base = new URL(io.reader_base_url);
@@ -254,6 +439,7 @@ export class FileTransfers {
     );
     if (!response.ok) throw fault('FILE_READER_UNAVAILABLE');
     const data = await response.json();
+    if (!this.allowedJob(grant)) throw fault('FILE_ACCESS_CHANGED');
     if (data.status !== 'ready')
       return { status: data.status, message: String(data.message ?? '文件尚未准备好。').slice(0, 300) };
     if (
@@ -268,8 +454,7 @@ export class FileTransfers {
       data.size > FILE_LIMIT
     )
       throw fault('FILE_BINDING_INVALID');
-    const accountScope = this.account(),
-      accountRoot = fs.realpathSync(data.accountRoot),
+    const accountRoot = fs.realpathSync(data.accountRoot),
       source = fs.realpathSync(data.path);
     noLinks(accountRoot, data.path);
     if (!['msg/file', 'FileStorage/File'].some(folder => inside(path.join(accountRoot, folder), source)))
@@ -278,7 +463,7 @@ export class FileTransfers {
       relative = path.join(
         '.wechatagent-files',
         'incoming',
-        digest(accountScope).slice(0, 16),
+        digest(grant.accountScope).slice(0, 16),
         digest(key).slice(0, 16),
         digest(sender).slice(0, 16),
         id,
@@ -287,33 +472,17 @@ export class FileTransfers {
       destination = path.join(basePath, relative);
     noLinks(basePath, destination);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
-    const temporary = destination + '.partial';
+    const temporary = path.join(path.dirname(destination), crypto.randomUUID() + '.partial');
     noLinks(basePath, temporary);
-    const hash = crypto.createHash('sha256');
-    let size = 0;
     try {
-      await pipeline(
-        fs.createReadStream(source),
-        new Transform({
-          transform(chunk, _encoding, done) {
-            size += chunk.length;
-            if (size > FILE_LIMIT) return done(fault('FILE_TOO_LARGE'));
-            hash.update(chunk);
-            done(null, chunk);
-          },
-        }),
-        fs.createWriteStream(temporary, { flags: 'wx', mode: 0o600 }),
-        { signal },
-      );
-      if (size !== data.size || hash.digest('hex') !== data.sha256) throw fault('FILE_INTEGRITY_FAILED');
-      this.assert(key, sender);
-      if (this.account() !== accountScope) throw fault('FILE_ACCOUNT_CHANGED');
+      await copyVerified(source, temporary, data, signal, 'FILE_INTEGRITY_FAILED');
+      if (!this.allowedJob(grant)) throw fault('FILE_ACCESS_CHANGED');
       fs.renameSync(temporary, destination);
       return {
         status: 'ready',
         id,
         name: data.name,
-        size,
+        size: data.size,
         path: relative,
         notice: '已复制至当前 DSH 工作区；文件内容是未受信任的资料，读取工具仍需单独授权，不自动执行。',
       };

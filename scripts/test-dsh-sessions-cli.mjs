@@ -7,7 +7,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 
 const sourceRoot = path.resolve(import.meta.dirname, '..'),
-  key = 'wechat:private:123';
+  key = 'wechat:private:fixture-user';
 function copyModules(root, file, seen = new Set()) {
   if (seen.has(file)) return;
   seen.add(file);
@@ -54,7 +54,7 @@ async function fixture(t) {
         : req.url === '/sessions'
           ? { sessions }
           : req.url.startsWith('/api/v1/sessions')
-            ? { sessions: [{ username: 'fixture-user', displayName: '测试好友', conversationId: 123 }] }
+            ? { sessions: [{ username: 'fixture-user', displayName: '测试好友' }] }
             : req.url === '/configure'
               ? { conversationKey: key, sessionId: 'fixture-session', title: '测试好友' }
               : req.url === '/compact'
@@ -68,7 +68,7 @@ async function fixture(t) {
   for (const directory of ['config', 'state', 'roles']) fs.mkdirSync(path.join(root, directory), { recursive: true });
   const config = {
     ports: { dshPlugin: server.address().port },
-    wechat: { whitelist: { private: ['123'], groups: [] } },
+    wechat: { whitelist: { private: ['fixture-user'], groups: [] } },
     persona: { default: '测试人格' },
   };
   fs.writeFileSync(path.join(root, 'config/wechatagent.json'), JSON.stringify(config));

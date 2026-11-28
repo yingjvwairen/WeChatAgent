@@ -1,3 +1,4 @@
+import { desktopManifest, seedDesktopPayloads } from './test-fixtures/desktop-deployment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -82,7 +83,7 @@ test('default and chat-bound personas cannot be deleted through case variants or
     ).status,
     409,
   );
-  f.config.persona.chats = { 'wechat:group:123': 'UNUSED' };
+  f.config.persona.chats = { 'wechat:group:123@chatroom': 'UNUSED' };
   const configFile = path.join(f.root, 'config/wechatagent.json');
   fs.writeFileSync(configFile, JSON.stringify(f.config));
   const before = fs.readFileSync(configFile);
@@ -110,12 +111,13 @@ test('installer relaunch and upgrade remember explicit deletion while recreating
   write('vendor/wechat/Weixin.exe', 'fixture');
   write('vendor/hook/version.dll', 'fixture');
   write('vendor/hook/build.json', '{}');
-  const manifest = { version: '0.0.1', files: ['config/wechatagent.example.json', 'roles/Unused.md'] };
+  const manifest = desktopManifest({ version: '0.0.1', files: ['config/wechatagent.example.json', 'roles/Unused.md'] });
   write('project/deployment.json', JSON.stringify(manifest));
   assert.equal(
     (await f.request('/api/roles/delete', { name: 'Unused', revision: f.target.revision, confirmed: true })).status,
     200,
   );
+  seedDesktopPayloads(write);
   await deployment.bootstrapDeployment(resources, f.home);
   assert(!fs.existsSync(path.join(f.root, 'roles/Unused.md')));
   manifest.version = '0.0.2';
@@ -267,7 +269,7 @@ test('UI keeps cards and drafts on server failure, and blocks saved or draft bin
   for (const kind of ['saved-default', 'draft-chat', 'saving']) {
     const f = uiFixture();
     if (kind === 'saved-default') f.state.config.persona.default = 'unused';
-    if (kind === 'draft-chat') f.state.draft.persona.chats = { 'wechat:group:123': 'UNUSED' };
+    if (kind === 'draft-chat') f.state.draft.persona.chats = { 'wechat:group:123@chatroom': 'UNUSED' };
     if (kind === 'saving') f.roleSaves.set('Other', Promise.resolve());
     f.open();
     assert.equal(f.dialog, undefined);

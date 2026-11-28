@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseStickerTags, validateStickerFile } from '../public/console/sticker-manager.js';
+import { directoryStickerFiles, parseStickerTags, validateStickerFile } from '../public/console/sticker-manager.js';
 test('manual sticker metadata accepts Chinese tags without duplicate or oversized entries', () => {
   assert.deepEqual(parseStickerTags('开心， 打招呼,开心'), ['开心', '打招呼']);
   assert.deepEqual(parseStickerTags(''), []);
@@ -13,7 +13,17 @@ test('manual sticker picker limits local uploads before base64 allocation', () =
   for (const file of [
     { name: 'script.svg', size: 123 },
     { name: 'hi.gif', size: 0 },
-    { name: 'hi.gif', size: 8 * 1024 * 1024 + 1 },
+    { name: 'hi.gif', size: 20 * 1024 * 1024 + 1 },
   ])
     assert.throws(() => validateStickerFile(file));
+});
+test('folder import selects only supported top-level files and orders them by name', () => {
+  const entries = ['pool/z.gif', 'pool/nested/private.png', 'pool/note.txt', 'pool/a.PNG', 'unscoped.jpg'].map(
+    path => ({ name: path.split('/').at(-1), webkitRelativePath: path }),
+  );
+  assert.deepEqual(
+    directoryStickerFiles(entries).map(file => file.name),
+    ['a.PNG', 'z.gif'],
+  );
+  assert.throws(() => directoryStickerFiles({ length: 10001 }), /一万/);
 });

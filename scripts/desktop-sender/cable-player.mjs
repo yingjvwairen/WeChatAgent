@@ -73,7 +73,7 @@ export function inspectPlaybackWav(
 export class CablePlayer {
   constructor({
     renderId,
-    executable = path.resolve(import.meta.dirname, '../../state/audio-probe/AudioRouteProbe.exe'),
+    executable = path.resolve(import.meta.dirname, '../../state/ui-host/AudioRouteProbe.exe'),
     tempRoot = os.tmpdir(),
     stopTimeoutMs = 750,
     timeoutGraceMs = 3000,

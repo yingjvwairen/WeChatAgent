@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { allowedConversation, parseChatKey } from '../packages/wechat-identity.mjs';
 import { selectRoleText } from '../components/qq-bridge/src/role-card.js';
-import { conversationId } from './hook-onebot.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fail = (message, code = 1) => {
   console.error('WeChatAgent 会话管理：' + message);
@@ -80,22 +80,15 @@ async function main() {
           ...config.wechat.whitelist.groups.map(id => 'wechat:group:' + id),
         ];
     for (const key of keys) {
-      const [, kind, id] = key.split(':');
-      if (!config.wechat.whitelist[kind === 'group' ? 'groups' : 'private'].map(String).includes(id))
+      if (!allowedConversation(config.wechat, key))
         throw Object.assign(new Error(`只允许管理聊天范围中的会话，收到 ${key}。请先在“聊天”页保存允许范围。`), {
           friendly: true,
         });
-      const matches = contacts.filter(
-        c =>
-          c.username &&
-          (c.username.includes('@chatroom') ? 'group' : 'private') === kind &&
-          String(conversationId(c.username, c.displayName, c.conversationId)) === id,
-      );
+      const { id } = parseChatKey(key);
+      const matches = contacts.filter(contact => contact.username === id);
       if (matches.length !== 1)
         throw Object.assign(
-          new Error(
-            `找不到唯一的聊天映射（${key}）：请刷新群资料或在“聊天”页使用“重新关联原群”；现有 DSH 会话未被删除。`,
-          ),
+          new Error(`在当前微信账号的会话列表中找不到唯一的聊天（${key}）。请在微信里打开这个聊天并等待资料同步。`),
           { friendly: true },
         );
       const personaName = config.persona.chats?.[key] ?? config.persona.default;

@@ -28,7 +28,10 @@ async function ready(port, token) {
 }
 
 test('DSH plugin creates one safe session per group and resumes mappings', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'social-plugin-'));
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'social-plugin-'));
+  const dir = path.join(fixtureRoot, 'plugin');
+  for (const name of ['wechat-identity.mjs', 'wechat-file-reference.mjs'])
+    fs.copyFileSync(path.join(root, 'packages', name), path.join(fixtureRoot, name));
   const packageDir = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-llm');
   fs.mkdirSync(packageDir, { recursive: true });
   fs.writeFileSync(path.join(packageDir, 'package.json'), '{"type":"module","exports":"./index.js"}');
@@ -98,6 +101,7 @@ test('DSH plugin creates one safe session per group and resumes mappings', async
     'model-search.mjs',
     'dsh-access.mjs',
     'file-tools.mjs',
+    'file-storage.mjs',
     'file-transfers.mjs',
     'assistant-policy.mjs',
     'conversation-policy.mjs',
@@ -115,6 +119,7 @@ test('DSH plugin creates one safe session per group and resumes mappings', async
     'history-policy.mjs',
     'history-store.mjs',
     'history-runtime.mjs',
+    'native-quote-source.mjs',
     'usage-summary.mjs',
     'request-window.mjs',
   ])
@@ -274,8 +279,8 @@ test('DSH plugin creates one safe session per group and resumes mappings', async
       model: 'deepseek-flash',
     });
     await ready(port, 'test-plugin-token');
-    const a = await request('wechat:group:A');
-    const b = await request('wechat:group:B');
+    const a = await request('wechat:group:A@chatroom');
+    const b = await request('wechat:group:B@chatroom');
     assert.equal(a.text, 'SILENT');
     assert.notEqual(a.sessionId, b.sessionId);
     assert.equal(first.calls.create.length, 2);
@@ -293,7 +298,7 @@ test('DSH plugin creates one safe session per group and resumes mappings', async
       model: 'deepseek-flash',
     });
     await ready(port, 'test-plugin-token');
-    const restored = await request('wechat:group:A');
+    const restored = await request('wechat:group:A@chatroom');
     assert.equal(restored.sessionId, a.sessionId);
     assert.equal(second.calls.resume.length, 1);
     assert.deepEqual(second.calls.resume[0].agentOptions, first.calls.create[0].agentOptions);
@@ -302,6 +307,6 @@ test('DSH plugin creates one safe session per group and resumes mappings', async
   } finally {
     if (oldToken === undefined) delete process.env.SOCIAL_DSH_TOKEN;
     else process.env.SOCIAL_DSH_TOKEN = oldToken;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });

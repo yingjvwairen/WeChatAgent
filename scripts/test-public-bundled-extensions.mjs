@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt } from 'node:crypto';
+import os from 'node:os';
 import { createConsole } from './console-server.mjs';
 test('project plugin management is in DSH and chat authorization preserves persona and rejects stale or foreign updates', async t => {
-  const root = fs.mkdtempSync(path.resolve('state/dsh-api-fixture-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-api-fixture-'));
   for (const dir of ['config', 'roles', 'state']) fs.mkdirSync(path.join(root, dir));
   const config = JSON.parse(fs.readFileSync('config/wechatagent.example.json', 'utf8'));
-  config.wechat.whitelist = { private: [123], groups: [456] };
+  config.wechat.whitelist = { private: ['123'], groups: ['456@chatroom'] };
   fs.writeFileSync(path.join(root, 'config/wechatagent.json'), JSON.stringify(config));
   fs.writeFileSync(path.join(root, 'roles', config.persona.default + '.md'), '测试人格');
   const app = createConsole({
@@ -20,7 +21,8 @@ test('project plugin management is in DSH and chat authorization preserves perso
   });
   t.after(async () => {
     await app.close();
-    assert(root.startsWith(path.resolve('state') + path.sep));
+    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(root).startsWith('dsh-api-fixture-'));
     fs.rmSync(root, { recursive: true, force: true });
   });
   const address = await app.start(),
@@ -40,8 +42,8 @@ test('project plugin management is in DSH and chat authorization preserves perso
   assert(!catalog.extensions.some(item => item.id === 'meme-search'));
   assert(catalog.extensions.some(item => item.id === 'native-member-memory'));
   const snapshot = (await rpc('/api/config')).data,
-    body = { revision: snapshot.revision, key: 'wechat:group:456', skills: ['sample'], tools: ['lookup'] };
-  assert.equal((await rpc('/api/dsh-access', { ...body, key: 'wechat:group:999' })).status, 400);
+    body = { revision: snapshot.revision, key: 'wechat:group:456@chatroom', skills: ['sample'], tools: ['lookup'] };
+  assert.equal((await rpc('/api/dsh-access', { ...body, key: 'wechat:group:999@chatroom' })).status, 400);
   const saved = await rpc('/api/dsh-access', body);
   assert.equal(saved.status, 200);
   assert.deepEqual(saved.data.config.persona, snapshot.config.persona);

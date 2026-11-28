@@ -54,26 +54,11 @@ def resolve(descriptor):
             allow_cdn=project.get('wechat', {}).get('media', {}).get('allowStickerCdn', False) is True,
             allow_cdn_alias=project.get('wechat', {}).get('media', {}).get('allowStickerCdnAlias', False) is True,
         )
-    resource = reader.account / 'db_storage' / 'message' / 'message_resource.db'
     ids = list(media.extract_media_md5s(content))
-    if resource.is_file():
-        connection = None
-        try:
-            key, salt = reader_api.nt.derive_database_key(str(resource), '', '', reader.passphrase)
-            connection, cursor = reader_api.nt.connect_nt_db(str(resource), key, salt)
-            cursor.execute('PRAGMA query_only=ON')
-            if int(descriptor['serverId'] or 0):
-                cursor.execute(
-                    'SELECT packed_info FROM MessageResourceInfo WHERE message_svr_id=? AND message_local_id=? AND message_create_time=? LIMIT 8',
-                    (int(descriptor['serverId']), descriptor['localId'], descriptor['createTime']),
-                )
-                for (packed,) in cursor.fetchall():
-                    ids.extend(media.extract_blob_md5s(packed))
-        except Exception:
-            pass  # Exact cache identity remains available; never guess another image.
-        finally:
-            if connection is not None:
-                connection.close()
+    try:
+        ids.extend(sorted(reader.resource_names(descriptor)))
+    except Exception:
+        pass  # The XML can still identify a verified local copy.
     ids = list(dict.fromkeys(value.lower() for value in ids if re.fullmatch(r'[a-fA-F0-9]{32}', value)))
     settings = reader_api.read_json(reader.settings_file)
     keys = []

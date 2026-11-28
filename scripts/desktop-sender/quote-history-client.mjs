@@ -1,3 +1,4 @@
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -233,7 +234,7 @@ export async function locateQuoteViaHistory(driver, job, frame, signal, { run = 
     binding.threadId < 1 ||
     !Number.isInteger(binding.lastInputTick) ||
     binding.lastInputTick < 0 ||
-    driver.config.executableVersion !== '4.2.0.53' ||
+    driver.config.executableVersion !== DESKTOP_WECHAT_VERSION ||
     !digest(driver.config.executableSha256)
   )
     throw fail('QUOTE_UIA_BINDING_UNCONFIRMED');

@@ -9,8 +9,14 @@ import { voiceInterruptionEvidence, voiceRecordingCancellationEvidence } from '.
 import crypto from 'node:crypto';
 import { beginQuoteDraft, readQuoteDraft } from './quote-draft-state.mjs';
 import { DesktopSender } from '../desktop-sender.mjs';
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
+import { deliverDesktopMessage } from '../desktop-message-delivery.mjs';
+import { ReplyMediaCatalog } from '../reply-media-catalog.mjs';
+import { TextDeliveryStore } from '../text-delivery-store.mjs';
+import { WechatOneBot } from '../wechat-onebot.mjs';
 import { acquireDesktopQueue } from './delivery-lock.mjs';
 import { controlSavedChatDelivery, savedChatDeliveries } from './delivery-list.mjs';
+import { SocialEngine } from '../../components/qq-bridge/src/core/social-engine.js';
 import { ReplyDeliveryControls } from '../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 
 const hex = letter => letter.repeat(64);
@@ -81,7 +87,12 @@ function fixture(
     root,
     config,
     probeAccount: async () => account,
-    authorize: async job => ({ allowed: targets.has(job.target), grantId: hex('b'), version: 1 }),
+    authorize: async (job, { preparing } = {}) => ({
+      allowed: targets.has(job.target),
+      grantId: hex('b'),
+      version: 1,
+      ...(preparing && job.quote && state.refreshedQuote ? { quote: state.refreshedQuote } : {}),
+    }),
     authorizeCurrent: job => targets.has(job.target),
     resolveTarget: async (kind, target) => {
       assert.ok(targets.has(target));
@@ -91,13 +102,14 @@ function fixture(
     driverFactory: async factory => (
       state.factories++,
       {
-        health: async () => ({ ready: true }),
+        health: async () => ({ ready: true, voiceSend: config.input.voiceSend }),
         applySettings: async () => {
           state.explicitApplies = (state.explicitApplies ?? 0) + 1;
           assert.equal(state.draft, '');
         },
         prepareVoiceHandoff: async () => {
           state.voicePreflights = (state.voicePreflights ?? 0) + 1;
+          if (state.preflightError) throw state.preflightError;
           if (state.preflightWaits > 0) {
             state.preflightWaits--;
             return { ready: false, reason: 'QT_ACTIVITY_WARMUP' };
@@ -151,7 +163,7 @@ function fixture(
         pasteImage: async job => {
           state.pastes.push(job.image.path);
           state.fileBodyAtPaste = fs.readFileSync(job.image.path, 'utf8');
-          assert.equal(path.basename(job.image.path), 'document.txt');
+          assert.equal(path.basename(job.image.path), state.expectedFileName ?? 'document.txt');
           assert.equal(job.mode, 'file');
           return { performed: true, attempted: true };
         },
@@ -477,6 +489,10 @@ test('each voice bubble passes foreground preflight and gets its own canonical r
     assert.equal(call.job.segment.id, call.job.segment.attemptId);
     assert.equal(fs.readFileSync(call.job.segment.path).toString('ascii', 0, 4), 'RIFF');
   }
+  const context = f.engine.contexts.get(f.account.accountRef);
+  const [row] = context.metadata.values();
+  assert.equal(row.job.pcmBase64, undefined);
+  assert.equal(fs.existsSync(context.store.voiceInputFile(row.job.id)), false);
 });
 test('scoped lookup distinguishes absent jobs from other accounts, grants and durable receipts', async t => {
   const f = fixture(t),
@@ -1109,6 +1125,48 @@ test('turning off voice before recording leaves another chat runnable', async t 
   assert.equal(f.state.segments.length, 0);
 });
 
+test('a thrown read-only voice preflight waits in its chat while a second chat sends', async t => {
+  const f = fixture(t, { additionalTargets: ['wxid_other'] });
+  f.state.preflightError = Object.assign(Error('UI_QT_FOCUS_PREFLIGHT_INVALID'), {
+    code: 'UI_QT_FOCUS_PREFLIGHT_INVALID',
+    attempted: false,
+  });
+  await f.engine.admit('voice', { ...f.payload, pcmBase64: Buffer.alloc(32000).toString('base64') });
+  const other = await finalDelivery(
+    f.engine,
+    f.engine.sendText({ ...f.payload, target: 'wxid_other', deliveryId: 'other' }),
+  );
+  assert.equal(other.confirmed, true);
+  assert.equal((await f.engine.query(f.payload.deliveryId)).reason, 'UI_QT_FOCUS_PREFLIGHT_INVALID');
+  assert.equal(f.state.segments.length, 0);
+  assert.equal(f.engine.pumpFailure, undefined);
+});
+
+test('an unverified focus return during voice preflight still blocks further desktop work', async t => {
+  const f = fixture(t, { additionalTargets: ['wxid_other'] });
+  f.state.preflightError = Object.assign(Error('UI_QT_LAYOUT_FOCUS_RETURN_UNVERIFIED'), {
+    code: 'UI_QT_LAYOUT_FOCUS_RETURN_UNVERIFIED',
+    attempted: false,
+  });
+  await f.engine.admit('voice', { ...f.payload, pcmBase64: Buffer.alloc(32000).toString('base64') });
+  const other = await f.engine.sendText({ ...f.payload, target: 'wxid_other', deliveryId: 'other' });
+  assert.equal(other.reason, 'UI_QT_LAYOUT_FOCUS_RETURN_UNVERIFIED');
+  assert.deepEqual(f.state.pastes, []);
+});
+
+test('global pause admits voice without preflight and resumes that logical job', async t => {
+  const f = fixture(t);
+  f.config.input.paused = true;
+  assert.equal((await f.engine.health()).voiceSend, true);
+  const voice = f.engine.sendVoice({ ...f.payload, pcmBase64: Buffer.alloc(32000).toString('base64') });
+  assert.equal((await voice).state, 'queued');
+  assert.equal(f.state.voicePreflights ?? 0, 0);
+  f.config.input.paused = false;
+  const result = await finalDelivery(f.engine, f.engine.query(f.payload.deliveryId));
+  assert.equal(result.confirmed, true);
+  assert.equal(f.state.segments.length, 1);
+});
+
 test('a paused untouched chat preserves its FIFO while another chat sends, including after restart', async t => {
   const f = fixture(t, { additionalTargets: ['wxid_other'] });
   f.config.input.paused = true;
@@ -1243,6 +1301,23 @@ test('renaming a peer or removing the original staged file cannot break an idemp
   );
   assert.equal(f.state.submits.length, 1);
 });
+
+test('ordinary files keep their full Unicode filename through admission and staging', async t => {
+  const f = fixture(t);
+  const file = path.join(f.root, 'source.staged');
+  fs.writeFileSync(file, 'fixture');
+  for (const count of [110, 125]) {
+    const fileName = '\u{1F4C1}'.repeat(count) + '.pdf';
+    f.state.expectedFileName = fileName;
+    const payload = { ...f.payload, deliveryId: 'unicode-file-' + count, path: file, fileName };
+    const result = await finalDelivery(f.engine, f.engine.sendFile(payload));
+    assert.equal(result.confirmed, true, result.reason);
+    assert.equal(path.basename(f.state.pastes.at(-1)), fileName);
+    assert.equal(f.state.fileBodyAtPaste, 'fixture');
+  }
+  assert.equal(f.state.submits.length, 2);
+});
+
 test('a late receipt confirms the original text after restart without another input', async t => {
   const f = fixture(t);
   f.state.missingReceipt = true;
@@ -1265,6 +1340,32 @@ test('unstarted queued text follows the current UIA paste policy', async t => {
   f.config.input.paused = false;
   await finalDelivery(f.engine, f.engine.query(f.payload.deliveryId));
   assert.deepEqual(f.state.pastes, ['hello']);
+});
+
+test('DSH disconnect withdraws a desktop admission that has not started typing', async t => {
+  const f = fixture(t);
+  f.state.observedIdle = 0;
+  const scope = { accountRef: f.account.accountRef, kind: 'private', target: f.payload.target, rosterGrant: 'g' };
+  const key = 'wechat:private:' + f.payload.target,
+    id = '9'.repeat(64);
+  const result = await f.engine.sendText({ ...f.payload, rosterGrant: 'g', parentId: id });
+  assert.equal(result.inputStarted, false);
+  const item = { message: { readerGrant: 'g' }, parts: [{ state: 'submitted', deliveryId: id, text: f.payload.text }] };
+  SocialEngine.prototype.suspendConnection.call({
+    timers: new Map(),
+    dirty: new Set(),
+    pendingDirect: new Set(),
+    decisions: new Map(),
+    buffer: { pendingReplies: new Map([[key, item]]), rememberReply() {} },
+    replay() {},
+    inspectReceipt() {},
+    deliveryControls: new ReplyDeliveryControls(f.root, scope.accountRef),
+  });
+  f.state.observedIdle = 99999;
+  f.engine.kick();
+  await until(() => f.engine.listDeliveries(scope)[0]?.state === 'cancelled');
+  assert.deepEqual(f.state.pastes, []);
+  assert.deepEqual(f.state.submits, []);
 });
 
 test('global pause still confirms submitted text and stopped queue uses the same scoped preview', async t => {
@@ -1322,16 +1423,235 @@ test('operators can pause, resume and cancel the unsent tail of a voice between 
   assert.equal(f.state.segments.length, 1);
 });
 
-test('pre-admission target errors leave no native job to poll', async t => {
+test('a pre-admission target error is definitive and leaves no native job to poll', async t => {
   const f = fixture(t);
+  let resolutions = 0;
   f.engine.resolveTarget = async () => {
+    resolutions++;
     throw Error('DESKTOP_TARGET_AMBIGUOUS');
   };
-  await assert.rejects(
-    f.engine.sendText(f.payload),
-    error => error.message === 'DESKTOP_TARGET_AMBIGUOUS' && error.attempted === false,
-  );
+  const adapter = {
+    targetsSending: new Set(),
+    delivery: {},
+    status: {},
+    reload() {},
+    allowed: () => true,
+    project: { wechat: {} },
+    accountRef: f.account.accountRef,
+    textDeliveries: new TextDeliveryStore(path.join(f.root, 'state/text-deliveries')),
+    checkNative: async () => ({ account: f.account.account }),
+    dispatchDesktop: (op, payload) => f.engine.request(op, payload),
+    desktopSender: f.engine,
+  };
+  for (const receiptOnly of [false, true]) {
+    await assert.rejects(
+      deliverDesktopMessage(adapter, { ...f.payload, receiptOnly }, async () => ({
+        operation: 'text',
+        body: { text: f.payload.text },
+      })),
+      e =>
+        e.message === 'NATIVE_SEND_REJECTED' &&
+        e.data?.attempted === false &&
+        e.data.reason === 'DESKTOP_TARGET_AMBIGUOUS',
+    );
+  }
+  assert.equal(resolutions, 1);
   assert.equal(await f.engine.lookup({ ...f.payload, accountRef: f.account.accountRef }), null);
+});
+
+test('a held OneBot image leaves another chat free to queue and confirm a reply', async t => {
+  const other = 'wxid_other';
+  const f = fixture(t, { additionalTargets: [other] });
+  const held = { accountRef: f.account.accountRef, kind: 'private', target: f.payload.target, rosterGrant: 'legacy' };
+  f.config.input.operationTimeoutMs = 30000;
+  f.config.wechat = { whitelist: { private: [held.target, other], groups: [] } };
+  for (const [relative, value] of [
+    ['config/wechatagent.json', f.config],
+    ['state/weflow/active-account.json', { id: held.accountRef }],
+    ['state/wechat-io-config.json', {}],
+  ]) {
+    const file = path.join(f.root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(value));
+  }
+  new ReplyDeliveryControls(f.root, held.accountRef).control({
+    key: 'wechat:private:' + held.target,
+    grant: held.rosterGrant,
+    operation: 'pause',
+    revision: 0,
+  });
+  const media = path.join(f.root, 'media');
+  fs.mkdirSync(media);
+  fs.writeFileSync(
+    path.join(media, 'picture.png'),
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'base64',
+    ),
+  );
+  const catalog = new ReplyMediaCatalog({ root: f.root });
+  catalog.importDirectory({ directory: media, expectedRevision: catalog.snapshot().revision });
+  const desktopSender = new DesktopSender(f.root);
+  desktopSender.loading = Promise.resolve(f.engine);
+  const adapter = new WechatOneBot({ directory: f.root, desktopSender });
+  adapter.account = f.account.account;
+  adapter.accountRef = held.accountRef;
+  adapter.ownWxid = f.account.accountWxid;
+  adapter.checkNative = async () => ({ account: adapter.account });
+  Object.assign(adapter.status, { version: DESKTOP_WECHAT_VERSION, native_sticker_send: true });
+  const imageRequest = {
+    action: 'send_private_msg',
+    params: {
+      user_id: held.target,
+      message: [{ type: 'wechat_sticker', data: { id: catalog.list()[0].id } }],
+      wechatagent_delivery_id: hex('a'),
+    },
+  };
+  let imageAdmission;
+  const image = adapter.action(imageRequest).then(result => {
+    imageAdmission = result;
+  });
+  await until(() => f.engine.listDeliveries(held).length === 1);
+  const message = [{ type: 'text', data: { text: 'other chat' } }];
+  const text = await adapter.action({
+    action: 'send_private_msg',
+    params: { user_id: other, message, wechatagent_delivery_id: hex('b') },
+  });
+  assert.equal(text.status, 'ok', text.message);
+  assert.equal(text.data.pending, true);
+  assert.equal(imageAdmission?.data.pending, true, 'image admission completed while its chat was held');
+  await image;
+  assert.equal((await adapter.action(imageRequest)).data.pending, true);
+  assert.equal(f.engine.listDeliveries(held).length, 1);
+  assert.equal(f.engine.listDeliveries(held)[0].state, 'paused');
+
+  const query = {
+    action: 'get_text_delivery',
+    params: { kind: 'private', target: other, message, wechatagent_delivery_id: hex('b') },
+  };
+  await until(async () => (await adapter.action(query)).data.receipt === 'wechat-server-id');
+  assert.equal((await adapter.action(query)).data.reused, true);
+  assert.deepEqual(f.state.pastes, ['other chat']);
+  assert.equal(f.state.submits.length, 1);
+});
+
+test('OneBot persists a reply during global pause and resumes the same native job', async t => {
+  const f = fixture(t);
+  Object.assign(f.config, { wechat: { whitelist: { private: [f.payload.target], groups: [] } } });
+  f.config.input.paused = true;
+  const configFile = path.join(f.root, 'config/wechatagent.json');
+  fs.mkdirSync(path.dirname(configFile));
+  fs.writeFileSync(configFile, JSON.stringify(f.config));
+  const adapter = Object.assign(Object.create(WechatOneBot.prototype), {
+    directory: f.root,
+    targetsSending: new Set(),
+    activeActions: 0,
+    delivery: {},
+    status: { paused: true },
+    reload() {},
+    project: f.config,
+    ownWxid: f.account.accountWxid,
+    account: f.account.account,
+    accountRef: f.account.accountRef,
+    textDeliveries: new TextDeliveryStore(path.join(f.root, 'state/text-deliveries')),
+    checkNative: async () => ({ account: f.account.account }),
+    desktopSender: f.engine,
+  });
+  f.engine.authorizeCurrent = (job, forInput) => adapter.authorizeDesktopCurrent(job, forInput);
+  f.engine.authorize = (job, options) => adapter.authorizeDesktop(job, options);
+  const message = [{ type: 'text', data: { text: f.payload.text } }];
+  const { data: sent } = await adapter.action({
+    action: 'send_private_msg',
+    params: { user_id: f.payload.target, message },
+  });
+  assert.equal(sent.pending, true);
+  const deliveryId = sent.delivery_id;
+  assert.match(deliveryId, /^[a-f0-9]{64}$/u);
+  const attempt = adapter.textDeliveries.get(adapter.textDeliveries.key('private', f.payload.target, deliveryId, ''));
+  assert.equal(attempt.state, 'accepted');
+  assert.deepEqual(f.state.pastes, []);
+  f.config.input.paused = false;
+  fs.writeFileSync(configFile, JSON.stringify(f.config));
+  f.engine.applyConfiguration();
+  for (let i = 0; i < 100 && !f.state.submits.length; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  const receipt = await adapter.action({
+    action: 'get_text_delivery',
+    params: { kind: 'private', target: f.payload.target, message, wechatagent_delivery_id: deliveryId },
+  });
+  assert.equal(receipt.data.receipt, 'wechat-server-id');
+  assert.equal(f.state.submits.length, 1);
+});
+
+test('plain text quotes are rechecked before taking over the editor', async () => {
+  const quote = { id: hex('a'), sender: 'fixture-peer', serverId: '512', timestamp: 1700000000, text: 'same text' };
+  const job = { target: 'fixture-peer', quote };
+  const adapter = Object.assign(Object.create(WechatOneBot.prototype), {
+    authorizeDesktopCurrent: () => true,
+    quoteSource: async (target, id) => {
+      assert.equal(target, job.target);
+      assert.equal(id, quote.id);
+      return { ...quote };
+    },
+  });
+  assert.equal((await adapter.authorizeDesktop(job, { preparing: true })).allowed, true);
+  adapter.quoteSource = async () => {
+    throw Error('QUOTE_SOURCE_AMBIGUOUS');
+  };
+  await assert.rejects(adapter.authorizeDesktop(job, { preparing: true }), {
+    message: 'INPUT_QUOTE_SOURCE_UNVERIFIED',
+  });
+});
+
+test('rich quotes keep the original server identity and use refreshed UI neighbors', async t => {
+  const f = fixture(t);
+  const serverId = '512';
+  const quote = {
+    id: crypto
+      .createHash('sha256')
+      .update(f.payload.target + '\0' + serverId)
+      .digest('hex'),
+    sender: 'fixture-peer',
+    serverId,
+    timestamp: 1700000000,
+    text: '[图片]',
+    kind: 'image',
+    locator: { index: 0, rows: [{ kind: 'image' }] },
+  };
+  const fresh = { ...quote, locator: { index: 1, rows: [{ kind: 'text', text: 'anchor' }, { kind: 'image' }] } };
+  const adapter = Object.assign(Object.create(WechatOneBot.prototype), {
+    authorizeDesktopCurrent: () => true,
+    quoteSource: async () => fresh,
+  });
+  const job = { target: f.payload.target, quote };
+  f.state.refreshedQuote = (await adapter.authorizeDesktop(job, { preparing: true })).quote;
+  assert.equal((await finalDelivery(f.engine, f.engine.sendText({ ...f.payload, quote }))).confirmed, true);
+  assert.deepEqual(f.state.prepared.quote, fresh);
+  assert.deepEqual(f.state.callbacks.find(item => item.options.phase === 'prepare').job.quote, quote);
+  adapter.quoteSource = async () => ({ ...fresh, serverId: '513' });
+  await assert.rejects(adapter.authorizeDesktop(job, { preparing: true }), /INPUT_QUOTE_SOURCE_UNVERIFIED/);
+  adapter.quoteSource = async () => null;
+  await assert.rejects(adapter.authorizeDesktop(job, { preparing: true }), /INPUT_QUOTE_SOURCE_UNVERIFIED/);
+});
+
+test('the quote source request allows the Reader cold-lookup budget', async () => {
+  const adapter = Object.assign(Object.create(WechatOneBot.prototype), {
+    api: { reader_base_url: 'http://127.0.0.1:1', reader_token: 'fixture' },
+    fetch: async (_url, { signal }) => {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 4200);
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      });
+      return Response.json({ quote: { serverId: '512' } });
+    },
+  });
+  assert.deepEqual(await adapter.quoteSource('fixture-peer', hex('a')), { serverId: '512' });
 });
 
 test('stopped desktop queue can pause, resume and cancel an untouched delivery under the engine lease', async t => {

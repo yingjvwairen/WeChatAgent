@@ -11,6 +11,7 @@ import { ReplyMediaCatalog } from '../reply-media-catalog.mjs';
 import { DeliveryStore } from './delivery-store.mjs';
 import { ownsDesktop, selectDelivery } from './scheduler.mjs';
 import { ReplyDeliveryControls } from '../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
+import { FILE_LIMIT, safeFileName } from '../../packages/wechat-file-reference.mjs';
 import { normalizeDesktopText, validDesktopText, canTypeDesktopText } from './text-contract.mjs';
 import { listChatDeliveries, saveDeliveryControl } from './delivery-list.mjs';
 
@@ -353,7 +354,7 @@ export class DesktopSenderEngine {
         payload.mediaName = media.name;
       }
       const stat = fs.statSync(payload.path);
-      if (!stat.isFile() || stat.size > 50 * 1024 * 1024) throw fault('DESKTOP_MEDIA_INVALID');
+      if (!stat.isFile() || stat.size > FILE_LIMIT) throw fault('DESKTOP_MEDIA_INVALID');
       const bytes = fs.readFileSync(payload.path);
       const md5 = crypto.createHash('md5').update(bytes).digest('hex');
       if (
@@ -368,14 +369,7 @@ export class DesktopSenderEngine {
         throw fault('DESKTOP_MEDIA_CHANGED');
       if (operation === 'file') {
         payload.fileName ??= path.basename(payload.path);
-        if (
-          typeof payload.fileName !== 'string' ||
-          payload.fileName !== path.basename(payload.fileName) ||
-          !payload.fileName ||
-          payload.fileName.length > 240 ||
-          /[\x00-\x1f<>:"|?*]/.test(payload.fileName)
-        )
-          throw fault('DESKTOP_FILE_NAME_INVALID');
+        if (!safeFileName(payload.fileName)) throw fault('DESKTOP_FILE_NAME_INVALID');
       }
     }
     const { pcmBase64, ...jobPayload } = payload;

@@ -36,6 +36,23 @@ def chat_key(username):
     return f'wechat:{kind}:{username}'
 
 
+def conversation_grant(wechat, key):
+    chat = parse_chat_key(key)
+    if not chat:
+        return None
+    kind, talker = chat
+    if talker not in wechat.get('whitelist', {}).get('groups' if kind == 'group' else 'private', []):
+        return None
+    return wechat.get('rosterGrants', {}).get(key, 'legacy')
+
+
+def plugin_chat_allowed(saved, account, key, grant):
+    if not grant or not isinstance(account, str) or not re.fullmatch('[a-f0-9]{64}', account):
+        return False
+    scope = saved.get('chatScopes', {}).get(account, {})
+    return scope is None or isinstance(scope, dict) and scope.get(key) == grant
+
+
 def reader_account_scope(account, root=None):
     # A configured Reader and bridge share the identity written at account selection.
     # Check the physical directory before using it, including across junctions.

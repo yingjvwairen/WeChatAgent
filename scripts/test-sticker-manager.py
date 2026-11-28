@@ -1,5 +1,6 @@
 """Synthetic manual imports: never contacts WeChat, DSH or the network."""
 
+from http.server import ThreadingHTTPServer
 import base64, concurrent.futures, hashlib, io, json, pathlib, tempfile, threading, unittest, urllib.request, urllib.error
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,7 +31,7 @@ class ManagerTests(unittest.TestCase):
         (self.root / 'config').mkdir()
         self.config = {
             'wechat': {
-                'whitelist': {'private': ['789'], 'groups': ['123', '456']},
+                'whitelist': {'private': ['789'], 'groups': ['123@chatroom', '456@chatroom']},
                 'stickers': {'collectEnabled': False, 'shareEnabled': False},
             }
         }
@@ -63,11 +64,11 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(item['manual'])
         self.assertTrue(item['animated'])
         self.assertEqual(result['count'], 1)
-        a = self.pool.candidates('wechat:group:123')[0]
+        a = self.pool.candidates('wechat:group:123@chatroom')[0]
         b = self.pool.candidates('wechat:private:789')[0]
         self.assertNotEqual(a['id'], b['id'])
-        self.assertEqual(self.pool.candidates('wechat:group:999'), [])
-        file = pathlib.Path(self.pool.resource(a['id'], 'wechat:group:123')['path'])
+        self.assertEqual(self.pool.candidates('wechat:group:999@chatroom'), [])
+        file = pathlib.Path(self.pool.resource(a['id'], 'wechat:group:123@chatroom')['path'])
         self.assertEqual(file.read_bytes(), raw)
         self.assertEqual(
             self.manager.image(item['id'], result['scope'], True)['base64'], base64.b64encode(raw).decode()
@@ -76,6 +77,29 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(preview['mime'], 'image/png')
         with Image.open(io.BytesIO(base64.b64decode(preview['base64']))) as img:
             self.assertLessEqual(max(img.size), 160)
+
+    def test_large_original_gif_and_two_hundred_frames_use_the_same_material_policy(self):
+        frames = [Image.new('RGB', (10, 10), (n, 30, 80)) for n in range(200)]
+        output = io.BytesIO()
+        frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=20, loop=0)
+        raw = output.getvalue()
+        result = self.manager.import_image(self.body(raw))
+        self.assertTrue(result['items'][0]['animated'])
+        large = picture() + b'\0' * (9 * 1024 * 1024)
+        imported = self.manager.import_image(self.body(large))
+        self.assertEqual(imported['count'], 2)
+        with self.pool.lock:
+            item = self.pool.read()['entries'][hashlib.sha256(large).hexdigest()]
+            self.assertEqual(self.pool.verified_bytes(hashlib.sha256(large).hexdigest(), item), large)
+        frames.append(Image.new('RGB', (10, 10), 'white'))
+        bad = io.BytesIO()
+        frames[0].save(bad, format='GIF', save_all=True, append_images=frames[1:], duration=20)
+        self.assert_code('STICKER_MANAGER_INVALID_IMAGE', lambda: self.manager.import_image(self.body(bad.getvalue())))
+        # A real GIF can have small update rectangles on a large logical canvas.
+        # Reject its aggregate canvas decode budget before expanding all frames.
+        bad = bytearray(raw)
+        bad[6:10] = (1000).to_bytes(2, 'little') * 2
+        self.assert_code('STICKER_MANAGER_INVALID_IMAGE', lambda: self.manager.import_image(self.body(bytes(bad))))
 
     def test_static_conversion_dedup_and_edit_are_persistent(self):
         png = picture('PNG')
@@ -88,6 +112,33 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(restarted.listing()['items'][0]['tags'], ['赞同'])
         with Image.open(self.pool.folder / (digest + '.gif')) as img:
             self.assertEqual(img.format, 'GIF')
+
+    def test_opted_in_static_assets_preserve_bytes_and_bind_the_model_reference_to_one_chat(self):
+        for format in ['PNG', 'JPEG']:
+            with self.subTest(format=format):
+                raw = picture(format)
+                result = self.manager.import_image(self.body(raw, preserveStatic=True))
+                item = result['items'][0]
+                self.assertEqual(item['format'], format.lower())
+                key = 'wechat:private:789'
+                self.assertEqual(self.pool.candidates(key), [])
+                candidate = self.pool.candidates(key, include_images=True)[0]
+                self.assertEqual(candidate['format'], format.lower())
+                self.assertNotIn('path', candidate)
+                self.assertIsNone(self.pool.resource(candidate['id'], 'wechat:group:123@chatroom'))
+                resource = self.pool.resource(candidate['id'], key)
+                path = pathlib.Path(resource['path'])
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(
+                    self.manager.image(item['id'], result['scope'], True)['mime'], 'image/' + format.lower()
+                )
+                path.write_bytes(raw + b'changed')
+                with self.assertRaises(RuntimeError):
+                    self.pool.resource(candidate['id'], key)
+                self.manager.change(
+                    {'id': item['id'], 'scope': result['scope'], 'revision': result['revision']}, remove=True
+                )
+                self.assertFalse(path.exists())
 
     def test_stale_revision_and_other_account_cannot_mutate_or_preview(self):
         stale = self.body()
@@ -115,18 +166,18 @@ class ManagerTests(unittest.TestCase):
         raw = picture()
         result = self.manager.import_image(self.body(raw))
         digest = result['items'][0]['id']
-        candidate = self.pool.candidates('wechat:group:123')[0]
+        candidate = self.pool.candidates('wechat:group:123@chatroom')[0]
         state = self.pool.read()
         state['review'] = {'ticket': 'a' * 64, 'revision': self.pool.revision(state), 'startedAt': 1, 'candidates': []}
         self.pool.write(state)
         self.manager.change(self.body(id=digest), True)
         self.assertIsNone(self.pool.read()['review'])
-        self.assertIsNone(self.pool.resource(candidate['id'], 'wechat:group:123'))
+        self.assertIsNone(self.pool.resource(candidate['id'], 'wechat:group:123@chatroom'))
         self.assertFalse((self.pool.folder / (digest + '.gif')).exists())
         self.config['wechat']['stickers']['collectEnabled'] = True
         (self.root / 'config/wechatagent.json').write_text(json.dumps(self.config))
         md5 = hashlib.md5(raw).hexdigest()
-        self.assertFalse(self.pool.store(raw, {'md5': md5}, md5, 'wechat:group:123', 1, 'b' * 64))
+        self.assertFalse(self.pool.store(raw, {'md5': md5}, md5, 'wechat:group:123@chatroom', 1, 'b' * 64))
         self.assertEqual(self.manager.import_image(self.body(raw))['count'], 1)
         self.assertNotIn(digest, self.pool.read()['removed'])
 
@@ -189,9 +240,9 @@ class ManagerTests(unittest.TestCase):
         reader.sticker_labels = StickerLabels(self.root / 'labels.json')
         reader.image_index = {}
         reader.pump_sticker_collection = lambda: None
-        choices = reader.sticker_candidates('wechat:group:123', '开心')
+        choices = reader.sticker_candidates('wechat:group:123@chatroom', '开心')
         self.assertEqual(choices[0]['tags'], ['开心', '打招呼'])
-        native = reader.resolve_sticker(choices[0]['id'], 'wechat:group:123')
+        native = reader.resolve_sticker(choices[0]['id'], 'wechat:group:123@chatroom')
         self.assertEqual(pathlib.Path(native['path']).parent, self.root / 'state/stickers/outgoing')
 
     def test_real_reader_http_manager_requires_token_and_checks_account_scope(self):
@@ -206,19 +257,15 @@ class ManagerTests(unittest.TestCase):
         servers = []
 
         def factory(port, handler):
-            server = api.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
             servers.append(server)
             ready.set()
             return server
 
         reader = SimpleNamespace(
-            sticker_collection=self.pool,
-            poll=lambda: None,
-            stop=threading.Event(),
-            sticker_executor=SimpleNamespace(shutdown=lambda **_: None),
-            sticker_review_executor=SimpleNamespace(shutdown=lambda **_: None),
+            sticker_manager=self.manager, stop=threading.Event(), poll=lambda: None, close=lambda: None
         )
-        with patch.object(api, 'create_reader_server', factory):
+        with patch.object(api, 'create_reader_server', factory), patch.object(threading, 'excepthook') as uncaught:
             thread = threading.Thread(target=api.serve, args=(reader, 0, 'fixture-token'), daemon=True)
             thread.start()
             self.assertTrue(ready.wait(5))
@@ -242,6 +289,9 @@ class ManagerTests(unittest.TestCase):
                 data = request('')[1]
                 item = data['items'][0]
                 self.assertEqual(request('/image?id=' + item['id'] + '&scope=' + data['scope'])[1]['mime'], 'image/png')
+                duplicate = self.body(name='renamed.gif', description='new', tags=[], skipExisting=True)
+                self.assertEqual(request('/import', duplicate), (200, data))
+                self.assertEqual(request('/import', {**duplicate, 'scope': 'other'})[0], 409)
                 body = self.body(id=item['id'])
                 body['scope'] = 'wrong'
                 self.assertEqual(request('/delete', body)[0], 409)
@@ -251,6 +301,9 @@ class ManagerTests(unittest.TestCase):
             finally:
                 servers[0].shutdown()
                 thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(reader.stop.is_set())
+                uncaught.assert_not_called()
 
 
 if __name__ == '__main__':

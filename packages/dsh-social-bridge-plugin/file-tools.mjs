@@ -66,21 +66,22 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
           });
         } else if (name === 'wechat_file_status') result = transfers.status(args.id, key, turn.sender);
         else {
-          const port = transfers.settings().ports.adapter,
-            response = await fetchImpl('http://127.0.0.1:' + port + '/status', {
-              signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
-              redirect: 'error',
-            }),
-            status = await response.json();
+          const port = transfers.settings().ports.adapter;
+          const response = await fetchImpl('http://127.0.0.1:' + port + '/status', {
+            signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+            redirect: 'error',
+          });
+          const status = await response.json();
           if (
             !response.ok ||
             status.project !== 'WeChatAgent' ||
             status.component !== 'adapter' ||
-            status.native_file_send !== true ||
-            status.fileTransfer !== 'durable-outbox-v1' ||
-            status.ready !== true
-          )
+            status.ready !== true ||
+            status.file_send !== true ||
+            status.fileTransfer !== 'durable-outbox-v1'
+          ) {
             throw Error('FILE_NATIVE_SENDER_NOT_READY');
+          }
           result = await transfers.queue({
             key,
             sender: turn.sender,
@@ -108,9 +109,9 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
             code,
             message:
               code === 'FILE_NATIVE_SENDER_NOT_READY'
-                ? '文件发送组件未加载，请更新匹配客户端的 Hook 并重启微信及服务。'
+                ? '桌面文件发送组件尚未就绪，请在控制台检查微信连接和发送服务。'
                 : code === 'FILE_STORAGE_LIMIT'
-                  ? '文件缓存已达上限，请在本机检查并整理 state/files 后重试。'
+                  ? '发送队列已满，请等待现有文件任务结束，或在控制台取消排队任务后重试。'
                   : '本次文件操作未完成；文字与后续任务可以继续，不能声称文件已读或已送达。',
           }),
           isError: true,

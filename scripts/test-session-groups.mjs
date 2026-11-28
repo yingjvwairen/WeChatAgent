@@ -134,13 +134,13 @@ test('session grouping UI filters without merging chats and escapes workspace na
       assignments: {},
     },
     [{ conversationKey: 'wechat:private:1', sessionId: 's', groupId: 'g' }],
-    new Set(['wechat:private:1', 'wechat:group:2']),
+    new Set(['wechat:private:1', 'wechat:group:2@chatroom']),
   );
   const button = value => ({ dataset: { sessionGroupFilter: value } });
   ui.click(button('g'));
   assert.equal(renders, 1);
   assert(ui.visible('wechat:private:1'));
-  assert(!ui.visible('wechat:group:2'));
+  assert(!ui.visible('wechat:group:2@chatroom'));
   const html = ui.toolbar();
   assert(!html.includes('<script>'));
   assert(html.includes('&lt;script&gt;'));
@@ -148,7 +148,7 @@ test('session grouping UI filters without merging chats and escapes workspace na
   assert.match(html, /aria-pressed="true"/);
   assert.match(ui.control('wechat:private:1'), /移动到分组/);
   ui.click(button('unassigned'));
-  assert(ui.visible('wechat:group:2'));
+  assert(ui.visible('wechat:group:2@chatroom'));
   assert(!ui.visible('wechat:private:1'));
   ui.prepare({ available: false, groups: [] }, [], new Set());
   assert.match(ui.toolbar(), /原有会话仍可继续使用/);

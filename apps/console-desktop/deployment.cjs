@@ -4,18 +4,43 @@ const fs = process.versions.electron ? require('original-fs') : require('node:fs
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-async function seedBuiltinPlugins(template, workspace, manifest, previous) {
+function packageFingerprint(directory) {
+  const files = [];
+  let entries = 0;
+  function visit(folder, prefix) {
+    if (!fs.lstatSync(folder, { throwIfNoEntry: false })?.isDirectory()) return false;
+    for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
+      if (++entries > 512) return false;
+      const file = path.join(folder, entry.name),
+        name = prefix + entry.name;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        if (!visit(file, name + '/')) return false;
+      } else if (entry.isFile()) {
+        if (files.length >= 256 || fs.statSync(file).size > 8 * 1024 * 1024) return false;
+        files.push([name, crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')]);
+      } else return false;
+    }
+    return true;
+  }
+  return visit(directory, '') ? fingerprintFiles(files) : null;
+}
+
+function fingerprintFiles(files) {
+  files.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return crypto.createHash('sha256').update(JSON.stringify(files)).digest('hex');
+}
+
+async function seedBuiltinPlugins(template, workspace, manifest, previousHashes) {
   const ids = manifest.builtinPlugins ?? [];
   const validId = id => typeof id === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(id);
   if (!Array.isArray(ids) || ids.length > 32 || ids.some(id => !validId(id)) || new Set(ids).size !== ids.length) {
     throw new Error('发行包内置插件清单无效。');
   }
-  if (!ids.length) return [];
+  if (!ids.length) return {};
   const plugins = path.join(workspace, 'plugins');
   fs.mkdirSync(plugins, { recursive: true });
   if (!fs.lstatSync(plugins).isDirectory() || fs.lstatSync(plugins).isSymbolicLink()) throw new Error('插件目录无效。');
-  const retained = Array.isArray(previous.builtinPlugins) ? previous.builtinPlugins : [];
-  const installed = [];
+  const installed = {};
   for (const id of ids) {
     const target = path.join(plugins, id);
     const prefix = 'optional-extensions/' + id + '/';
@@ -23,22 +48,14 @@ async function seedBuiltinPlugins(template, workspace, manifest, previous) {
     if (!files.includes(prefix + 'plugin.json') || !files.includes(prefix + 'index.mjs'))
       throw new Error('发行包内置插件文件不完整。');
     const existing = fs.lstatSync(target, { throwIfNoEntry: false });
+    const nextHash = fingerprintFiles(files.map(file => [file.slice(prefix.length), manifest.sourceHashes?.[file]]));
     if (existing) {
-      // Exact packaged copies can also be recognized after an interrupted bootstrap.
-      const matchesPackage = () =>
-        files.every(file => {
-          const installedFile = path.join(target, file.slice(prefix.length));
-          const info = fs.lstatSync(installedFile, { throwIfNoEntry: false });
-          return (
-            info?.isFile() &&
-            !info.isSymbolicLink() &&
-            crypto.createHash('sha256').update(fs.readFileSync(installedFile)).digest('hex') ===
-              manifest.sourceHashes?.[file]
-          );
-        });
-      if (existing.isDirectory() && !existing.isSymbolicLink() && (retained.includes(id) || matchesPackage()))
-        installed.push(id);
-      continue;
+      const current = packageFingerprint(target);
+      if (current === nextHash) {
+        installed[id] = nextHash;
+        continue;
+      }
+      if (!current || current !== previousHashes[id]) continue; // Locally installed or modified package.
     }
     // Stage on the same volume and publish the complete package in one rename.
     const scratch = path.join(workspace, 'state');
@@ -58,8 +75,19 @@ async function seedBuiltinPlugins(template, workspace, manifest, previous) {
       }
       const item = JSON.parse(fs.readFileSync(path.join(temporary, 'plugin.json'), 'utf8').replace(/^\uFEFF/, ''));
       if (item.id !== id || item.host !== 'wechatagent' || item.apiVersion !== 2) throw new Error('内置插件身份无效。');
-      fs.renameSync(temporary, target);
-      installed.push(id);
+      const archive = existing ? path.join(scratch, 'plugin-archives', id + '-' + crypto.randomUUID()) : null;
+      if (archive) {
+        fs.mkdirSync(path.dirname(archive), { recursive: true });
+        if (!fs.lstatSync(path.dirname(archive)).isDirectory()) throw Error('插件归档目录无效。');
+        fs.renameSync(target, archive);
+      }
+      try {
+        fs.renameSync(temporary, target);
+      } catch (error) {
+        if (archive) fs.renameSync(archive, target);
+        throw error;
+      }
+      installed[id] = nextHash;
     } finally {
       if (fs.existsSync(temporary)) fs.rmSync(temporary, { recursive: true, force: true });
     }
@@ -68,34 +96,45 @@ async function seedBuiltinPlugins(template, workspace, manifest, previous) {
 }
 
 async function bootstrapDeployment(resourcesPath, dataHome, progress = () => {}, options = {}) {
-  const template = path.join(resourcesPath, 'project');
-  const manifestFile = path.join(template, 'deployment.json');
+  const template = path.join(resourcesPath, 'project'),
+    manifestFile = path.join(template, 'deployment.json');
   if (!fs.existsSync(manifestFile)) return null;
   const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-  const wechatVersion = manifest.wechatVersion ?? '4.1.10.27';
-  if (!['4.1.10.27', '4.1.15.13', '4.2.0.12'].includes(wechatVersion)) throw new Error('发行包微信版本无效。');
   if (
-    manifest.bundledWechatVersions &&
-    (manifest.bundledWechatVersions.length !== 1 || manifest.bundledWechatVersions[0] !== wechatVersion)
+    manifest.desktopRuntime !== true ||
+    manifest.wechatVersion !== '4.2.0.53' ||
+    !Array.isArray(manifest.bundledWechatVersions) ||
+    manifest.bundledWechatVersions.length
   )
-    throw new Error('发行包包含其他微信版本。');
-  const dshBundled = manifest.dshBundled !== false;
-  const workspace = path.join(dataHome, 'workspace');
-  const previousDistribution = path.join(workspace, 'config/distribution.json');
-  const previousSettings = fs.existsSync(previousDistribution)
-    ? JSON.parse(fs.readFileSync(previousDistribution, 'utf8').replace(/^\uFEFF/, ''))
+    throw Error('发行包桌面运行环境或微信版本无效。');
+  const workspace = path.join(dataHome, 'workspace'),
+    distributionFile = path.join(workspace, 'config/distribution.json');
+  const previous = fs.existsSync(distributionFile)
+    ? JSON.parse(fs.readFileSync(distributionFile, 'utf8').replace(/^\uFEFF/, ''))
     : {};
+  const configFile = path.join(workspace, 'config/wechatagent.json');
+  const config = JSON.parse(
+    fs
+      .readFileSync(
+        fs.existsSync(configFile) ? configFile : path.join(template, 'config/wechatagent.example.json'),
+        'utf8',
+      )
+      .replace(/^\uFEFF/, ''),
+  );
+  if (config.runtime?.sender !== 'wechat-ui')
+    throw Error('请选择新的数据目录配置桌面发送。当前数据目录使用其他发送后端。');
+  const previousHashes = { ...previous.builtinPluginHashes };
+  for (const id of previous.builtinPlugins ?? []) {
+    if (/^[a-z][a-z0-9-]{0,39}$/.test(id) && !previousHashes[id]) {
+      previousHashes[id] = packageFingerprint(path.join(workspace, 'optional-extensions', id));
+    }
+  }
   const externalDshHome =
     options.externalDshHome ||
-    previousSettings.externalDshHome ||
+    previous.externalDshHome ||
     process.env.DSH_HOME ||
     path.join(require('node:os').homedir(), '.dsh');
-  const dshHome =
-    options.dshHome ||
-    previousSettings.dshHome ||
-    (dshBundled && !fs.existsSync(path.join(workspace, 'config/wechatagent.json'))
-      ? path.join(dataHome, 'dsh')
-      : externalDshHome);
+  const dshHome = options.dshHome || previous.dshHome || externalDshHome;
   fs.mkdirSync(workspace, { recursive: true });
   for (const relative of manifest.files) {
     if (
@@ -104,196 +143,120 @@ async function bootstrapDeployment(resourcesPath, dataHome, progress = () => {},
       relative.startsWith('state/') ||
       relative === 'config/wechatagent.json'
     )
-      throw new Error('发行包文件清单无效。');
+      throw Error('发行包文件清单无效。');
     const source = path.join(template, relative),
       target = path.join(workspace, relative);
     if (relative.startsWith('roles/')) {
       if (fs.existsSync(target)) continue;
       const name = path.basename(relative, '.md'),
         key = crypto.createHash('sha256').update(name.toLocaleLowerCase()).digest('hex');
-      const marker = path.join(workspace, 'state', 'deleted-personas', key + '.json');
       try {
-        const record = JSON.parse(fs.readFileSync(marker, 'utf8'));
-        if (
-          record.version === 1 &&
-          typeof record.name === 'string' &&
-          record.name.toLocaleLowerCase() === name.toLocaleLowerCase()
-        )
-          continue;
-      } catch {
-        /* Missing/invalid markers retain the existing seed behaviour. */
-      }
+        const marker = JSON.parse(
+          fs.readFileSync(path.join(workspace, 'state/deleted-personas', key + '.json'), 'utf8'),
+        );
+        if (marker.version === 1 && marker.name?.toLocaleLowerCase() === name.toLocaleLowerCase()) continue;
+      } catch {}
     }
-    const bytes = fs.readFileSync(source);
-    if (
-      fs.existsSync(target) &&
-      crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex') ===
-        crypto.createHash('sha256').update(bytes).digest('hex')
-    )
+    const bytes = fs.readFileSync(source),
+      hash = crypto.createHash('sha256').update(bytes).digest('hex');
+    if (manifest.sourceHashes?.[relative] && hash !== manifest.sourceHashes[relative])
+      throw Error('发行包文件校验失败。');
+    if (fs.existsSync(target) && crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex') === hash)
       continue;
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, bytes);
   }
   const runtimeName = manifest.runtimeRevision ? `${manifest.version}-${manifest.runtimeRevision}` : manifest.version;
-  const versionRuntime = path.join(dataHome, 'runtimes', runtimeName);
-  const ready = path.join(versionRuntime, '.ready');
+  const versionRuntime = path.join(dataHome, 'runtimes', runtimeName),
+    ready = path.join(versionRuntime, '.ready');
   if (!fs.existsSync(ready)) {
     fs.mkdirSync(versionRuntime, { recursive: true });
-    progress('正在准备内置 Python 运行环境…');
-    await fs.promises.cp(path.join(resourcesPath, 'runtime', 'python'), path.join(versionRuntime, 'python'), {
-      recursive: true,
-    });
-    progress(dshBundled ? '正在准备 Node.js 与模型程序…' : '正在准备 Node.js 运行环境…');
-    fs.copyFileSync(path.join(resourcesPath, 'runtime', 'node.exe'), path.join(versionRuntime, 'node.exe'));
-    if (dshBundled)
-      await fs.promises.cp(path.join(resourcesPath, 'vendor', 'dsh'), path.join(versionRuntime, 'dsh'), {
+    progress('正在准备本机 Python、OCR 与 Node.js 运行环境…');
+    for (const name of ['python', 'ocr'])
+      await fs.promises.cp(path.join(resourcesPath, 'runtime', name), path.join(versionRuntime, name), {
         recursive: true,
       });
+    fs.copyFileSync(path.join(resourcesPath, 'runtime/node.exe'), path.join(versionRuntime, 'node.exe'));
     fs.writeFileSync(ready, manifest.version);
   }
-  const python = path.join(versionRuntime, 'python', 'python.exe');
-  const node = path.join(versionRuntime, 'node.exe');
-  // Keep an existing legacy executable/data binding; new installations choose
-  // an independently installed DSH through the setup page.
-  const dsh = dshBundled ? path.join(versionRuntime, 'dsh', 'DeepSeek Harness.exe') : previousSettings.dsh || '';
-  const client = path.join(workspace, 'state', 'hook', 'wechat-' + wechatVersion);
-  if (!fs.existsSync(path.join(client, 'Weixin.exe'))) {
-    progress('正在准备独立匹配微信…');
-    fs.mkdirSync(path.dirname(client), { recursive: true });
-    await fs.promises.cp(path.join(resourcesPath, 'vendor', 'wechat'), client, { recursive: true });
+  const python = path.join(versionRuntime, 'python/python.exe'),
+    ocrPython = path.join(versionRuntime, 'ocr/python.exe'),
+    node = path.join(versionRuntime, 'node.exe');
+  const modelDirectory = path.join(workspace, 'state/ocr/models');
+  fs.mkdirSync(modelDirectory, { recursive: true });
+  await fs.promises.cp(path.join(resourcesPath, 'runtime/ocr-models'), modelDirectory, { recursive: true });
+  const keyBytes = fs.readFileSync(path.join(resourcesPath, 'runtime/reader-key/wx_key.dll'));
+  if (
+    keyBytes.length !== manifest.readerKey?.bytes ||
+    crypto.createHash('sha256').update(keyBytes).digest('hex') !== manifest.readerKey?.sha256
+  )
+    throw Error('读取配置组件校验失败。');
+  const keyTarget = path.join(workspace, 'components/weflow-cli/resources/key/win32/x64/wx_key.dll');
+  fs.mkdirSync(path.dirname(keyTarget), { recursive: true });
+  fs.writeFileSync(keyTarget, keyBytes);
+  progress('正在准备桌面控件与录音组件…');
+  const nativeDirectory = path.join(workspace, 'state/ui-host');
+  fs.mkdirSync(nativeDirectory, { recursive: true });
+  if (!manifest.nativeHashes || !Object.keys(manifest.nativeHashes).length) throw Error('发行包缺少桌面组件。');
+  for (const [name, expected] of Object.entries(manifest.nativeHashes)) {
+    if (!/^[A-Za-z0-9-]+\.exe$/.test(name) || !/^[a-f0-9]{64}$/.test(expected)) throw Error('桌面组件清单无效。');
+    const bytes = fs.readFileSync(path.join(resourcesPath, 'desktop-native', name));
+    if (crypto.createHash('sha256').update(bytes).digest('hex') !== expected) throw Error('桌面组件校验失败。');
+    const target = path.join(nativeDirectory, name);
+    if (!fs.existsSync(target) || !fs.readFileSync(target).equals(bytes)) fs.writeFileSync(target, bytes);
   }
-  if (wechatVersion === '4.1.10.27') {
-    const nativeDir = path.join(workspace, 'state', 'hook', 'native');
-    fs.mkdirSync(nativeDir, { recursive: true });
-    const previousBuild = path.join(nativeDir, 'build.json');
-    if (fs.existsSync(previousBuild) && fs.existsSync(path.join(nativeDir, 'version.dll'))) {
-      const installedHash = crypto
-        .createHash('sha256')
-        .update(fs.readFileSync(path.join(nativeDir, 'version.dll')))
-        .digest('hex');
-      const nextHash = crypto
-        .createHash('sha256')
-        .update(fs.readFileSync(path.join(resourcesPath, 'vendor/hook/version.dll')))
-        .digest('hex');
-      if (installedHash !== nextHash) {
-        const previous = JSON.parse(fs.readFileSync(previousBuild, 'utf8').replace(/^\uFEFF/, ''));
-        if (previous.sha256 === installedHash)
-          fs.copyFileSync(previousBuild, path.join(nativeDir, 'build.previous.json'));
-      }
-    }
-    for (const file of ['version.dll', 'build.json']) {
-      const source = path.join(resourcesPath, 'vendor', 'hook', file),
-        target = path.join(nativeDir, file);
-      const bytes = fs.readFileSync(source);
-      if (
-        !fs.existsSync(target) ||
-        crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex') !==
-          crypto.createHash('sha256').update(bytes).digest('hex')
-      )
-        fs.writeFileSync(target, bytes);
-    }
+  if (!fs.existsSync(configFile) || config.runtime.python === previous.python) config.runtime.python = python;
+  config.input ??= {};
+  if (
+    !config.input.python ||
+    config.input.python === previous.desktopPython ||
+    config.input.python === previous.foregroundInputPython
+  )
+    config.input.python = python;
+  config.input.expectedVersion = '4.2.0.53';
+  fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
+  if (manifest.buildId && previous.buildId && previous.buildId !== manifest.buildId) {
+    const pendingFile = path.join(workspace, 'state/console-state.json');
+    let pending = {};
+    try {
+      pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
+    } catch {}
+    fs.mkdirSync(path.dirname(pendingFile), { recursive: true });
+    fs.writeFileSync(pendingFile, JSON.stringify({ ...pending, pendingApply: true, dshRestartRequired: true }));
   }
-  if (['4.1.15.13', '4.2.0.12'].includes(wechatVersion)) {
-    const sourceDir = path.join(resourcesPath, 'vendor', 'hook-current');
-    const currentBuild = JSON.parse(fs.readFileSync(path.join(sourceDir, 'build.json'), 'utf8').replace(/^\uFEFF/, ''));
-    if (
-      currentBuild.targetVersion !== wechatVersion ||
-      currentBuild.integration !== 'WeChatAgent-1' ||
-      currentBuild.profile !== (wechatVersion === '4.2.0.12' ? '4.2.0.12-stickers-v2' : '4.1.15.13-media-mentions-v2')
-    )
-      throw new Error('发行包新版微信组件版本无效。');
-    if (
-      wechatVersion === '4.2.0.12' &&
-      (currentBuild.productionEnabled !== true ||
-        currentBuild.runtimeVerified !== true ||
-        currentBuild.acceptance?.coldStart !== true ||
-        currentBuild.acceptance?.textReceipt !== true ||
-        currentBuild.acceptance?.imageReceipt !== true ||
-        currentBuild.nativeStickerSend !== true ||
-        currentBuild.acceptance?.stickerReceipt !== true ||
-        currentBuild.acceptance?.animatedSticker !== true)
-    )
-      throw new Error('发行包 4.2 组件尚未通过运行验收。');
-    if (
-      wechatVersion === '4.2.0.12' &&
-      currentBuild.nativeVoiceSend === true &&
-      (currentBuild.nativeVoiceProtocol !== 'silk-receipt-v1' || currentBuild.acceptance?.voiceReceipt !== true)
-    )
-      throw new Error('发行包 4.2 语音组件尚未通过回执验收。');
-    const payloads = [
-      ['wechatagent-text-' + wechatVersion + '.dll', currentBuild.sha256],
-      ['wechatagent-text-loader.exe', currentBuild.loaderSha256],
-    ].map(([file, expected]) => {
-      const bytes = fs.readFileSync(path.join(sourceDir, file));
-      if (crypto.createHash('sha256').update(bytes).digest('hex') !== expected)
-        throw new Error('发行包新版微信组件校验失败。');
-      return [file, bytes];
-    });
-    payloads.push(['build.json', fs.readFileSync(path.join(sourceDir, 'build.json'))]);
-    const destination = path.join(workspace, 'state', 'hook', 'native-' + wechatVersion);
-    fs.mkdirSync(destination, { recursive: true });
-    for (const [file, bytes] of payloads) {
-      const target = path.join(destination, file);
-      if (!fs.existsSync(target) || !fs.readFileSync(target).equals(bytes)) fs.writeFileSync(target, bytes);
-    }
-  }
-  const configFile = path.join(workspace, 'config', 'wechatagent.json');
-  if (!fs.existsSync(configFile)) {
-    const config = JSON.parse(fs.readFileSync(path.join(workspace, 'config', 'wechatagent.example.json'), 'utf8'));
-    config.runtime.python = python;
-    config.runtime.dshDesktop = dshBundled ? dsh : '';
-    config.hook ??= {};
-    config.hook.expectedVersion = wechatVersion;
-    config.hook.wechatExecutable = 'state/hook/wechat-' + wechatVersion + '/Weixin.exe';
-    fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
-  }
-  const distributionFile = path.join(workspace, 'config', 'distribution.json');
-  if (fs.existsSync(distributionFile)) {
-    const previous = JSON.parse(fs.readFileSync(distributionFile, 'utf8'));
-    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-    if (config.runtime.python === previous.python) config.runtime.python = python;
-    if (dshBundled && config.runtime.dshDesktop === previous.dsh) config.runtime.dshDesktop = dsh;
-    fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
-    if (manifest.buildId && previous.buildId !== manifest.buildId) {
-      const pendingFile = path.join(workspace, 'state', 'console-state.json');
-      let pending = {};
-      try {
-        pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
-      } catch {}
-      fs.writeFileSync(
-        pendingFile,
-        JSON.stringify({ ...pending, pendingApply: true, dshRestartRequired: true }, null, 2),
-      );
-    }
-  }
-  const builtinPlugins = await seedBuiltinPlugins(template, workspace, manifest, previousSettings);
-  const foregroundInputPython = manifest.foregroundInputRuntime === true ? python : undefined;
+  const builtinPluginHashes = await seedBuiltinPlugins(template, workspace, manifest, previousHashes);
+  const builtinPlugins = Object.keys(builtinPluginHashes);
   fs.writeFileSync(
     distributionFile,
     JSON.stringify(
       {
         version: manifest.version,
         buildId: manifest.buildId,
+        builtAt: manifest.builtAt,
         runtimeRevision: manifest.runtimeRevision,
-        wechatVersion,
-        bundledWechatExecutable: client,
+        desktopRuntime: true,
+        wechatVersion: '4.2.0.53',
+        bundledWechatVersions: [],
         installed: true,
         dataHome,
         python,
-        foregroundInputPython,
+        desktopPython: python,
+        foregroundInputPython: python,
+        ocrPython,
         node,
-        dshBundled,
-        dsh,
+        dshBundled: false,
+        dsh: previous.dsh || '',
         dshHome,
         externalDshHome,
         assets: resourcesPath,
         builtinPlugins,
+        builtinPluginHashes,
       },
       null,
       2,
     ),
   );
-  progress('本机运行环境已准备，正在打开控制台…');
+  progress('本机运行环境已准备，请在连接设置选择已安装的微信与 DSH。');
   return { root: workspace, node, python, dataHome, version: manifest.version };
 }
 module.exports = { bootstrapDeployment };

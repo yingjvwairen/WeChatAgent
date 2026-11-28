@@ -3,21 +3,21 @@ const escape = value =>
     /[&<>"']/g,
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
   );
-export const needsWeChatRepair = output =>
-  /HOOK_CLIENT_UNHEALTHY|HOOK_INITIALIZATION_TIMEOUT|HOOK_NOT_LISTENING|HOOK_COMPONENT_UPDATE_PENDING|HOOK_AUTH_FAILED|HOOK_CONNECTION_RESET|HOOK_HEALTH_FAILED|HOOK_MULTIPLE_ACCOUNT_DATABASES|HOOK_ACCOUNT_METADATA_INVALID|HOOK_ACCOUNT_MISMATCH/.test(
-    String(output ?? ''),
-  );
+export const needsWeChatRestart = output =>
+  /\b(?:DESKTOP_NOT_READY|DESKTOP_WINDOW_NOT_READY)\b/.test(String(output ?? ''));
 const detail = item =>
   `<strong>${escape(item.name)} <span class="subtle">PID ${Number(item.pid)}</span></strong><span>${escape(item.reason)}</span><code>${escape(item.path || '无法确认程序路径')}</code>`;
 
-export async function openProcessRecovery({ api, modal, refreshStatus, toast, repairWeChat = false, onRecovered }) {
+export async function openProcessRecovery({ api, modal, refreshStatus, toast, restartWeChat = false, onRecovered }) {
   let active = true,
     busy = false,
     checking = false,
     scan;
   modal(
-    '检查占用进程',
-    '<p class="modal-description" role="status">正在检查配置端口和微信进程，此步骤不会停止程序…</p>',
+    restartWeChat ? '检查所选微信' : '检查占用进程',
+    restartWeChat
+      ? '<p class="modal-description" role="status">正在检查配置中的微信进程…</p>'
+      : '<p class="modal-description" role="status">正在检查端口与进程…</p>',
     {
       className: 'process-recovery-modal',
       onClose: () => {
@@ -41,16 +41,16 @@ export async function openProcessRecovery({ api, modal, refreshStatus, toast, re
       button.disabled = true;
     });
     try {
-      scan = await api('/api/process-recovery' + (repairWeChat ? '?purpose=hook-repair' : ''));
+      scan = await api('/api/process-recovery' + (restartWeChat ? '?purpose=wechat-restart' : ''));
       if (!active) return;
-      if (repairWeChat && scan.purpose !== 'hook-repair')
-        throw Error('当前后台尚未加载修复功能，请从托盘退出并重新打开 WeChatAgent，再重试。');
+      if (restartWeChat && (scan.purpose !== 'wechat-restart' || !scan.revision))
+        throw Error('无法确认所选微信程序，请重新检查。');
       title('选择需要停止的进程');
-      body.innerHTML = `<p class="modal-description">${repairWeChat ? '将重新打开配置中的匹配微信，可能需要重新登录。仅列出该客户端的进程；请核对路径，停止前还需要再次确认。' : '只列出异常端口的占用者和其他微信客户端。先核对程序名称、路径与 PID；选中后还需要再次确认。'}</p><div class="process-list">${scan.items.length ? scan.items.map(item => `<label class="process-row"><input type="checkbox" value="${escape(item.id)}" ${item.canStop ? (repairWeChat ? 'checked' : '') : 'disabled'} aria-label="选择 ${escape(item.name)}，PID ${Number(item.pid)}"><div>${detail(item)}${item.canStop ? '' : `<span class="inline-error">${escape(item.blockedReason)}</span>`}</div></label>`).join('') : `<p class="modal-description">${repairWeChat ? '匹配微信尚未运行，可以直接打开。' : '未发现可处理的占用进程。端口也可能被 Windows 保留或拒绝绑定，请在连接设置中修改该端口，或查看原始错误详情。'}</p>`}</div><p class="inline-error" data-recovery-error role="alert"></p><div class="modal-actions"><button class="button" data-close>取消</button><button class="button" data-recovery-rescan>重新检查</button>${repairWeChat && !scan.items.length ? '<button class="button primary" data-recovery-open>打开匹配微信</button>' : '<button class="button danger" data-recovery-prepare disabled>停止选中进程…</button>'}</div>`;
+      body.innerHTML = `<p class="modal-description">${restartWeChat ? '请选择要停止的微信进程并核对路径。重新打开客户端后可能需要再次登录。' : '只列出异常端口的占用者和其他微信客户端。先核对程序名称、路径与 PID；选中后还需要再次确认。'}</p><div class="process-list">${scan.items.length ? scan.items.map(item => `<label class="process-row"><input type="checkbox" value="${escape(item.id)}" ${item.canStop ? (restartWeChat ? 'checked' : '') : 'disabled'} aria-label="选择 ${escape(item.name)}，PID ${Number(item.pid)}"><div>${detail(item)}${item.canStop ? '' : `<span class="inline-error">${escape(item.blockedReason)}</span>`}</div></label>`).join('') : `<p class="modal-description">${restartWeChat ? '匹配微信尚未运行，可以直接打开。' : '未发现可处理的占用进程。端口也可能被 Windows 保留或拒绝绑定，请在连接设置中修改该端口，或查看原始错误详情。'}</p>`}</div><p class="inline-error" data-recovery-error role="alert"></p><div class="modal-actions"><button class="button" data-close>取消</button><button class="button" data-recovery-rescan>重新检查</button>${restartWeChat && !scan.items.length ? '<button class="button primary" data-recovery-open>打开匹配微信</button>' : '<button class="button danger" data-recovery-prepare disabled>停止选中进程…</button>'}</div>`;
       body.querySelector('[data-recovery-rescan]').onclick = showList;
       const next = body.querySelector('[data-recovery-prepare]');
       if (!next) {
-        body.querySelector('[data-recovery-open]')?.addEventListener('click', () => onRecovered?.());
+        body.querySelector('[data-recovery-open]')?.addEventListener('click', () => onRecovered?.(scan.revision));
         return;
       }
       next.disabled = !body.querySelector('input[type=checkbox]:checked');
@@ -85,7 +85,7 @@ export async function openProcessRecovery({ api, modal, refreshStatus, toast, re
     }
   };
   const showConfirmation = prepared => {
-    title(repairWeChat ? '再次确认重开匹配微信' : '再次确认停止进程');
+    title(restartWeChat ? '再次确认重开匹配微信' : '再次确认停止进程');
     body.innerHTML = `<p class="modal-description">将停止以下 ${prepared.items.length} 个进程，可能中断对应程序的连接和未完成操作。请先保存需要保留的内容；停止微信后可能需要重新登录。</p><div class="process-list">${prepared.items.map(item => `<div class="process-row"><div>${detail(item)}</div></div>`).join('')}</div><p class="inline-error" data-recovery-error role="alert"></p><div class="modal-actions"><button class="button" data-recovery-back autofocus>返回选择</button><button class="button danger" data-recovery-stop>确认停止 ${prepared.items.length} 个进程</button></div>`;
     body.querySelector('[data-recovery-back]').onclick = showList;
     body.querySelector('[data-recovery-back]').focus();
@@ -102,9 +102,9 @@ export async function openProcessRecovery({ api, modal, refreshStatus, toast, re
           confirmed: true,
         });
         if (!active) return;
-        if (repairWeChat) {
+        if (restartWeChat) {
           busy = false;
-          await onRecovered?.();
+          await onRecovered?.(scan.revision);
           return;
         }
         title('进程处理完成');

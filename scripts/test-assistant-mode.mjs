@@ -14,10 +14,10 @@ import { chatSettingsSnapshot, applyChatSettings } from '../public/console/conve
 import { MessageBuffer } from '../components/qq-bridge/src/core/message-buffer.js';
 import { SocialEngine } from '../components/qq-bridge/src/core/social-engine.js';
 const key = 'wechat:private:123',
-  group = 'wechat:group:456';
+  group = 'wechat:group:456@chatroom';
 const config = () => ({
   persona: { default: '聊天人格', chats: {} },
-  wechat: { whitelist: { private: ['123'], groups: ['456'] }, wake_mode: 'hybrid' },
+  wechat: { whitelist: { private: ['123'], groups: ['456@chatroom'] }, wake_mode: 'hybrid' },
 });
 const temp = t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'assistant-mode-'));
@@ -32,7 +32,7 @@ test('legacy chats keep social mode, assistant groups default to mention, invali
   assert.equal(conversationMode(c.wechat, group), 'mention');
   c.wechat.chatModes = { [group]: 'hybrid' };
   assert.equal(conversationMode(c.wechat, group), 'hybrid');
-  assert.equal(conversationWorkMode(c.wechat, 'wechat:group:999'), 'social');
+  assert.equal(conversationWorkMode(c.wechat, 'wechat:group:999@chatroom'), 'social');
   assert.throws(() => validateConversationSettings({ ...c.wechat, workModes: { [key]: 'full-access' } }));
 });
 test('mode settings keep distinct personas and grants; switching back restores the original settings', () => {

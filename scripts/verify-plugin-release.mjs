@@ -2,220 +2,138 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { withReleaseSnapshot } from './release-snapshot.mjs';
 import { assertPluginHost } from './plugin-host-check.mjs';
 import { BUNDLED_PLUGINS } from '../packages/plugin-api/bundled.mjs';
 import { releaseIdentity } from './release-version.mjs';
-import { verifyHookBuild, verifyWeChatClient } from './hook-build-policy.mjs';
+import { verifyReaderKey } from './prepare-reader-key.mjs';
+import { deploymentVerification, verifyInstallerPayload } from './release-verification.mjs';
 
 const root = path.resolve(import.meta.dirname, '..'),
   hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
-const { version, packageVersion } = releaseIdentity(JSON.parse(fs.readFileSync(path.join(root, 'package.json'))));
-const sourceReport = JSON.parse(fs.readFileSync(path.join(root, 'state/source-release-' + version + '.json')));
-const sourceAudit = await assertPluginHost(root),
-  sourceCheck = spawnSync(process.execPath, [path.join(root, 'scripts/public-source-check.mjs'), '--files'], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 4 * 1024 * 1024,
-    windowsHide: true,
-  });
-if (sourceCheck.status !== 0) throw Error('PUBLIC_SOURCE_CHECK_FAILED');
-const privacy = JSON.parse(sourceCheck.stdout),
-  builtFiles = Object.keys(sourceReport.sourceFiles).sort();
-if (JSON.stringify(builtFiles) !== JSON.stringify(privacy.files.sort()))
-  throw Error('SOURCE_FILE_SET_CHANGED_AFTER_PACKAGING');
-for (const relative of builtFiles)
-  if (hash(fs.readFileSync(path.join(root, relative))) !== sourceReport.sourceFiles[relative])
-    throw Error('SOURCE_CHANGED_AFTER_PACKAGING: ' + relative);
-const stage = path.join(root, 'state/installer-stage/project'),
-  unpacked = path.join(root, 'release/installer/win-unpacked/resources/project');
-const templateReports = [];
-const builtinPlugins = BUNDLED_PLUGINS.filter(item => item.builtin === true).map(item => item.id);
-for (const directory of [stage, unpacked]) {
-  await assertPluginHost(directory, { compareRoot: root });
-  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'deployment.json')));
-  if (manifest.version !== version || manifest.packageVersion !== packageVersion)
-    throw Error('INSTALLER_VERSION_MISMATCH');
-  if (JSON.stringify(manifest.builtinPlugins ?? []) !== JSON.stringify(builtinPlugins))
-    throw Error('INSTALLER_BUILTIN_PLUGINS_MISMATCH');
-  if (manifest.foregroundInputRuntime !== true) throw Error('INSTALLER_FOREGROUND_RUNTIME_MISSING');
-  const input = spawnSync(
-    path.join(directory, '../runtime/python/python.exe'),
-    ['-B', '-c', 'import psutil,win32api,win32clipboard,win32gui,win32process'],
-    { windowsHide: true, encoding: 'utf8', timeout: 30000 },
-  );
-  if (input.status !== 0) throw Error('INSTALLER_FOREGROUND_IMPORT_FAILED: ' + (input.stderr || ''));
-  const worker = spawnSync(
-    path.join(directory, '../runtime/python/python.exe'),
-    ['-B', path.join(directory, 'scripts/input-worker.py'), '--help'],
-    { windowsHide: true, encoding: 'utf8', timeout: 30000 },
-  );
-  if (worker.status !== 0 || !worker.stdout.includes('--workspace'))
-    throw Error('INSTALLER_FOREGROUND_WORKER_FAILED: ' + (worker.stderr || ''));
-  for (const relative of ['package.json', '../app/package.json']) {
-    const item = JSON.parse(fs.readFileSync(path.join(directory, relative), 'utf8'));
-    if (item.version !== packageVersion || item.releaseVersion !== version)
-      throw Error('INSTALLER_PACKAGE_VERSION_MISMATCH');
-  }
-  for (const relative of manifest.files) {
+await withReleaseSnapshot(root, async ({ commit, directory: source, files, pluginHost }) => {
+  const { version, packageVersion } = releaseIdentity(JSON.parse(fs.readFileSync(path.join(source, 'package.json'))));
+  const sourceReport = JSON.parse(fs.readFileSync(path.join(root, 'state/source-release-' + version + '.json')));
+  const builtFiles = Object.keys(sourceReport.sourceFiles).sort();
+  if (sourceReport.commit !== commit || JSON.stringify(builtFiles) !== JSON.stringify(files))
+    throw Error('SOURCE_SNAPSHOT_CHANGED_AFTER_PACKAGING');
+  for (const file of builtFiles)
+    if (hash(fs.readFileSync(path.join(source, file))) !== sourceReport.sourceFiles[file])
+      throw Error('SOURCE_CHANGED_AFTER_PACKAGING: ' + file);
+  const stage = path.join(root, 'state/installer-stage/project'),
+    unpacked = path.join(root, 'release/installer/win-unpacked/resources/project');
+  const reports = [],
+    builtinPlugins = BUNDLED_PLUGINS.filter(item => item.builtin === true).map(item => item.id);
+  for (const directory of [stage, unpacked]) {
+    await assertPluginHost(directory, { compareRoot: source });
+    const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'deployment.json')));
     if (
-      path.isAbsolute(relative) ||
-      relative.split(/[\\/]/).includes('..') ||
-      relative.startsWith('state/') ||
-      relative === 'config/wechatagent.json'
+      manifest.sourceCommit !== commit ||
+      manifest.version !== version ||
+      manifest.packageVersion !== packageVersion ||
+      manifest.desktopRuntime !== true ||
+      manifest.wechatVersion !== '4.2.0.53' ||
+      manifest.bundledWechatVersions?.length !== 0
     )
-      throw Error('INSTALLER_PRIVATE_PATH_REJECTED');
-    if (hash(fs.readFileSync(path.join(directory, relative))) !== manifest.sourceHashes[relative])
-      throw Error('INSTALLER_TEMPLATE_HASH_MISMATCH: ' + relative);
-  }
-  for (const relative of ['config/plugins.json', 'config/extensions.json', 'config/wechatagent.json'])
-    if (fs.existsSync(path.join(directory, relative))) throw Error('INSTALLER_PRIVATE_CONFIG_REJECTED');
-  if (fs.existsSync(path.join(directory, 'plugins')) && fs.readdirSync(path.join(directory, 'plugins')).length)
-    throw Error('INSTALLER_INSTALLED_PLUGINS_REJECTED');
-  templateReports.push({
-    buildId: manifest.buildId,
-    files: manifest.files.length,
-    runtimeRevision: manifest.runtimeRevision,
-    builtAt: manifest.builtAt,
-  });
-}
-if (templateReports[0].buildId !== templateReports[1].buildId) throw Error('INSTALLER_STAGE_DIVERGED');
-const packagedManifest = JSON.parse(fs.readFileSync(path.join(stage, 'deployment.json'), 'utf8'));
-const bundledWechatVersion = packagedManifest.wechatVersion ?? '4.1.10.27';
-const vendorReports = [];
-for (const directory of [
-  path.join(root, 'state/installer-stage/vendor'),
-  path.join(root, 'release/installer/win-unpacked/resources/vendor'),
-]) {
-  verifyWeChatClient(path.join(directory, 'wechat'), bundledWechatVersion);
-  if (JSON.stringify(packagedManifest.bundledWechatVersions) !== JSON.stringify([bundledWechatVersion]))
-    throw Error('INSTALLER_MIXED_WECHAT_VERSIONS');
-  const clientVersions = fs
-    .readdirSync(path.join(directory, 'wechat'), { withFileTypes: true })
-    .filter(entry => entry.isDirectory())
-    .map(entry => entry.name);
-  if (JSON.stringify(clientVersions) !== JSON.stringify([bundledWechatVersion]))
-    throw Error('INSTALLER_OLD_WECHAT_CLIENT_INCLUDED');
-  if (bundledWechatVersion === '4.1.10.27') verifyHookBuild(path.join(directory, 'hook'));
-  else if (fs.existsSync(path.join(directory, 'hook'))) throw Error('INSTALLER_OLD_HOOK_INCLUDED');
-  const current = ['4.1.15.13', '4.2.0.12'].includes(bundledWechatVersion)
-    ? verifyHookBuild(path.join(directory, 'hook-current'), bundledWechatVersion)
-    : null;
-  if (current) {
-    const files = fs.readdirSync(path.join(directory, 'hook-current')).sort();
+      throw Error('INSTALLER_DESKTOP_MANIFEST_INVALID');
+    if (JSON.stringify(manifest.builtinPlugins) !== JSON.stringify(builtinPlugins))
+      throw Error('INSTALLER_BUILTIN_PLUGINS_MISMATCH');
+    for (const file of manifest.files)
+      if (hash(fs.readFileSync(path.join(directory, file))) !== manifest.sourceHashes[file])
+        throw Error('INSTALLER_FILE_CHANGED: ' + file);
+    const packagedFiles = new Set(manifest.files);
+    for (const file of builtFiles)
+      if (!packagedFiles.has(file) || manifest.sourceHashes[file] !== sourceReport.sourceFiles[file])
+        throw Error('INSTALLER_SOURCE_CLOSURE_MISMATCH: ' + file);
+    for (const [file, expected] of Object.entries(manifest.nativeHashes))
+      if (hash(fs.readFileSync(path.join(directory, '../desktop-native', file))) !== expected)
+        throw Error('INSTALLER_NATIVE_CHANGED: ' + file);
+    if (!verifyReaderKey(fs.readFileSync(path.join(directory, '../runtime/reader-key/wx_key.dll'))))
+      throw Error('INSTALLER_READER_SETUP_CHANGED');
+    for (const [runtime, imports] of [
+      ['python', 'import sqlcipher3,av,psutil,win32api,win32gui,win32process'],
+      ['ocr', 'import rapidocr,onnxruntime,numpy,PIL'],
+    ]) {
+      const probe = spawnSync(path.join(directory, '../runtime', runtime, 'python.exe'), ['-B', '-c', imports], {
+        windowsHide: true,
+        encoding: 'utf8',
+        timeout: 60000,
+      });
+      if (probe.status !== 0) throw Error('INSTALLER_RUNTIME_IMPORT_FAILED: ' + runtime);
+    }
     if (
-      JSON.stringify(files) !==
-      JSON.stringify(
-        ['build.json', 'wechatagent-text-' + bundledWechatVersion + '.dll', 'wechatagent-text-loader.exe'].sort(),
-      )
+      fs.existsSync(path.join(directory, '../vendor/wechat')) ||
+      fs.existsSync(path.join(directory, '../vendor/hook'))
     )
-      throw Error('INSTALLER_UNEXPECTED_NATIVE_PAYLOAD');
-    for (const file of ['load-hook-42012.ps1', 'build-hook-42012.ps1'])
-      if (bundledWechatVersion === '4.2.0.12' && !fs.existsSync(path.join(stage, 'scripts', file)))
-        throw Error('INSTALLER_4_2_LOADER_MISSING');
+      throw Error('INSTALLER_RETIRED_VENDOR_INCLUDED');
+    reports.push(deploymentVerification(manifest));
   }
-  vendorReports.push({
-    version: bundledWechatVersion,
-    clientSha256: hash(fs.readFileSync(path.join(directory, 'wechat/Weixin.exe'))),
-    coreSha256: hash(fs.readFileSync(path.join(directory, 'wechat', bundledWechatVersion, 'Weixin.dll'))),
-    nativeProfile: current?.profile ?? null,
-    nativeSha256: current?.sha256 ?? null,
-    loaderSha256: current?.loaderSha256 ?? null,
-    nativeVoiceSend: current?.nativeVoiceSend === true,
+  if (JSON.stringify(reports[0]) !== JSON.stringify(reports[1])) throw Error('INSTALLER_STAGES_DIVERGED');
+  const installerRelative = 'release/installer/WeChatAgent-Setup-' + version + '-x64.exe',
+    installer = fs.readFileSync(path.join(root, installerRelative));
+  const pe = installer.readUInt32LE(0x3c);
+  if (installer.toString('ascii', 0, 2) !== 'MZ' || installer.readUInt32LE(pe) !== 0x4550)
+    throw Error('INSTALLER_PE_INVALID');
+  await verifyInstallerPayload(path.join(root, installerRelative), path.resolve(unpacked, '../..'));
+  const assets = [
+    installerRelative,
+    sourceReport.asset.path,
+    ...BUNDLED_PLUGINS.filter(item => item.zip).map(item => item.zip),
+  ];
+  const assetRecords = assets.map(relative => {
+    const bytes = fs.readFileSync(path.join(root, relative));
+    return { path: relative, bytes: bytes.length, sha256: hash(bytes) };
   });
-}
-if (JSON.stringify(vendorReports[0]) !== JSON.stringify(vendorReports[1]))
-  throw Error('INSTALLER_VENDOR_RESOURCES_DIVERGED');
-const installerRelative = 'release/installer/WeChatAgent-Setup-' + version + '-x64.exe',
-  installer = fs.readFileSync(path.join(root, installerRelative));
-const pe = installer.readUInt32LE(0x3c);
-if (installer.toString('ascii', 0, 2) !== 'MZ' || installer.readUInt32LE(pe) !== 0x4550)
-  throw Error('INSTALLER_PE_INVALID');
-const assets = [
-  installerRelative,
-  sourceReport.asset.path,
-  ...BUNDLED_PLUGINS.filter(item => item.zip).map(item => item.zip),
-];
-const roleAsset = 'release/installer/蓝色大肥鱼-小助手.md';
-if (fs.existsSync(path.join(root, roleAsset))) assets.push(roleAsset);
-const assetRecords = assets.map(relative => {
-  const data = fs.readFileSync(path.join(root, relative));
-  return { path: relative, bytes: data.length, sha256: hash(data) };
-});
-if (assetRecords.find(item => item.path === sourceReport.asset.path).sha256 !== sourceReport.asset.sha256)
-  throw Error('SOURCE_ARCHIVE_CHANGED');
-const liveAcceptance =
-  bundledWechatVersion === '4.2.0.12'
-    ? JSON.parse(fs.readFileSync(path.join(root, 'release-profile.json'), 'utf8')).verification?.wechat42012
-    : null;
-if (
-  bundledWechatVersion === '4.2.0.12' &&
-  (!liveAcceptance?.coldStart ||
-    !liveAcceptance?.textReceipt ||
-    !liveAcceptance?.imageReceipt ||
-    !liveAcceptance?.stickerReceipt ||
-    !liveAcceptance?.animatedSticker ||
-    liveAcceptance.nativeSha256 !== vendorReports[0].nativeSha256)
-)
-  throw Error('RELEASE_RUNTIME_ACCEPTANCE_MISMATCH');
-if (
-  vendorReports[0].nativeVoiceSend &&
-  (liveAcceptance?.voiceReceipt !== true || liveAcceptance.loaderSha256 !== vendorReports[0].loaderSha256)
-)
-  throw Error('RELEASE_VOICE_ACCEPTANCE_MISMATCH');
-const report = {
-  version,
-  packageVersion,
-  ok: true,
-  ...templateReports[0],
-  checkedAt: new Date().toISOString(),
-  pluginHost: sourceAudit.contract,
-  sourcePrivacy: { candidateFiles: privacy.candidateFiles, findings: privacy.findings },
-  templateFilesVerified: templateReports,
-  bundledWechat: vendorReports[0],
-  sourceFiles: sourceReport.sourceFiles,
-  assets: assetRecords,
-  regression:
-    JSON.parse(fs.readFileSync(path.join(root, 'release-profile.json'), 'utf8')).verification?.publicRegression ?? null,
-  builtinPlugins,
-  pluginAutoInstalled: builtinPlugins.length > 0,
-  pluginAutoEnabled: false,
-  foregroundInputRuntime: true,
-  servicesRestarted: liveAcceptance?.servicesRestarted === true,
-  realWeChatStarted: !!liveAcceptance,
-  actualUserDataUsed: !!liveAcceptance,
-  liveAcceptance,
-  publication: 'local-build-only',
-  validationLimits: [
-    'Packaged-file, host-contract, source-file-set and artifact-hash verification. Second-device installation, group mentions, long-running stability and live ASR were not tested.',
-    ...(vendorReports[0].nativeVoiceSend
-      ? [
-          'The bundled Hook was tested after a cold start. Filehelper text, image, animated GIF and native voice receipts were verified against the same DLL.',
-        ]
-      : []),
-    'Automated plugin, console, deployment and synthetic voice tests are recorded in docs/PLUGIN_HOST_AUDIT.md.',
-  ],
-};
-const release = path.join(root, 'release/installer');
-fs.writeFileSync(path.join(release, 'VERIFICATION.json'), JSON.stringify(report, null, 2) + '\n');
-fs.writeFileSync(path.join(release, 'VERIFICATION-' + version + '.json'), JSON.stringify(report, null, 2) + '\n');
-if (new Set(assetRecords.map(item => path.basename(item.path))).size !== assetRecords.length)
-  throw Error('RELEASE_ASSET_NAME_CONFLICT');
-fs.writeFileSync(
-  path.join(release, 'SHA256SUMS.txt'),
-  assetRecords.map(item => item.sha256 + '  ' + path.basename(item.path)).join('\n') + '\n',
-);
-fs.writeFileSync(
-  path.join(root, installerRelative + '.sha256'),
-  assetRecords[0].sha256 + '  ' + path.basename(installerRelative) + '\n',
-);
-console.log(
-  JSON.stringify({
-    ok: true,
+  for (const asset of assetRecords)
+    if (sourceReport.sourceFiles[asset.path] && sourceReport.sourceFiles[asset.path] !== asset.sha256)
+      throw Error('PLUGIN_RELEASE_ASSET_CHANGED');
+  if (assetRecords[0].sha256 !== hash(installer)) throw Error('INSTALLER_CHANGED_DURING_VERIFICATION');
+  if (assetRecords.find(item => item.path === sourceReport.asset.path).sha256 !== sourceReport.asset.sha256)
+    throw Error('SOURCE_ARCHIVE_CHANGED');
+  const report = {
     version,
-    buildId: report.buildId,
-    sourceFiles: builtFiles.length,
-    assets: assetRecords.length,
-    templateFiles: templateReports[0].files,
-    pluginContract: sourceAudit.contract.revision,
-  }),
-);
+    packageVersion,
+    ok: true,
+    ...reports[0],
+    checkedAt: new Date().toISOString(),
+    sourceCommit: commit,
+    pluginHost,
+    sourcePrivacy: { candidateFiles: files.length, findings: [] },
+    templateFilesVerified: reports,
+    desktopRuntime: true,
+    wechatVersion: '4.2.0.53',
+    bundledWechatVersions: [],
+    sourceFiles: sourceReport.sourceFiles,
+    assets: assetRecords,
+    builtinPlugins,
+    pluginAutoInstalled: true,
+    pluginAutoEnabled: false,
+    publication: 'local-build-only',
+    validationLimits: [
+      'Artifact, source closure, plugin contract and runtime imports only; this command does not operate WeChat or claim live/second-machine acceptance.',
+    ],
+  };
+  const release = path.join(root, 'release/installer');
+  for (const file of ['VERIFICATION.json', 'VERIFICATION-' + version + '.json'])
+    fs.writeFileSync(path.join(release, file), JSON.stringify(report, null, 2) + '\n');
+  if (new Set(assetRecords.map(item => path.basename(item.path))).size !== assetRecords.length)
+    throw Error('RELEASE_ASSET_NAME_CONFLICT');
+  fs.writeFileSync(
+    path.join(release, 'SHA256SUMS.txt'),
+    assetRecords.map(item => item.sha256 + '  ' + path.basename(item.path)).join('\n') + '\n',
+  );
+  fs.writeFileSync(
+    path.join(root, installerRelative + '.sha256'),
+    assetRecords[0].sha256 + '  ' + path.basename(installerRelative) + '\n',
+  );
+  console.log(
+    JSON.stringify({
+      ok: true,
+      version,
+      buildId: report.buildId,
+      sourceFiles: builtFiles.length,
+      assets: assetRecords.length,
+      pluginContract: pluginHost.revision,
+    }),
+  );
+});

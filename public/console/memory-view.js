@@ -1,11 +1,4 @@
-export function createMemoryUI({
-  api,
-  state,
-  escapeHtml: esc,
-  icon,
-  renderPage,
-  toast,
-}) {
+export function createMemoryUI({ api, state, escapeHtml: esc, icon, renderPage, toast }) {
   let overview,
     selected = '',
     query = '',
@@ -47,7 +40,13 @@ export function createMemoryUI({
       offset = 0;
       selected = '';
     }
-    const tabs = `<nav class="workspace-tabs" aria-label="记忆分类"><a href="#memory/members" ${section === 'members' ? 'aria-current="page"' : ''}>群友记忆</a><a href="#memory/summaries" ${section === 'summaries' ? 'aria-current="page"' : ''}>压缩记忆</a></nav>`;
+    const tabs = `<nav class="workspace-tabs" aria-label="记忆分类">${[
+      ['members', '群友记忆'],
+      ['summaries', '压缩记忆'],
+      ['notebook', '鱼的记事本'],
+    ]
+      .map(([id, label]) => `<a href="#memory/${id}" ${section === id ? 'aria-current="page"' : ''}>${label}</a>`)
+      .join('')}</nav>`;
     overview = await api('/api/memory');
     if (!overview.available)
       return (
@@ -73,9 +72,13 @@ export function createMemoryUI({
     try {
       data = await api(
         '/api/memory/' +
-          (section === 'members' ? 'members' : 'summaries') +
+          section +
           common +
-          (section === 'members' ? '&query=' + encodeURIComponent(query) + '&status=' + status : '&source=' + source),
+          (section === 'members'
+            ? '&query=' + encodeURIComponent(query) + '&status=' + status
+            : section === 'summaries'
+              ? '&source=' + source
+              : ''),
       );
     } catch (e) {
       error = e.message;
@@ -92,19 +95,30 @@ export function createMemoryUI({
           ]
             .map(([id, label]) => `<option value="${id}" ${status === id ? 'selected' : ''}>${label}</option>`)
             .join('')}</select></div>`
-        : `<div class="field"><label for="memory-source">摘要来源</label><select id="memory-source">${[
-            ['all', '全部来源'],
-            ['history', '本地历史摘要'],
-            ['native', 'DSH 原生压缩'],
-          ]
-            .map(([id, label]) => `<option value="${id}" ${source === id ? 'selected' : ''}>${label}</option>`)
-            .join('')}</select></div>`
+        : section === 'summaries'
+          ? `<div class="field"><label for="memory-source">摘要来源</label><select id="memory-source">${[
+              ['all', '全部来源'],
+              ['history', '本地历史摘要'],
+              ['native', 'DSH 原生压缩'],
+            ]
+              .map(([id, label]) => `<option value="${id}" ${source === id ? 'selected' : ''}>${label}</option>`)
+              .join('')}</select></div>`
+          : ''
     }<button class="button" type="button" data-memory-refresh>${icon('refresh')}刷新</button></form></section>`;
     let body;
     if (error)
       body = `<section class="card" role="alert"><h2>记忆暂时无法读取</h2><p>${esc(error)}</p><button class="button" data-memory-refresh>重新读取</button></section>`;
     else if (section === 'members')
       body = `<div class="memory-stat-strip" aria-label="此群的记忆统计"><p><strong>${data.stats.members}</strong> 已记录群友</p><p><strong>${data.stats.tags}</strong> 互动标签</p><p><strong>${data.stats.tentative}</strong> 待观察标签</p><span>${data.enabled ? '正在记录此群' : '此群记录已暂停，已有记忆保留'}</span></div><p class="scope-note">${icon('info')}标签来自有限互动，仅作接话参考；少于 3 条独立证据为待观察，90 天前的证据不再计入。同名群友按稳定标识区分。</p><div class="memory-member-grid">${data.members.map(memberCard).join('') || `<section class="card empty-state"><h2>${query || status !== 'all' ? '没有匹配的群友' : '此群尚无群友记忆'}</h2><p>${query || status !== 'all' ? '试试其他昵称、成员 ID 或标签状态。' : '开启群友记忆后，在已允许的群聊中交流，记录会自动出现在这里。'}</p></section>`}</div>${pagination(data)}`;
+    else if (section === 'notebook')
+      body = `${data.errors ? '<p class="inline-error" role="alert">此页有日记暂时无法读取。</p>' : ''}<div class="memory-timeline">${
+        data.entries
+          .map(
+            (entry, index) =>
+              `<details class="memory-summary" ${index === 0 ? 'open' : ''}><summary><span><strong>${esc(entry.date)}</strong><small>${esc(entry.personaName)}</small></span>${icon('arrow')}</summary><div class="memory-summary-body"><pre>${esc(entry.text)}</pre></div></details>`,
+          )
+          .join('') || '<section class="card empty-state"><h2>此聊天尚无可查看的日记</h2></section>'
+      }</div>${pagination(data)}`;
     else
       body = `<div class="memory-stat-strip"><p><strong>${data.historyTotal}</strong> 本地历史摘要</p><span>${source === 'history' ? '当前仅查看本地历史摘要' : data.nativeStatus === 'saved' ? '正在查看已保存的 DSH 原生摘要' : data.nativeAvailable ? 'DSH 原生摘要已连接' : 'DSH 原生摘要暂不可用，可继续查看本地历史摘要'}</span></div><p class="scope-note">${icon('info')}本地历史摘要供历史检索使用；DSH 原生摘要用于会话上下文压缩。摘要可能遗漏细节，查看不会重新生成摘要。</p>${data.historyError ? `<p class="inline-error" role="alert">${esc(data.historyError)}</p>` : ''}<div class="memory-timeline">${rows.map(summaryCard).join('') || '<section class="card empty-state"><h2>此来源尚无可查看的压缩记忆</h2><p>完成历史摘要或 DSH 压缩后刷新；连接已加载该会话的 DSH 可读取最新摘要。</p></section>'}</div>${pagination(data)}<p class="subtle">展示最近 200 份本地历史摘要与最近 50 份已保存或已加载会话的 DSH 原生摘要。${data.historyLimited ? '更早的本地摘要仍保存在数据库中。' : ''}</p>`;
     return tabs + `<div class="section-stack memory-page">${selector}${body}</div>`;

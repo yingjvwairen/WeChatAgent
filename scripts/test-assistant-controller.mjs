@@ -1,3 +1,4 @@
+import { matchesConversationGrant } from '../packages/wechat-identity.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -20,7 +21,7 @@ import {
   AssistantNotifications,
   isSilentAssistantNotification,
 } from '../packages/dsh-social-bridge-plugin/assistant-notifications.mjs';
-const key = 'wechat:group:123',
+const key = 'wechat:group:123@chatroom',
   sender = 'wxid_admin',
   member = 'wxid_member',
   taskId = 'T0123456789abcdef';
@@ -47,8 +48,8 @@ const request = (batch = 'a', extra = {}) => ({
 const config = () => ({
   persona: { default: 'fixture' },
   wechat: {
-    whitelist: { groups: ['123', '456'], private: [] },
-    workModes: { [key]: 'assistant', 'wechat:group:456': 'assistant' },
+    whitelist: { groups: ['123@chatroom', '456@chatroom'], private: [] },
+    workModes: { [key]: 'assistant', 'wechat:group:456@chatroom': 'assistant' },
     assistant: { administrators: [sender], adminOnlyGroups: { [key]: false } },
     dshAccess: { chats: { [key]: { skills: [], tools: [] } } },
   },
@@ -94,7 +95,7 @@ test('per-chat execution is serialized; another chat proceeds independently and 
   );
   const a = tasks.submit(request('a')),
     b = tasks.submit(request('b')),
-    c = tasks.submit(request('c', { conversationKey: 'wechat:group:456' }));
+    c = tasks.submit(request('c', { conversationKey: 'wechat:group:456@chatroom' }));
   await wait(() => releases.length === 2);
   assert.equal(tasks.get(b.id).state, 'queued');
   tasks.cancel(a.id);
@@ -386,7 +387,7 @@ test('durable task lookups and cancellation never expose another sender or chat'
   await assert.rejects(f.control('result', f.body({ senderWxid: member, taskId: job.id })), /ADMIN_REQUIRED/);
   await assert.rejects(f.control('list', f.body({ senderWxid: member })), /ADMIN_REQUIRED/);
   await assert.rejects(
-    f.control('result', f.body({ conversationKey: 'wechat:group:456', taskId: job.id })),
+    f.control('result', f.body({ conversationKey: 'wechat:group:456@chatroom', taskId: job.id })),
     /NOT_FOUND/,
   );
   assert((await f.control('status', f.body({ taskId: job.id }))).running);
@@ -555,4 +556,48 @@ test('short RPC polling returns the original result on replay and only submits t
   assert.equal(await client.followup(key, '执行测试任务', meta), 'RESPOND: 实际完成');
   assert.equal(await client.followup(key, '执行测试任务', meta), 'RESPOND: 实际完成');
   assert.equal(f.tasks.jobs.size, 1);
+});
+
+test('re-adding a chat cannot reactivate a queued task or a pending approval', async t => {
+  const allowed = (key, sender, grant) =>
+    matchesConversationGrant(f.c.wechat, key, grant) && f.c.wechat.assistant.administrators.includes(sender);
+  const f = controlFixture(t);
+  f.tasks.allowed = allowed;
+  f.c.wechat.rosterGrants = { [key]: 'first-grant' };
+  f.c.wechat.dshAccess.chats[key].remoteApproval = true;
+  f.save();
+  const active = f.tasks.submit(request('a', { rosterGrant: 'first-grant' }));
+  const queued = f.tasks.submit(request('b', { rosterGrant: 'first-grant' }));
+  await wait(() => f.tasks.get(active.id).state === 'running');
+  f.pending.set('session-1', { taskId: active.id });
+  const agent = {
+    session: {
+      id: 'session-1',
+      snapshotEvents: () => [
+        { type: 'tool/call', data: { callId: 'fixture-call', arguments: { path: 'fixture.txt' } } },
+      ],
+    },
+  };
+  const approval = f.ask({ agent, callId: 'fixture-call', toolName: 'fixture-tool' }, async () =>
+    assert.fail('unexpected fallback'),
+  );
+  await wait(() => f.tasks.get(active.id).state === 'waiting_approval');
+  const token = f.tasks.get(active.id).approval.id;
+  f.c.wechat.rosterGrants[key] = 'second-grant';
+  f.save();
+  await assert.rejects(f.control('approve', f.body({ token, rosterGrant: 'second-grant' })), {
+    code: 'ASSISTANT_GRANT_CHANGED',
+  });
+  assert.equal(await f.ask({ agent }, async () => assert.fail('revoked task cannot fall through')), 'cancelled');
+  await assert.rejects(f.control('result', f.body({ taskId: active.id, rosterGrant: 'second-grant' })), {
+    code: 'ASSISTANT_GRANT_CHANGED',
+  });
+  // Release the running fixture so the older queued task is checked at dequeue.
+  f.tasks.active.delete(active.id);
+  f.tasks.pump();
+  assert.equal(f.tasks.get(queued.id).state, 'cancelled');
+  const newTask = f.tasks.submit(request('b', { rosterGrant: 'second-grant' }));
+  assert.notEqual(newTask.id, queued.id);
+  f.control.dispose();
+  assert.equal(await approval, 'cancelled');
 });

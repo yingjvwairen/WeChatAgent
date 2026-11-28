@@ -412,6 +412,7 @@ export class ProactiveEngine {
         deliveryId: job.id,
         source: 'proactive',
         contextId: job.snapshot,
+        expiresAt: job.expiresAt,
       });
     } catch (error) {
       if (['PROACTIVE_NOT_ALLOWED', 'PROACTIVE_CONTEXT_CHANGED', 'CONVERSATION_NOT_ALLOWED'].includes(error.code)) {
@@ -422,6 +423,7 @@ export class ProactiveEngine {
       this.log(`[Proactive] ${key} send_pending code=${error.code ?? 'unknown'}`);
       return;
     }
+    if (delivery?.pending === true) return;
     const at = this.now(),
       status = delivery?.delivered === 'unconfirmed' ? 'unconfirmed' : 'confirmed';
     this.buffer.completeReply(

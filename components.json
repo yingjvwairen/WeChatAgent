@@ -1,6 +1,6 @@
 {
   "project": "WeChatAgent",
-  "version": "0.3.6",
+  "version": "0.4.5",
   "distribution": "source-only",
   "components": [
     {
@@ -37,14 +37,6 @@
   ],
   "externalComponents": [
     {
-      "name": "WeChat-Hook",
-      "upstream": "https://github.com/aixed/WeChat-Hook",
-      "commit": "e905d07ade50d2c6472e4eb3bd4f3fe19cf662c6",
-      "targetWeChat": "4.1.10.27",
-      "distributed": false,
-      "license": "Overall license not confirmed"
-    },
-    {
       "name": "WeFlow Desktop reference",
       "upstream": "https://github.com/hicccc77/WeFlow",
       "sourceLicense": "CC-BY-NC-SA-4.0",
@@ -68,5 +60,5 @@
     "洛奇希",
     "示例助手"
   ],
-  "redistributionAuthorization": "Maintainer confirmed authorization to redistribute all currently used components. Public source excludes vendor binaries and third-party Hook source; own additions do not replace upstream licenses."
+  "redistributionAuthorization": "Public source excludes proprietary desktop clients and personal data; third-party components retain their own licenses."
 }

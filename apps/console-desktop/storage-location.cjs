@@ -103,7 +103,7 @@ function rebasePath(value, mappings) {
   return value;
 }
 const pathKey =
-  /^(?:path|file|filename|filePath|sourcePath|targetPath|cachePath|imagePath|directory|root|projectRoot|project_root|cwd|python|node|dsh|dshDesktop|wechatExecutable|statePath|stateFile|dataHome|tokenFile|outgoingPath)$/i;
+  /^(?:path|file|filename|filePath|sourcePath|targetPath|cachePath|imagePath|directory|root|projectRoot|project_root|cwd|python|node|dsh|dshDesktop|wechatExecutable|statePath|stateFile|dataHome|tokenFile|outgoingPath|modelDirectory|profiles|gptWeights|sovitsWeights|refAudio)$/i;
 function rebaseJson(value, mappings, key = '', databaseBase = mappings[0][0]) {
   if (
     key === 'dbPath' &&
@@ -310,6 +310,20 @@ function deploymentStorageOptions(report, dataHome) {
     externalDshHome: report.dshRetained || report.managedDsh === false ? report.oldDshHome : undefined,
   };
 }
+
+async function moveMigrationDirectory(source, destination) {
+  for (let retry = 0; ; retry++) {
+    if (fs.existsSync(destination)) throw Error('目标目录在迁移期间发生变化，尚未覆盖任何已有数据。');
+    try {
+      await fs.promises.rename(source, destination);
+      return;
+    } catch (error) {
+      if (process.platform !== 'win32' || retry >= 3 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+      await new Promise(resolve => setTimeout(resolve, 30 * 2 ** retry));
+    }
+  }
+}
+
 async function prepareDataHome(
   plan,
   { checkIdle = assertMigrationIdle, progress = () => {}, verify = async () => {}, legacyDshHome } = {},
@@ -450,8 +464,7 @@ async function prepareDataHome(
       ...(fs.existsSync(path.join(stage, 'backups')) ? ['backups'] : []),
     ]) {
       const destination = path.join(home, name);
-      if (fs.existsSync(destination)) throw Error('目标目录在迁移期间发生变化，尚未覆盖任何已有数据。');
-      await fs.promises.rename(path.join(stage, name), destination);
+      await moveMigrationDirectory(path.join(stage, name), destination);
       published.push(destination);
     }
     for (const name of ['window.json', 'background.png', 'background.jpg']) {
@@ -490,7 +503,7 @@ async function prepareDataHome(
       let recovered = true;
       for (const folder of published.reverse())
         if (within(home, folder) && !same(home, folder))
-          await fs.promises.rename(folder, path.join(stage, path.basename(folder))).catch(() => {
+          await moveMigrationDirectory(folder, path.join(stage, path.basename(folder))).catch(() => {
             recovered = false;
           });
       if (recovered) await removeStage().catch(() => {});

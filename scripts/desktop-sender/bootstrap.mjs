@@ -1,3 +1,4 @@
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -29,7 +30,11 @@ const SEARCH_POPUP_42053 = Object.freeze({
   extendedStyle: 524416,
 });
 export function defaultSearchPopup(account) {
-  if (account?.executableVersion !== '4.2.0.53' || !digest(account.accountRef) || !digest(account.executableSha256))
+  if (
+    account?.executableVersion !== DESKTOP_WECHAT_VERSION ||
+    !digest(account.accountRef) ||
+    !digest(account.executableSha256)
+  )
     throw fault('DESKTOP_SEARCH_POPUP_REQUIRED');
   return {
     version: 1,
@@ -45,7 +50,7 @@ export function bootstrapBinding(account) {
   const source = account?.binding;
   if (
     account?.readOnly !== true ||
-    account.executableVersion !== '4.2.0.53' ||
+    account.executableVersion !== DESKTOP_WECHAT_VERSION ||
     !digest(account.executableSha256) ||
     !digest(account.accountRef) ||
     typeof account.accountWxid !== 'string' ||
@@ -146,7 +151,7 @@ export async function bootstrapDesktopSender({
   if (
     !path.isAbsolute(root ?? '') ||
     !['uia', 'ocr'].includes(settings?.controlMode) ||
-    settings.expectedVersion !== '4.2.0.53' ||
+    settings.expectedVersion !== DESKTOP_WECHAT_VERSION ||
     !samePath(settings.executable, account?.executable)
   )
     throw fault('DESKTOP_BOOTSTRAP_CONFIG_INVALID');

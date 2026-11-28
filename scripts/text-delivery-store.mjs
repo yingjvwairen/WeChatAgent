@@ -3,14 +3,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
-const validRejection = value =>
-  value === undefined ||
-  (value &&
-    typeof value === 'object' &&
-    /^(NATIVE_SEND_REJECTED|API_HTTP_(400|401|403|409|429))$/.test(value.code ?? '') &&
-    Number.isSafeInteger(value.at) &&
-    value.at >= 0 &&
-    (value.nativeRet === undefined || Number.isSafeInteger(value.nativeRet)));
 export class TextDeliveryStore {
   constructor(directory) {
     this.directory = directory;
@@ -27,16 +19,11 @@ export class TextDeliveryStore {
       item.key !== key ||
       !['dispatching', 'accepted', 'unconfirmed', 'rejected', 'confirmed'].includes(item.state) ||
       typeof item.account !== 'string' ||
-      typeof item.wxid !== 'string' ||
+      typeof item.target !== 'string' ||
       typeof item.text !== 'string' ||
       !item.text.trim() ||
       Buffer.byteLength(item.text) > 16000 ||
-      !Number.isFinite(item.startedAt) ||
-      !Array.isArray(item.baseline) ||
-      item.baseline.length > 100 ||
-      item.baseline.some(id => !/^\d+$/.test(id)) ||
-      !validRejection(item.rejection) ||
-      !validRejection(item.firstRejection)
+      !Number.isFinite(item.startedAt)
     )
       throw Error('TEXT_DELIVERY_STATE_INVALID');
     return item;
@@ -45,8 +32,12 @@ export class TextDeliveryStore {
     if (!/^[a-f0-9]{64}$/.test(item.key)) throw Error('TEXT_DELIVERY_STATE_INVALID');
     fs.mkdirSync(this.directory, { recursive: true });
     const file = path.join(this.directory, item.key + '.json'),
-      temp = file + '.' + process.pid + '.tmp';
-    fs.writeFileSync(temp, JSON.stringify(item), { mode: 0o600 });
-    fs.renameSync(temp, file);
+      temp = file + '.' + crypto.randomUUID() + '.tmp';
+    try {
+      fs.writeFileSync(temp, JSON.stringify(item), { flag: 'wx', mode: 0o600, flush: true });
+      fs.renameSync(temp, file);
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
   }
 }

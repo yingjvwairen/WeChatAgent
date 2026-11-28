@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { FishNotebookStore } from '../packages/dsh-social-bridge-plugin/fish-notebook-store.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -14,7 +15,7 @@ import { consoleRoute } from '../public/console/layout-model.mjs';
 const account = 'a'.repeat(64),
   member = 'b'.repeat(64),
   other = 'c'.repeat(64),
-  group = 'wechat:group:123',
+  group = 'wechat:group:123@chatroom',
   friend = 'wechat:private:456',
   clock = Date.now(),
   esc = value =>
@@ -29,7 +30,7 @@ function fixture(t) {
     fs.rmSync(root, { recursive: true, force: true });
   });
   const config = JSON.parse(fs.readFileSync('config/wechatagent.example.json', 'utf8'));
-  config.wechat.whitelist = { groups: ['123'], private: ['456'] };
+  config.wechat.whitelist = { groups: ['123@chatroom'], private: ['456'] };
   for (const dir of ['config', 'state/weflow', 'roles']) fs.mkdirSync(path.join(root, dir), { recursive: true });
   const configFile = path.join(root, 'config/wechatagent.json');
   fs.writeFileSync(configFile, JSON.stringify(config));
@@ -83,7 +84,12 @@ function fixture(t) {
       tags: [{ label: '语气温和', evidenceIds: observations.map(r => r.evidenceId) }],
     });
     memory.update(turn, { memberId: other, tags: [{ label: '喜欢提问', evidenceIds: ['e'.repeat(32)] }] });
-    return path.join(root, 'state/member-memory', account, '123.json');
+    return path.join(
+      root,
+      'state/member-memory',
+      account,
+      crypto.createHash('sha256').update('wechat:group:123@chatroom').digest('hex') + '.json',
+    );
   };
   return { root, config, configFile, view, params, remember, requests, offline: () => (offline = true) };
 }
@@ -127,7 +133,7 @@ test('account switches, disallowed chats, private member lookups and directory t
   const f = fixture(t);
   f.remember();
   assert.throws(() => f.view.members(f.params(group, { scope: other })), /账号已切换/);
-  assert.throws(() => f.view.members(f.params('wechat:group:999')), /聊天范围/);
+  assert.throws(() => f.view.members(f.params('wechat:group:999@chatroom')), /聊天范围/);
   assert.throws(() => f.view.members(f.params(friend)), /只适用于群聊/);
   assert.throws(() => f.view.members(f.params('wechat:group:..\\456')), /聊天范围/);
   fs.writeFileSync(path.join(f.root, 'state/weflow/active-account.json'), JSON.stringify({ id: other }));
@@ -287,6 +293,37 @@ test('console memory routes require the console token and preserve configuration
   assert.equal(result.status, 200);
   assert.equal((await result.json()).total, 2);
   assert.deepEqual([fingerprint(file), fingerprint(f.configFile)], before);
+  const store = new FishNotebookStore(f.root, account);
+  const diary = {
+    id: '2026-10-25-' + 'e'.repeat(16),
+    version: 1,
+    accountScope: account,
+    conversationKey: friend,
+    date: '2026-10-25',
+    personaName: '小鱼',
+    personaDigest: 'd'.repeat(64),
+    text: '已保存的日记',
+    createdAt: clock,
+    sourceCount: 1,
+    visitors: {},
+  };
+  store.write(diary);
+  const journalFile = store.file(friend, diary.id);
+  const journal = fingerprint(journalFile);
+  const url = base + '/api/memory/notebook?' + f.params(friend);
+  assert.equal((await fetch(url)).status, 401);
+  const notebooks = await fetch(url, { headers }).then(r => r.json());
+  assert.equal(notebooks.entries[0].text, diary.text);
+  assert.equal(notebooks.entries[0].visitors, undefined);
+  assert.equal(fingerprint(journalFile), journal);
+  assert.equal(
+    (await fetch(base + '/api/memory/notebook?' + f.params('wechat:private:unlisted'), { headers })).status,
+    403,
+  );
+  assert.equal(
+    (await fetch(base + '/api/memory/notebook?' + f.params(friend, { scope: 'f'.repeat(64) }), { headers })).status,
+    409,
+  );
   for (const name of ['memory-view.js', 'memory-view.css']) assert.equal((await fetch(base + '/' + name)).status, 200);
 });
 test('memory pages escape labels and summaries, retain drafts and expose filtering, pagination and source states', async t => {
@@ -332,6 +369,7 @@ test('memory pages escape labels and summaries, retain drafts and expose filteri
   assert(html.includes('复制摘要'));
   assert.equal(JSON.stringify(state.draft), before);
   assert.deepEqual(consoleRoute('#memory/summaries'), { page: 'memory', section: 'summaries' });
+  assert.deepEqual(consoleRoute('#memory/notebook'), { page: 'memory', section: 'notebook' });
   assert.equal(consoleRoute('#memory/invalid').section, 'members');
   assert(requests.every(route => route.startsWith('/api/memory')));
 });

@@ -1,49 +1,25 @@
+import { parseChatKey, validChatId } from '../packages/wechat-identity.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { encodeVoice, validateSilk, voicePcm } from './decode-wechat-voice.mjs';
-import { VoiceSynthesis, outputFeature } from './voice-synthesis.mjs';
+import speechContract from '../packages/speech-contract/local-model-fields.json' with { type: 'json' };
+import { voicePcm } from './decode-wechat-voice.mjs';
+import { VoiceSynthesis, outputFeature, dialogueFeature, maxReplyChars } from './voice-synthesis.mjs';
+import { conversationGrant } from '../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 
 const route = '/api/voice/send';
 const textRoute = '/api/voice/send-text';
-const maxWavBytes = 2 * 1024 * 1024;
+const maxWavBytes = 32 * 1024 * 1024;
 const maxRequestBytes = 4 * Math.ceil(maxWavBytes / 3) + 1024;
 const deliveryPattern = /^[A-Za-z0-9_-]{1,80}$/;
 // Host-owned deliveries (Realtime turns, DSH voice replies) cannot be claimed by API callers.
 const dialogueId = /^(?:realtime|dsh)-[a-f0-9]{64}$/;
-const chatPattern = /^wechat:(private|group):([1-9][0-9]{0,15})$/;
 const operationPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
-const nativeReceiptRoute = '/WeChatAgent/voice-deliveries/';
 const bad = (code, status) => Object.assign(new Error(code), { code, status });
 const sha256 = data => crypto.createHash('sha256').update(data).digest('hex');
 const localId = value => Number.isSafeInteger(Number(value)) && /^[1-9][0-9]*$/.test(String(value));
 const serverId = value => /^[1-9][0-9]{0,31}$/.test(String(value));
-const fingerprintWindowMs = 60000;
-
-function applyHelperMapping(job, mapping) {
-  if (mapping?.operationId !== job.operationId || mapping.state !== 'accepted') return false;
-  const exactTarget = mapping.target === job.wxid;
-  if (!exactTarget && !(mapping.target === undefined && job.wxid === 'filehelper')) return false;
-  const messageId = exactTarget && localId(mapping.localId) ? String(mapping.localId) : undefined;
-  const changed = !job.submitted || Boolean(messageId && !job.localId);
-  job.submitted = true;
-  if (messageId && !job.localId) job.localId = messageId;
-  return changed;
-}
-
-function applyNativeMapping(job, mapping) {
-  if (!job.receiptAccount || mapping?.operationId !== job.operationId || mapping.target !== job.wxid) return false;
-  if (mapping.state === 'accepted' && mapping.ret === 0 && !job.submitted) {
-    job.submitted = true;
-    return true;
-  }
-  if (mapping.state === 'rejected' && mapping.ret === 1 && !job.submitted && !job.rejected) {
-    job.rejected = true;
-    return true;
-  }
-  return false;
-}
 
 function replaceFile(file, value) {
   const temp = file + '.' + crypto.randomUUID() + '.tmp';
@@ -91,21 +67,15 @@ async function readUpload(req, textOnly) {
     throw bad('VOICE_INVALID_REQUEST', 400);
   }
   const { conversationKey, deliveryId, wavBase64, text } = data ?? {};
-  const chat = typeof conversationKey === 'string' && chatPattern.exec(conversationKey);
-  if (
-    !chat ||
-    !Number.isSafeInteger(Number(chat[2])) ||
-    typeof deliveryId !== 'string' ||
-    !deliveryPattern.test(deliveryId) ||
-    dialogueId.test(deliveryId)
-  ) {
+  const chat = parseChatKey(conversationKey);
+  if (!chat || typeof deliveryId !== 'string' || !deliveryPattern.test(deliveryId) || dialogueId.test(deliveryId)) {
     throw bad('VOICE_INVALID_REQUEST', 400);
   }
   if (textOnly) {
-    if (wavBase64 !== undefined || typeof text !== 'string' || !text.trim() || text.length > 4096) {
+    if (wavBase64 !== undefined || typeof text !== 'string' || !text.trim() || text.length > maxReplyChars) {
       throw bad('VOICE_TTS_INVALID_TEXT', 400);
     }
-    return { deliveryId, kind: chat[1], target: chat[2], text: text.trim() };
+    return { deliveryId, kind: chat.kind, target: chat.id, text: text.trim() };
   }
   if (
     text !== undefined ||
@@ -118,7 +88,7 @@ async function readUpload(req, textOnly) {
   const wav = Buffer.from(wavBase64, 'base64');
   if (wav.length > maxWavBytes) throw bad('VOICE_TOO_LARGE', 413);
   if (wav.toString('base64') !== wavBase64) throw bad('VOICE_INVALID_REQUEST', 400);
-  return { deliveryId, kind: chat[1], target: chat[2], wav };
+  return { deliveryId, kind: chat.kind, target: chat.id, wav };
 }
 
 export class VoiceSend {
@@ -130,6 +100,8 @@ export class VoiceSend {
     this.active = new Set();
     this.receiptPolls = new Set();
     this.requests = 0;
+    this.closed = false;
+    this.pollControllers = new Map();
   }
 
   handle(req, res) {
@@ -197,14 +169,13 @@ export class VoiceSend {
       const job = JSON.parse(fs.readFileSync(this.file(deliveryId), 'utf8'));
       if (
         job.deliveryId !== deliveryId ||
-        job.version !== 1 ||
+        job.version !== 2 ||
+        job.transport !== 'desktop' ||
         !operationPattern.test(job.operationId) ||
-        !chatPattern.test('wechat:' + job.kind + ':' + job.target) ||
-        !Array.isArray(job.baseline) ||
+        !validChatId(job.kind, job.target) ||
         !Number.isSafeInteger(job.startedAt) ||
         !Number.isSafeInteger(job.deadline) ||
-        (job.localId !== undefined && !localId(job.localId)) ||
-        (job.silkSha256 !== undefined && !/^[a-f0-9]{64}$/.test(job.silkSha256))
+        (job.localId !== undefined && !localId(job.localId))
       )
         throw bad('VOICE_STATE_INVALID', 503);
       return job;
@@ -229,167 +200,132 @@ export class VoiceSend {
     replaceFile(dest, JSON.stringify(job));
   }
 
-  fingerprintFile(job) {
-    return path.join(
-      this.directory,
-      'content-claims',
-      sha256(JSON.stringify([job.receiptAccount ?? job.senderAccount, job.wxid, job.silkSha256])),
-    );
-  }
-
-  reserveFingerprint(job) {
-    const file = this.fingerprintFile(job);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const options = { flag: 'wx', flush: true, mode: 0o600 };
-    try {
-      fs.writeFileSync(file, job.deliveryId, options);
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      const previous = this.load(fs.readFileSync(file, 'utf8'));
-      if (
-        previous &&
-        this.fingerprintFile(previous) === file &&
-        this.ownsUniqueFingerprint(previous) &&
-        (previous.rejected || (previous.confirmed && job.baseline.includes(previous.localId)))
-      ) {
-        replaceFile(file, job.deliveryId);
-        return;
-      }
-      // An unresolved earlier send makes these bytes ambiguous for both deliveries.
-      try {
-        fs.writeFileSync(file + '.multiple', '', options);
-      } catch (markerError) {
-        if (markerError.code !== 'EEXIST') throw markerError;
-      }
-    }
-  }
-
-  ownsUniqueFingerprint(job) {
-    if (!job.silkSha256) return false;
-    const file = this.fingerprintFile(job);
-    try {
-      if (fs.readFileSync(file, 'utf8') !== job.deliveryId) return false;
-    } catch (error) {
-      if (error.code === 'ENOENT') return false;
-      throw error;
-    }
-    try {
-      fs.statSync(file + '.multiple');
-      return false;
-    } catch (error) {
-      if (error.code === 'ENOENT') return true;
-      throw error;
-    }
-  }
-
   checkAllowed(kind, target) {
     this.adapter.reload();
-    if (this.adapter.stopped) throw bad('VOICE_BACKEND_UNAVAILABLE', 503);
+    if (this.closed || this.adapter.stopped) throw bad('VOICE_BACKEND_UNAVAILABLE', 503);
     if (!this.adapter.allowed(kind, target)) throw bad('VOICE_CONVERSATION_NOT_ALLOWED', 403);
   }
 
-  async identity(kind, target, job) {
+  async identity(kind, target, job, expectedRosterGrant) {
     this.checkAllowed(kind, target);
-    const { account, senderAccount, receiptAccount, voiceSenderWxid, voiceSend, voiceTransport, voiceTargets } =
-      await this.adapter.checkNative();
-    const wxid = await this.adapter.resolveTarget(kind, target);
+    const identity = await this.adapter.checkNative();
+    await this.adapter.lookupTarget(kind, target);
     this.checkAllowed(kind, target);
+    if (identity.voiceTransport !== 'desktop') throw bad('VOICE_BACKEND_UNAVAILABLE', 503);
+    const rosterGrant = conversationGrant(this.adapter.project.wechat, 'wechat:' + kind + ':' + target);
+    if (expectedRosterGrant !== undefined && expectedRosterGrant !== rosterGrant)
+      throw bad('VOICE_CONVERSATION_GRANT_CHANGED', 403);
     if (
       job &&
-      (job.account !== account ||
-        job.wxid !== wxid ||
-        (job.senderAccount && job.senderAccount !== senderAccount) ||
-        (job.receiptAccount && job.receiptAccount !== receiptAccount))
-    ) {
+      (job.account !== identity.account ||
+        (job.accountRef !== undefined && job.accountRef !== this.adapter.accountRef) ||
+        (job.rosterGrant !== undefined && job.rosterGrant !== rosterGrant) ||
+        job.target !== target ||
+        job.kind !== kind ||
+        (job.recordingAccount && job.recordingAccount !== identity.recordingAccount))
+    )
       throw bad('VOICE_ACCOUNT_OR_TARGET_CHANGED', 409);
-    }
-    if (voiceTargets && !voiceTargets.includes(wxid)) {
-      throw bad(voiceTransport === 'helper' ? 'VOICE_HELPER_TARGET_NOT_ALLOWED' : 'VOICE_HOOK_TARGET_NOT_ALLOWED', 403);
-    }
+    return { ...identity, kind, target, rosterGrant };
+  }
+
+  pluginGrant(identity, kind, target, selected, feature = outputFeature) {
     return {
-      account,
-      senderAccount,
-      receiptAccount,
-      voiceSenderWxid,
-      wxid,
-      voiceSend,
-      voiceTransport: voiceTransport ?? 'native',
+      id: selected.id,
+      generation: selected.generation,
+      feature,
+      account: identity.account,
+      accountRef: identity.accountRef,
+      target,
+      rosterGrant: conversationGrant(this.adapter.project.wechat, 'wechat:' + kind + ':' + target),
     };
   }
 
-  async sendText({ deliveryId, kind, target, text }) {
-    return this.generateAndSend({ deliveryId, kind, target, text });
+  checkPlugin(job) {
+    if (!job.voicePlugin) return;
+    const grant = job.voicePlugin,
+      feature = grant.feature ?? outputFeature;
+    if (![outputFeature, dialogueFeature].includes(feature)) throw bad('VOICE_TTS_PERMISSION_CHANGED', 403);
+    const candidates = this.synthesis.candidates('wechat:' + job.kind + ':' + job.target, feature);
+    if (
+      candidates.length !== 1 ||
+      candidates[0].id !== grant.id ||
+      candidates[0].generation !== grant.generation ||
+      grant.account !== job.account
+    )
+      throw bad('VOICE_TTS_PERMISSION_CHANGED', 403);
   }
 
-  // Whether this chat can receive a synthesized voice reply right now.
-  async capability(kind, target) {
-    let identity;
+  async capability(kind, target, expectedRosterGrant) {
     try {
-      identity = await this.identity(kind, target);
+      const identity = await this.identity(kind, target, undefined, expectedRosterGrant);
+      return {
+        voice:
+          identity.voiceSend === true &&
+          this.synthesis.candidates('wechat:' + kind + ':' + target, outputFeature).length === 1,
+      };
     } catch {
       return { voice: false };
     }
-    if (!identity.voiceSend || (identity.voiceTransport === 'desktop' && identity.wxid !== 'filehelper'))
-      return { voice: false };
-    return { voice: this.synthesis.candidates('wechat:' + kind + ':' + target, outputFeature).length === 1 };
+  }
+  sendText(upload) {
+    return this.generateAndSend(upload);
   }
 
-  // A DSH reply chosen as voice. The bridge's 64-hex delivery ID names one
-  // logical reply; retries query the same delivery. fallback is true only when
-  // nothing was submitted, so the caller may send the same text once instead.
-  async speakReply({ kind, target, text, deliveryId }) {
+  async speakReply({ kind, target, text, deliveryId, expectedRosterGrant, receiptOnly = false, observeOnly = false }) {
     const id = 'dsh-' + deliveryId;
-    if (!dialogueId.test(id) || typeof text !== 'string' || !text.trim() || text.length > 4096)
+    if (!dialogueId.test(id) || typeof text !== 'string' || !text.trim() || text.length > maxReplyChars)
       throw bad('VOICE_INVALID_REQUEST', 400);
-    if (this.active.has(id)) return { deliveryId: id, status: 'pending' };
+    if (this.active.has(id)) return { deliveryId: id, status: 'pending', fallback: false };
     this.active.add(id);
-    const submitted = () => {
+    const mayHaveSubmitted = () => {
       const job = this.load(id);
-      return (
-        !!job && !!(job.submitted || job.localId || job.confirmed || (job.synthesisState === 'ready' && !job.rejected))
-      );
+      return !!job && (job.sendIntent || job.submitted || job.confirmed);
     };
     try {
       const job = this.load(id);
       let result;
+      if (!job && receiptOnly) return { deliveryId: id, status: 'unconfirmed', fallback: false };
       if (job) {
-        if (job.kind !== kind || job.target !== target || job.textSha256 !== sha256(text.trim()))
+        if (job.kind !== kind || job.target !== String(target) || job.textSha256 !== sha256(text.trim()))
           throw bad('VOICE_DELIVERY_ID_CONFLICT', 409);
-        result = await this.status(job, null);
-      } else {
+        result = await this.status(job, null, observeOnly, expectedRosterGrant);
+      } else
         try {
-          result = await this.generateAndSend({ deliveryId: id, kind, target, text: text.trim() });
+          result = await this.generateAndSend({ deliveryId: id, kind, target, text: text.trim(), expectedRosterGrant });
         } catch (error) {
-          const code =
-            typeof error.code === 'string' && error.code.startsWith('VOICE_')
-              ? error.code
-              : 'VOICE_BACKEND_UNAVAILABLE';
-          return { deliveryId: id, status: 'rejected', error: code, fallback: !submitted() };
+          return {
+            deliveryId: id,
+            status: 'rejected',
+            error: /^VOICE_[A-Z_]+$/.test(error.code ?? '') ? error.code : 'VOICE_BACKEND_UNAVAILABLE',
+            fallback:
+              !['VOICE_CONVERSATION_GRANT_CHANGED', 'VOICE_ACCOUNT_OR_TARGET_CHANGED'].includes(error.code) &&
+              !mayHaveSubmitted(),
+          };
         }
-        if (result.status === 'pending') this.followReceipt(id);
-      }
-      return { ...result, fallback: result.status === 'rejected' && !submitted() };
+      if (!observeOnly && result.status === 'pending') this.followReceipt(id);
+      return { ...result, fallback: result.status === 'rejected' && !mayHaveSubmitted() };
     } finally {
       this.active.delete(id);
     }
   }
 
   followReceipt(deliveryId) {
-    if (this.adapter.stopped || this.receiptPolls.size >= 8) return;
+    if (this.closed || this.adapter.stopped || this.receiptPolls.size >= 8 || this.pollControllers.has(deliveryId))
+      return;
     const controller = new AbortController();
+    this.pollControllers.set(deliveryId, controller);
     this.adapter.controllers.add(controller);
     const task = this.pollReceipt(deliveryId, controller.signal)
       .catch(() => {})
       .finally(() => {
         this.adapter.controllers.delete(controller);
+        this.pollControllers.delete(deliveryId);
         this.receiptPolls.delete(task);
       });
     this.receiptPolls.add(task);
   }
-
   async pollReceipt(deliveryId, signal) {
-    const initial = this.load(deliveryId);
-    while (initial && !signal.aborted && Date.now() < initial.deadline) {
+    while (!this.closed && !signal.aborted) {
       await sleep(800, undefined, { signal });
       if (signal.aborted || this.active.has(deliveryId)) continue;
       this.active.add(deliveryId);
@@ -403,44 +339,47 @@ export class VoiceSend {
       }
     }
   }
-
   async close() {
+    this.closed = true;
+    for (const controller of this.pollControllers.values()) controller.abort();
     await this.synthesis.close();
     await Promise.allSettled(this.receiptPolls);
   }
 
-  // Text-to-voice through the chat's voice-output-v1 plugin, then the native send.
-  async generateAndSend({ deliveryId, kind, target, text }, permitted = () => true) {
-    const identity = await this.identity(kind, target);
+  async generateAndSend({ deliveryId, kind, target, text, expectedRosterGrant }, permitted = () => true) {
+    if (typeof text !== 'string' || !text.trim() || text.length > maxReplyChars)
+      throw bad('VOICE_TTS_INVALID_TEXT', 400);
+    text = text.trim();
+    const identity = await this.identity(kind, target, undefined, expectedRosterGrant);
     if (!identity.voiceSend) throw bad('VOICE_UNSUPPORTED', 501);
-    if (identity.voiceTransport === 'desktop' && identity.wxid !== 'filehelper')
-      throw bad('VOICE_FILEHELPER_ONLY', 403);
     if (!permitted()) throw bad('VOICE_TTS_PERMISSION_CHANGED', 403);
-    const key = 'wechat:' + kind + ':' + target;
-    const selected = this.synthesis.selected(key, outputFeature);
-    const startedAt = Date.now();
+    const key = 'wechat:' + kind + ':' + target,
+      selected = this.synthesis.selected(key, outputFeature),
+      startedAt = Date.now();
     const job = {
-      version: 1,
+      version: 2,
       deliveryId,
       kind,
-      target,
+      target: String(target),
       account: identity.account,
-      wxid: identity.wxid,
-      senderAccount: identity.senderAccount,
-      receiptAccount: identity.receiptAccount,
-      transport: identity.voiceTransport,
+      accountRef: identity.accountRef,
+      rosterGrant: identity.rosterGrant,
+      transport: 'desktop',
       operationId: crypto.randomUUID(),
-      ...(text === undefined ? {} : { textSha256: sha256(text) }),
+      recordingAccount: identity.recordingAccount,
+      voicePlugin: this.pluginGrant(identity, kind, target, selected),
+      text,
+      textSha256: sha256(text),
       synthesisState: 'synthesizing',
       durationMs: 0,
       startedAt,
-      deadline: startedAt + 35000,
-      baseline: [],
+      deadline: startedAt + 600000,
+      segments: [],
     };
     this.save(job, true);
     try {
       const { wav, allowed } = await this.synthesis.generate({
-        account: identity.account,
+        accountRef: identity.accountRef,
         key,
         text,
         selected,
@@ -450,206 +389,250 @@ export class VoiceSend {
     } catch (error) {
       if (job.synthesisState === 'synthesizing') {
         job.synthesisState = 'failed';
-        job.synthesisError = /^VOICE_[A-Z_]{1,55}$/.test(error.code) ? error.code : 'VOICE_TTS_FAILED';
+        job.synthesisError = /^VOICE_[A-Z_]{1,55}$/.test(error.code ?? '') ? error.code : 'VOICE_TTS_FAILED';
         this.save(job);
       }
       throw error;
     }
   }
 
-  async send({ deliveryId, kind, target, wav }, prepared, authorized = () => true) {
-    const adapter = this.adapter;
-    const identity = await this.identity(kind, target, prepared);
+  async send({ deliveryId, kind, target, wav, voicePlugin }, prepared, authorized = () => true) {
+    const identity = await this.identity(kind, target, prepared, voicePlugin?.rosterGrant);
     if (!identity.voiceSend) throw bad('VOICE_UNSUPPORTED', 501);
-    if (prepared && prepared.transport !== identity.voiceTransport) throw bad('VOICE_BACKEND_CHANGED', 409);
-    const desktop = identity.voiceTransport === 'desktop';
-    const helper = identity.voiceTransport === 'helper';
-    if (desktop && identity.wxid !== 'filehelper') throw bad('VOICE_FILEHELPER_ONLY', 403);
-    const pcm = desktop ? voicePcm(wav) : null;
-    if (pcm && pcm.length > 59 * 32000) throw bad('VOICE_DESKTOP_DURATION_LIMIT', 400);
-    const encoded = desktop ? null : await encodeVoice(wav);
-    const audio = desktop
-      ? { pcmBase64: pcm.toString('base64'), durationMs: Math.ceil(pcm.length / 32) }
-      : { silkBase64: encoded.silk.toString('base64'), durationMs: encoded.durationMs };
-    const key = kind + ':' + target;
-    if (adapter.targetsSending.has(key) || adapter.targetsSending.size >= (adapter.hook.maxConcurrentSends ?? 4)) {
-      throw bad('VOICE_SENDER_BUSY', 429);
+    let pcm = voicePcm(wav, { maxSeconds: 1024 });
+    const minPcmBytes = 32 * speechContract.speechLimits.minBubbleMs;
+    if (pcm.length < minPcmBytes) {
+      const padded = Buffer.alloc(minPcmBytes);
+      pcm.copy(padded);
+      pcm = padded;
     }
-    adapter.targetsSending.add(key);
-    try {
-      const rows = await adapter.messages(identity.wxid);
-      const current = await this.identity(kind, target, identity);
-      if (!current.voiceSend) throw bad('VOICE_UNSUPPORTED', 501);
-      if (current.voiceTransport !== identity.voiceTransport) throw bad('VOICE_BACKEND_CHANGED', 409);
-      if (!authorized()) throw bad('VOICE_TTS_PERMISSION_CHANGED', 403);
-      const startedAt = Date.now();
-      const job = {
-        ...prepared,
-        version: 1,
-        deliveryId,
+    let grant = prepared?.voicePlugin ?? voicePlugin;
+    // A raw local API upload to a peer still needs the chat's plugin grant for
+    // the acoustic Reader. File Transfer is available for explicit diagnostics.
+    if (!grant && target !== 'filehelper')
+      grant = this.pluginGrant(
+        identity,
         kind,
         target,
-        account: current.account,
-        wxid: current.wxid,
-        operationId: prepared?.operationId ?? crypto.randomUUID(),
-        sha256: sha256(wav),
-        durationMs: audio.durationMs,
-        startedAt,
-        transport: current.voiceTransport,
-        senderAccount: current.senderAccount,
-        receiptAccount: current.receiptAccount,
-        deadline: startedAt + (desktop ? 75000 : (adapter.receiptOverride ?? adapter.hook.receiptTimeoutMs ?? 18000)),
-        baseline: rows
-          .map(row => row.localId)
-          .filter(localId)
-          .map(String),
-      };
-      if (prepared) job.synthesisState = 'ready';
-      if (helper || job.receiptAccount) {
-        const { start, end } = validateSilk(encoded.silk);
-        job.silkSha256 = sha256(encoded.silk.subarray(start, end));
-        job.baselineServerIds = rows.map(row => String(row.serverId)).filter(serverId);
+        this.synthesis.selected('wechat:' + kind + ':' + target, outputFeature),
+      );
+    const startedAt = Date.now(),
+      durationMs = Math.ceil(pcm.length / 32);
+    const job = {
+      ...prepared,
+      version: 2,
+      deliveryId,
+      kind,
+      target: String(target),
+      account: identity.account,
+      recordingAccount: identity.recordingAccount,
+      transport: 'desktop',
+      operationId: prepared?.operationId ?? crypto.randomUUID(),
+      accountRef: identity.accountRef,
+      rosterGrant: identity.rosterGrant,
+      sha256: sha256(wav),
+      durationMs,
+      startedAt,
+      deadline: startedAt + Math.max(120000, durationMs * 4 + 120000),
+      segments: [],
+      ...(grant ? { voicePlugin: grant } : {}),
+      ...(prepared ? { synthesisState: 'ready' } : {}),
+    };
+    this.checkPlugin(job);
+    if (!authorized()) throw bad('VOICE_TTS_PERMISSION_CHANGED', 403);
+    // The desktop queue serializes recording with other input. Keep the audio
+    // until that queue acknowledges the durable intent.
+    job.pendingPcm = pcm.toString('base64');
+    job.pendingPcmSha256 = sha256(pcm);
+    job.sendIntent = true;
+    this.save(job, !prepared);
+    if (prepared) prepared.synthesisState = 'ready';
+    await this.dispatchVoice(job);
+    return this.response(job);
+  }
+
+  async dispatchVoice(job) {
+    try {
+      const mapping = await this.adapter.dispatchDesktop(
+        'voice',
+        {
+          kind: job.kind,
+          target: job.target,
+          accountRef: job.accountRef,
+          rosterGrant: job.rosterGrant,
+          deliveryId: job.operationId,
+          text: job.text,
+          pcmBase64: job.pendingPcm,
+          parentId: job.deliveryId.startsWith('dsh-') ? job.deliveryId.slice(4) : job.deliveryId,
+          ...(job.voicePlugin ? { voicePlugin: job.voicePlugin } : {}),
+        },
+        job.account,
+      );
+      this.applyMapping(job, mapping);
+    } catch (error) {
+      job.inputError = /^[A-Z][A-Z0-9_]{1,79}$/.test(error.senderCode ?? error.code ?? '')
+        ? (error.senderCode ?? error.code)
+        : 'VOICE_DESKTOP_UNCONFIRMED';
+      if (error.attempted === false) {
+        job.sendIntent = false;
+        job.rejected = true;
+        job.nativeState = 'failed';
+        delete job.pendingPcm;
+        delete job.pendingPcmSha256;
       }
-      this.save(job, !prepared);
-      if (prepared) prepared.synthesisState = 'ready';
-      if (job.silkSha256) this.reserveFingerprint(job);
-      let result;
-      try {
-        result = await adapter.native(
-          '/SendVoiceMsg',
-          {
-            wxidorgid: job.wxid,
-            operationId: job.operationId,
-            ...audio,
-            ...(current.voiceSenderWxid ? { accountWxid: current.voiceSenderWxid } : {}),
-          },
-          job.senderAccount ?? job.account,
-        );
-      } catch (error) {
-        if (/^API_HTTP_(400|401|403|409|413|429)$/.test(error.message)) job.rejected = true;
-      }
-      if (job.receiptAccount) applyNativeMapping(job, result);
-      else {
-        if (Number.isInteger(result?.ret) && result.ret !== 0) job.rejected = true;
-        if (helper) applyHelperMapping(job, result);
-        else if (result?.ret === 0 && localId(result.localId)) job.localId = String(result.localId);
-      }
-      if (desktop) job.deadline = Date.now();
-      if (job.rejected || job.localId || job.submitted || desktop) this.save(job);
-      return this.response(job);
-    } finally {
-      adapter.targetsSending.delete(key);
+      this.save(job);
     }
   }
 
-  async status(job, upload) {
-    const identity = await this.identity(job.kind, job.target, job);
+  applyMapping(job, mapping) {
+    if (mapping?.deliveryId !== job.operationId || mapping.admitted !== true || typeof mapping.state !== 'string')
+      throw bad('VOICE_DESKTOP_RESULT_INVALID', 502);
+    const parts = mapping.segments ?? [];
+    if (
+      !Array.isArray(parts) ||
+      parts.length > 256 ||
+      parts.some(
+        (p, index) =>
+          p.index !== index ||
+          !/^([a-f0-9]{64})$/.test(p.attemptId ?? '') ||
+          !Number.isFinite(p.durationMs) ||
+          p.durationMs <= 0 ||
+          p.durationMs > 8000,
+      )
+    )
+      throw bad('VOICE_DESKTOP_RESULT_INVALID', 502);
+    job.segments = parts.map(p => ({
+      index: p.index,
+      attemptId: p.attemptId,
+      state: p.state,
+      durationMs: p.durationMs,
+      ...(p.serverId !== undefined ? { serverId: String(p.serverId) } : {}),
+      ...(p.localId !== undefined ? { localId: String(p.localId) } : {}),
+      ...(p.source ? { source: p.source } : {}),
+    }));
+    delete job.pendingPcm;
+    delete job.pendingPcmSha256;
+    job.nativeState = mapping.state;
+    job.submitted =
+      job.submitted === true ||
+      mapping.submitted === true ||
+      parts.some(p => ['confirmed', 'submitted', 'unknown'].includes(p.state));
+    if (mapping.confirmed === true) {
+      if (
+        mapping.state !== 'confirmed' ||
+        !parts.length ||
+        parts.some(
+          p =>
+            p.state !== 'confirmed' ||
+            !serverId(p.serverId) ||
+            !localId(p.localId) ||
+            p.source !== 'desktop-acoustic-match',
+        ) ||
+        new Set(parts.map(p => String(p.serverId))).size !== parts.length
+      )
+        throw bad('VOICE_DESKTOP_RECEIPT_INVALID', 502);
+      job.localId = String(parts.at(-1).localId);
+      job.serverMessageId = String(parts.at(-1).serverId);
+      job.sendIntent = true;
+      this.confirm(job);
+      return;
+    }
+    if (['failed', 'cancelled'].includes(mapping.state) && mapping.submission === 'not-started' && !job.submitted) {
+      job.rejected = true;
+      job.sendIntent = false;
+      job.inputError = mapping.reason ?? 'VOICE_DESKTOP_REJECTED';
+    }
+    if (mapping.submission === 'unknown' || mapping.state === 'unconfirmed') job.submitted = true;
+    this.save(job);
+  }
+
+  async status(job, upload, observeOnly = false, expectedRosterGrant) {
+    const identity = await this.identity(job.kind, job.target, job, expectedRosterGrant);
+    this.checkPlugin(job);
     const sameInput =
       !upload ||
       (upload.text === undefined
         ? !job.textSha256 && sha256(upload.wav) === job.sha256
         : sha256(upload.text) === job.textSha256);
-    if (upload && (upload.kind !== job.kind || upload.target !== job.target || !sameInput)) {
+    if (upload && (upload.kind !== job.kind || String(upload.target) !== job.target || !sameInput))
       throw bad('VOICE_DELIVERY_ID_CONFLICT', 409);
-    }
-    if (job.rejected || job.confirmed || ['synthesizing', 'failed'].includes(job.synthesisState))
-      return this.response(job);
-    const transport = job.transport ?? 'native';
-    const needsMapping = !job.localId && (transport === 'native' || transport === 'helper');
-    if (needsMapping && identity.voiceSend && identity.voiceTransport === transport) {
-      // A lost submit response is recovered by reading the backend's operation mapping.
-      const mapping = await this.adapter
-        .native(nativeReceiptRoute + job.operationId, undefined, job.senderAccount ?? job.account)
-        .catch(() => null);
-      if (mapping?.operationId === job.operationId) {
-        if (transport === 'helper') {
-          if (applyHelperMapping(job, mapping)) this.save(job);
-        } else if (job.receiptAccount) {
-          if (applyNativeMapping(job, mapping)) this.save(job);
-        } else if (localId(mapping.localId)) {
-          job.localId = String(mapping.localId);
-          this.save(job);
-        }
+    if (job.confirmed || job.rejected || job.synthesisState === 'failed') return this.response(job);
+    if (job.synthesisState === 'synthesizing') {
+      if (Date.now() >= job.deadline && !job.sendIntent) {
+        job.synthesisState = 'failed';
+        job.synthesisError = 'VOICE_TTS_INTERRUPTED';
+        this.save(job);
       }
-    }
-    if (!job.localId) {
-      if (!job.rejected && job.submitted && job.silkSha256) await this.checkContentReceipt(job);
       return this.response(job);
     }
-    if (job.baseline.includes(job.localId)) return this.response(job);
-    const rows = await this.adapter.messages(job.wxid);
-    const matching = rows.filter(
-      row =>
-        (row.isSend === 1 || row.isSend === true) &&
-        row.localType === 34 &&
-        String(row.localId) === job.localId &&
-        Number(row.createTime) >= Math.floor(job.startedAt / 1000),
-    );
-    if (
-      matching.length === 1 &&
-      serverId(matching[0].serverId) &&
-      !job.baselineServerIds?.includes(String(matching[0].serverId))
-    ) {
+    if (!job.sendIntent) return this.response(job);
+    try {
+      const mapping = job.pendingPcm
+        ? await this.adapter.desktopSender.request('lookup', {
+            account: job.account,
+            accountRef: job.accountRef,
+            kind: job.kind,
+            target: job.target,
+            rosterGrant: job.rosterGrant,
+            deliveryId: job.operationId,
+            ...(observeOnly ? { observeOnly: true } : {}),
+          })
+        : await this.adapter.desktopSender.request('query', {
+            deliveryId: job.operationId,
+            ...(observeOnly ? { observeOnly: true } : {}),
+          });
+      if (mapping === null && job.pendingPcm) {
+        if (observeOnly || Date.now() >= job.deadline || job.voicePlugin?.feature === dialogueFeature) {
+          job.rejected = true;
+          job.sendIntent = false;
+          job.inputError = 'VOICE_NOT_ADMITTED';
+          delete job.pendingPcm;
+          delete job.pendingPcmSha256;
+          this.save(job);
+        } else if (sha256(Buffer.from(job.pendingPcm, 'base64')) !== job.pendingPcmSha256) {
+          throw bad('VOICE_STAGED_AUDIO_CHANGED', 409);
+        } else if (identity.voiceSend) {
+          await this.identity(job.kind, job.target, job);
+          this.checkPlugin(job);
+          await this.dispatchVoice(job);
+        }
+        return this.response(job);
+      }
       await this.identity(job.kind, job.target, job);
-      this.confirm(job);
+      this.checkPlugin(job);
+      this.applyMapping(job, mapping);
+    } catch (error) {
+      if ([403, 409].includes(error.status)) throw error;
+      job.queryError = /^VOICE_[A-Z_]+$/.test(error.code ?? '') ? error.code : 'VOICE_DESKTOP_UNCONFIRMED';
+      this.save(job);
     }
     return this.response(job);
   }
-
-  async checkContentReceipt(job) {
-    if (!this.ownsUniqueFingerprint(job)) return;
-    const after = Math.floor(job.startedAt / 1000);
-    const before = Math.floor(Math.min(job.deadline, job.startedAt + fingerprintWindowMs) / 1000);
-    const query = new URLSearchParams({
-      talker: job.wxid,
-      account: job.receiptAccount ?? job.senderAccount,
-      digest: job.silkSha256,
-      after: String(after),
-      before: String(before),
-      baseline: job.baseline.join(','),
-    });
-    const result = await this.adapter.reader('/api/v1/outgoing-voice-receipt?' + query).catch(() => null);
-    const match = result?.match;
-    if (
-      !match ||
-      !localId(match.localId) ||
-      job.baseline.includes(String(match.localId)) ||
-      !serverId(match.serverId) ||
-      job.baselineServerIds?.includes(String(match.serverId)) ||
-      !Number.isSafeInteger(match.createTime) ||
-      match.createTime < after ||
-      match.createTime > before
-    )
-      return;
-    await this.identity(job.kind, job.target, job);
-    if (!this.ownsUniqueFingerprint(job)) return;
-    job.localId = String(match.localId);
-    job.serverMessageId = String(match.serverId);
-    this.confirm(job);
-  }
-
   confirm(job) {
+    if (job.confirmed) return;
     job.confirmed = true;
     this.save(job);
     this.adapter.status.confirmed_sends++;
   }
-
   response(job) {
-    const result = { deliveryId: job.deliveryId, durationMs: job.durationMs };
+    const result = { deliveryId: job.deliveryId, durationMs: job.durationMs, segments: job.segments ?? [] };
     if (job.synthesisState === 'failed') return { ...result, status: 'rejected', error: job.synthesisError };
-    if (job.rejected) return { ...result, status: 'rejected', error: 'VOICE_NATIVE_REJECTED' };
+    if (job.rejected) return { ...result, status: 'rejected', error: job.inputError ?? 'VOICE_DESKTOP_REJECTED' };
     if (job.confirmed)
       return {
         ...result,
         status: 'confirmed',
+        submitted: true,
         messageId: job.localId,
+        serverMessageId: job.serverMessageId,
         receipt: 'wechat-server-id',
-        ...(job.serverMessageId ? { serverMessageId: job.serverMessageId, receiptSource: 'silk-sha256' } : {}),
+        receiptSource: 'desktop-acoustic-match',
       };
-    return {
-      ...result,
-      ...(job.submitted ? { submitted: true } : {}),
-      status: Date.now() < job.deadline ? 'pending' : 'unconfirmed',
-    };
+    // The adapter deadline bounds admission. The desktop queue owns the
+    // lifetime of accepted jobs, including replies held by an operator pause.
+    const pending = job.nativeState
+      ? ['queued', 'waiting', 'paused', 'recording', 'submitted'].includes(job.nativeState)
+      : Date.now() < job.deadline;
+    return { ...result, ...(job.submitted ? { submitted: true } : {}), status: pending ? 'pending' : 'unconfirmed' };
   }
 }

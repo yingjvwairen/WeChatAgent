@@ -5,20 +5,24 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { pcmWav, decodeVoice, validateSilk, voicePcm } from './decode-wechat-voice.mjs';
-import { HookOneBot } from './hook-onebot.mjs';
+import { pcmWav, voicePcm } from './decode-wechat-voice.mjs';
+import { WechatOneBot } from './wechat-onebot.mjs';
+import { pcmWave } from './desktop-sender/engine-voice.mjs';
 import { PluginInstaller } from '../packages/plugin-api/installer.mjs';
 import { configuration, packageFiles, scanPlugins, updatePlugin } from '../packages/plugin-api/catalog.mjs';
 import { packZip } from '../packages/plugin-api/zip.mjs';
 import { createSettingsActionRunner } from './plugin-settings-actions.mjs';
 import { ReverseOneBotServer } from '../components/qq-bridge/src/onebot/reverse-ws-server.js';
+import { WechatOneBotAdapter } from '../components/qq-bridge/src/adapters/wechat/wechat-onebot-adapter.js';
+import { acceptanceVoiceSource, acceptVoiceDelivery } from './filehelper-acceptance.mjs';
+import { selectPluginAccount } from './test-fixtures/plugin-account.mjs';
 
-const token = 'b'.repeat(64);
-const account = 'wxid_fixture_1234';
-const chat = 'fixture@chatroom';
-const target = '123';
-const wav = pcmWav(Buffer.alloc(3200));
-const route = '/api/voice/send';
+const token = 'b'.repeat(64),
+  account = 'wxid_fixture_1234',
+  chat = 'fixture@chatroom',
+  target = 'filehelper';
+const wav = pcmWav(Buffer.alloc(3200)),
+  route = '/api/voice/send';
 const row = (fields = {}) => ({
   localId: 2,
   localType: 34,
@@ -27,98 +31,139 @@ const row = (fields = {}) => ({
   serverId: '900000000000000001',
   ...fields,
 });
-
-async function fixture(
-  t,
-  {
-    capable = true,
-    receiptTimeoutMs = 30000,
-    loseResponse = false,
-    desktop = false,
-    helper = false,
-    helperFull = false,
-    hookVoice = false,
-    stream = false,
-  } = {},
-) {
+const segment = (id, index = 0, durationMs = 1000, serverId) => ({
+  index,
+  attemptId: crypto
+    .createHash('sha256')
+    .update(id + ':' + index)
+    .digest('hex'),
+  durationMs,
+  state: serverId ? 'confirmed' : 'submitted',
+  ...(serverId ? { serverId, localId: index + 2, source: 'desktop-acoustic-match' } : {}),
+});
+async function fixture(t, { capable = true, receiptTimeoutMs = 30000, loseResponse = false, stream = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'WeChatAgent-voice-send-'));
   const config = {
-    runtime: { sender: 'wechat-hook', weflowMode: 'nt' },
+    runtime: { sender: 'wechat-ui', weflowMode: 'nt' },
+    input: { wechatExecutable: path.join(directory, 'Weixin.exe'), voiceSend: true },
     ports: { adapter: 0 },
     account: { nicknames: ['Fixture'] },
-    hook: { baseUrl: 'http://127.0.0.1:30001', expectedVersion: '4.2.0.12' },
-    wechat: { whitelist: { private: [], groups: [target] } },
+    wechat: { whitelist: { private: ['filehelper', 'wxid_other'], groups: ['fixture@chatroom'] } },
   };
-  const helperAny = helper || helperFull;
-  const filehelperMode = desktop || helperAny;
+  fs.mkdirSync(path.join(directory, 'config'));
+  fs.mkdirSync(path.join(directory, 'state'));
+  selectPluginAccount(directory);
+  fs.writeFileSync(
+    path.join(directory, 'state/wechat-io-config.json'),
+    JSON.stringify({ reader_base_url: 'http://127.0.0.1:5031', reader_token: 'reader-token' }),
+  );
+  const tokenFile = path.join(directory, 'state/voice-send.token');
+  fs.writeFileSync(tokenFile, token);
   const backend = {
     account,
     readerOwnWxid: 'wxid_fixture',
-    chat: filehelperMode ? 'filehelper' : chat,
+    chat: 'filehelper',
+    voiceEnabled: capable,
     rows: [],
+    targetRows: new Map(),
     submissions: [],
     textSubmissions: [],
-    ret: 0,
-    loseVoice: false,
-    dropTextReceipt: false,
-    helperAccount: 'wxid_fixture',
-    helperTargets: undefined,
-    helperReceipt: {},
-    targetRows: new Map(),
-    contentReceipt: null,
-    receiptQueries: [],
-    hookVoiceState: 'queued',
-    hookVoiceMapping: {},
-    hookVoiceTestOnly: false,
+    results: new Map(),
+    loseVoice: loseResponse,
+    autoConfirm: false,
+    confirmLatest(server = '900000000000000001') {
+      const sent = this.submissions.at(-1),
+        result = this.results.get(sent.deliveryId);
+      const segments = result.segments.map((part, index) =>
+        segment(sent.deliveryId, index, part.durationMs, String(BigInt(server) + BigInt(index))),
+      );
+      this.results.set(sent.deliveryId, {
+        ...result,
+        state: 'confirmed',
+        pending: false,
+        confirmed: true,
+        submitted: true,
+        submission: 'confirmed',
+        segments,
+      });
+    },
   };
-  if (desktop) {
-    config.runtime.sender = 'wechat-input';
-    config.input = { wechatExecutable: path.join(directory, 'Weixin.exe'), voiceSend: true };
-  }
-  if (filehelperMode) config.wechat.whitelist = { private: [target, '124'], groups: [] };
-  if (helperAny) config.helperVoice = { port: 30001 };
-  if (helperFull) config.runtime.sender = 'wechat-helper';
-  for (const folder of ['config', 'state/hook']) fs.mkdirSync(path.join(directory, folder), { recursive: true });
-  fs.writeFileSync(
-    path.join(directory, 'state/wechat-io-config.json'),
-    JSON.stringify({
-      reader_base_url: 'http://127.0.0.1:5031',
-      reader_token: 'reader-token',
-    }),
-  );
-  fs.writeFileSync(path.join(directory, 'state/hook/native-token.txt'), 'a'.repeat(64));
-  if (helperAny) {
-    fs.unlinkSync(path.join(directory, 'state/hook/native-token.txt'));
-    fs.writeFileSync(path.join(directory, 'state/helper-voice.token'), 'a'.repeat(64));
-  }
-  const tokenFile = path.join(directory, 'state/voice-send.token');
-  fs.writeFileSync(tokenFile, token);
+  const sessions = [
+    { username: 'filehelper', displayName: '文件传输助手' },
+    { username: 'wxid_other', displayName: 'Fixture peer' },
+    { username: chat, displayName: 'Fixture group' },
+  ];
   const saveConfig = () => fs.writeFileSync(path.join(directory, 'config/wechatagent.json'), JSON.stringify(config));
   saveConfig();
+  const inbox = (backend.inbox = []);
+  backend.emitVoice = payload => {
+    const rawid = crypto.createHash('sha256').update(payload.rawid).digest('hex');
+    inbox.push({
+      ...payload,
+      rawid,
+      readerIntake: {
+        version: 1,
+        rawid,
+        token: crypto.randomBytes(32).toString('hex'),
+        account: 'a'.repeat(64),
+        grant: 'legacy',
+      },
+    });
+  };
   const fetchImpl = async (input, options) => {
     const url = new URL(input);
-    const native = url.port === '30001';
-    assert.equal(options.headers.Authorization, 'Bearer ' + (native ? 'a'.repeat(64) : 'reader-token'));
-    if (url.pathname === '/api/v1/reader/status') {
+    assert.equal(options.headers.Authorization, 'Bearer reader-token');
+    if (url.pathname === '/api/v1/reader/status')
       return Response.json({
         backend: 'weflow-cli-nt',
+        intakeProtocol: 'reader-inbox-v2',
         ownWxid: backend.readerOwnWxid,
         accountDirectory: backend.account,
+        accountRef: 'a'.repeat(64),
+      });
+    if (url.pathname === '/api/v1/sessions') return Response.json({ sessions });
+    if (url.pathname === '/api/v1/desktop-target') {
+      const row = sessions.find(r => r.username === url.searchParams.get('target'));
+      return Response.json({
+        target: row && {
+          wxid: row.username,
+          name: row.displayName,
+          searchName: row.displayName,
+          uniqueSearchName: true,
+          uniqueTitle: true,
+          alias: '',
+          account: backend.account.toLowerCase(),
+          accountWxid: backend.readerOwnWxid,
+          accountRef: 'a'.repeat(64),
+        },
       });
     }
-    if (url.pathname === '/api/v1/push/messages') {
-      return new Response(
-        new ReadableStream({
-          start(controller) {
-            backend.emitVoice = payload => controller.enqueue(Buffer.from('data: ' + JSON.stringify(payload) + '\n\n'));
-            options.signal.addEventListener('abort', () => controller.close(), { once: true });
-          },
-        }),
-        { headers: { 'Content-Type': 'text/event-stream' } },
-      );
+    if (url.pathname === '/api/v1/messages')
+      return Response.json({
+        messages:
+          url.searchParams.get('talker') === 'filehelper'
+            ? backend.rows
+            : (backend.targetRows.get(url.searchParams.get('talker')) ?? []),
+      });
+    if (url.pathname === '/api/v1/intake/next') return Response.json({ event: inbox[0] ?? null });
+    if (url.pathname === '/api/v1/intake/route') {
+      const body = JSON.parse(options.body);
+      const item = inbox.find(row => row.readerIntake.token === body.token);
+      assert.equal(item.rawid, body.rawid);
+      if (body.forward) item.readerIntake.route = 'dsh';
+      return Response.json({ success: true, route: (item.readerIntake.route ??= body.route) });
     }
-    if (url.pathname.startsWith('/api/v1/voices/')) {
-      backend.audioReads = (backend.audioReads ?? 0) + 1;
+    if (url.pathname === '/api/v1/intake/ack') {
+      if (backend.reconnectBeforeAck) {
+        backend.reconnectBeforeAck = false;
+        inbox[0].offlineReplay = 'reply';
+        return Response.json({ success: false }, { status: 503 });
+      }
+      assert.equal(JSON.parse(options.body).token, inbox[0].readerIntake.token);
+      inbox.shift();
+      return Response.json({ success: true });
+    }
+    if (url.pathname.startsWith('/api/v1/voices/'))
       return Response.json({
         id: url.pathname.split('/').at(-1),
         conversationKey: url.searchParams.get('conversationKey'),
@@ -128,156 +173,128 @@ async function fixture(
         filename: 'voice.wav',
         durationSeconds: 0.1,
       });
-    }
-    if (url.pathname === '/WeChatAgent/health') {
-      if (helperAny)
-        return Response.json({
-          integration: 'WeChatAgent-Helper-Voice-1',
-          version: '4.2.0.12',
-          nativeVoiceSend: capable,
-          account: backend.helperAccount,
-          voiceTargets: backend.helperTargets,
-          ...(helperFull ? { nativeTextSend: true } : {}),
-        });
-      return Response.json({
-        backend: 'wechat-hook',
-        integration: 'WeChatAgent-1',
-        version: '4.2.0.12',
-        profile: '4.2.0.12-stickers-v2',
-        nativeTextSend: true,
-        nativeStickerSend: true,
-        nativeVoiceSend: capable,
-        databaseAccounts: [backend.account],
-        ...(hookVoice
-          ? { nativeVoiceProtocol: 'silk-receipt-v1', nativeVoiceTestOnly: backend.hookVoiceTestOnly }
-          : {}),
-      });
-    }
-    if (url.pathname === '/api/v1/sessions')
-      return Response.json({
-        sessions: [
-          { username: backend.chat, conversationId: target, displayName: filehelperMode ? '文件传输助手' : 'fixture' },
-          ...(filehelperMode ? [{ username: 'wxid_other', conversationId: '124' }] : []),
-          ...(helperAny ? [{ username: chat, conversationId: '125' }] : []),
-        ],
-      });
-    if (desktop && url.pathname === '/api/v1/contacts') {
-      return Response.json({ contacts: [{ username: 'filehelper', displayName: '文件传输助手' }] });
-    }
-    if (url.pathname === '/api/v1/messages') {
-      const talker = url.searchParams.get('talker');
-      if (talker === backend.chat) return Response.json({ messages: backend.rows });
-      assert(helperAny && ['wxid_other', chat].includes(talker));
-      return Response.json({ messages: backend.targetRows.get(talker) ?? [] });
-    }
-    if (url.pathname === '/api/v1/outgoing-voice-receipt') {
-      backend.receiptQueries.push(url.searchParams);
-      const match = backend.contentReceipt?.(url.searchParams) ?? null;
-      return Response.json({ success: true, match });
-    }
-    assert.equal(options.headers['X-WeChatAgent-Account'], helperAny ? backend.helperAccount : backend.account);
-    if (url.pathname === '/SendTextMsg') {
-      const body = JSON.parse(options.body);
-      backend.textSubmissions.push(body);
-      if (helperFull) assert.match(body.operationId, /^[a-f0-9]{64}$/);
-      if (!backend.dropTextReceipt) {
-        // The NT reader later shows the sent text with a server ID.
-        const talker = body.wxidorgid,
-          rows = talker === backend.chat ? backend.rows : (backend.targetRows.get(talker) ?? []);
-        rows.push({
-          localId: 100 + backend.textSubmissions.length,
-          localType: 1,
-          isSend: 1,
-          createTime: Math.floor(Date.now() / 1000),
-          serverId: '91000000000000000' + backend.textSubmissions.length,
-          content: body.msg,
-        });
-        if (talker !== backend.chat) backend.targetRows.set(talker, rows);
+    assert.fail('Unexpected Reader route ' + url.pathname);
+  };
+  const desktopSender = {
+    async request(operation, payload) {
+      if (operation === 'health')
+        return {
+          backend: 'wechat-ui',
+          version: '4.2.0.53',
+          databaseAccounts: [backend.account],
+          ready: true,
+          paused: backend.paused === true,
+          voiceSend: backend.voiceEnabled,
+          controlMode: 'uia',
+        };
+      if (operation === 'lookup') return backend.results.get(payload.deliveryId) ?? null;
+      if (operation === 'query') {
+        const value = backend.results.get(payload.deliveryId);
+        assert(value, 'query must refer to a prior logical operation');
+        return value;
       }
-      return Response.json({
-        ret: 0,
-        ...(helperFull ? { operationId: body.operationId, state: 'accepted', target: body.wxidorgid } : {}),
-      });
-    }
-    if (url.pathname === '/SendVoiceMsg') {
-      backend.submissions.push(JSON.parse(options.body));
-      if (hookVoice) assert.equal(backend.submissions.at(-1).accountWxid, 'wxid_fixture');
-      if (loseResponse || backend.loseVoice) throw new TypeError('fixture lost submit response');
-      if (helperAny) {
-        const { operationId, wxidorgid } = backend.submissions.at(-1);
-        return Response.json({ operationId, state: 'accepted', target: backend.helperTargets && wxidorgid });
+      if (operation === 'text') {
+        if (backend.interruptTextAdmission) {
+          backend.interruptTextAdmission = false;
+          throw Error('fixture interruption before desktop admission');
+        }
+        backend.textSubmissions.push(payload);
+        const messages = backend.targetRows.get(payload.target) || [];
+        messages.push(
+          row({
+            localType: 1,
+            localId: 100 + backend.textSubmissions.length,
+            serverId: String(910000000000000000n + BigInt(backend.textSubmissions.length)),
+            content: payload.text,
+          }),
+        );
+        backend.targetRows.set(payload.target, messages);
+        const { localId, serverId } = messages.at(-1);
+        const result = {
+          deliveryId: payload.deliveryId,
+          operation,
+          ret: 0,
+          admitted: true,
+          state: 'confirmed',
+          confirmed: true,
+          pending: false,
+          submitted: true,
+          submission: 'confirmed',
+          receipt: { source: 'wechat-server-id', localId, serverId },
+        };
+        backend.results.set(payload.deliveryId, result);
+        return result;
       }
-      if (hookVoice) {
-        const { operationId, wxidorgid } = backend.submissions.at(-1);
-        return Response.json({ ret: 0, operationId, target: wxidorgid, state: 'queued' });
+      assert.equal(operation, 'voice');
+      assert(!backend.results.has(payload.deliveryId), 'logical operation submitted twice');
+      backend.submissions.push(payload);
+      const durationMs = Buffer.from(payload.pcmBase64, 'base64').length / 32;
+      let result = {
+        deliveryId: payload.deliveryId,
+        state: 'submitted',
+        admitted: true,
+        pending: true,
+        submitted: true,
+        submission: 'submitted',
+        confirmed: false,
+        segments: Array.from({ length: Math.ceil(durationMs / 8000) }, (_, index) =>
+          segment(payload.deliveryId, index, Math.min(8000, durationMs - index * 8000)),
+        ),
+      };
+      if (backend.nextResult) result = { ...result, ...backend.nextResult };
+      backend.results.set(payload.deliveryId, result);
+      if (backend.loseVoice) {
+        backend.results.set(payload.deliveryId, {
+          ...result,
+          state: 'unconfirmed',
+          pending: false,
+          submission: 'unknown',
+          segments: result.segments.map(p => ({ ...p, state: 'unknown' })),
+        });
+        throw Object.assign(Error('DESKTOP_SEND_UNCONFIRMED'), { attempted: true });
       }
-      return Response.json({ ret: backend.ret, localId: 2 });
-    }
-    const receipt = backend.submissions.find(
-      item => url.pathname === '/WeChatAgent/voice-deliveries/' + item.operationId,
-    );
-    if (receipt) {
-      if (helperAny)
-        return Response.json({
-          operationId: receipt.operationId,
-          state: 'accepted',
-          target: backend.helperTargets && receipt.wxidorgid,
-          ...backend.helperReceipt,
-        });
-      if (hookVoice)
-        return Response.json({
-          ret: backend.hookVoiceState === 'rejected' ? 1 : 0,
-          operationId: receipt.operationId,
-          target: receipt.wxidorgid,
-          state: backend.hookVoiceState,
-          ...backend.hookVoiceMapping,
-        });
-      return Response.json({ operationId: receipt.operationId, localId: 2 });
-    }
-    assert.fail('Unexpected adapter route ' + url.pathname);
+      if (backend.autoConfirm) {
+        backend.confirmLatest();
+        result = backend.results.get(payload.deliveryId);
+      }
+      return result;
+    },
+    async resumePending() {
+      return [];
+    },
+    async close() {},
   };
   let adapter;
   const restart = async () => {
     if (adapter) await adapter.stop();
-    const inputSender = desktop
-      ? {
-          async request(operation, payload) {
-            if (operation === 'health')
-              return {
-                backend: 'wechat-input',
-                integration: 'WeChatAgent-Input-1',
-                ocr: false,
-                hookLoaded: false,
-                version: '4.2.0.12',
-                databaseAccounts: [backend.account],
-                ready: true,
-                voiceSend: capable,
-              };
-            assert.equal(operation, 'voice');
-            backend.submissions.push(payload);
-            return { ret: 0, submitted: true };
-          },
-          close() {},
-        }
-      : undefined;
-    adapter = new HookOneBot({ directory, fetchImpl, receiptTimeoutMs, inputSender, helperVoiceOnly: helper });
+    adapter = new WechatOneBot({ directory, fetchImpl, receiptTimeoutMs, desktopSender });
     adapter.connectOneBot = async () => {
-      if (helper) assert.fail('voice-only mode must not start OneBot');
+      adapter.readerConsumer = crypto.randomBytes(16).toString('hex');
+      adapter.socket = {
+        readyState: WebSocket.OPEN,
+        close() {
+          this.readyState = WebSocket.CLOSED;
+        },
+        send(raw) {
+          const event = JSON.parse(raw),
+            intake = event.wechatagent.readerIntake;
+          void adapter.action({ action: 'ack_wechatagent_intake', params: { ...intake, self_id: event.self_id } });
+        },
+      };
     };
-    if (!stream) adapter.receiveSse = async () => {};
+    if (!stream) adapter.receiveReaderInbox = async () => {};
     await adapter.start();
   };
   t.after(async () => {
-    if (adapter?.server?.listening) await adapter.stop();
-    assert.equal(path.dirname(directory), os.tmpdir());
-    fs.rmSync(directory, { recursive: true, force: true });
+    if (adapter) await adapter.stop();
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
   await restart();
   const call = async (url, { auth = token, body } = {}) => {
     const response = await fetch('http://127.0.0.1:' + adapter.server.address().port + url, {
       method: body === undefined ? 'GET' : 'POST',
       headers: { Authorization: 'Bearer ' + auth, 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     return { http: response.status, body: await response.json() };
   };
@@ -286,7 +303,7 @@ async function fixture(
       ...options,
       body: {
         deliveryId: 'fixture-id',
-        conversationKey: 'wechat:' + (filehelperMode ? 'private:' : 'group:') + target,
+        conversationKey: 'wechat:private:filehelper',
         wavBase64: wav.toString('base64'),
         ...overrides,
       },
@@ -305,280 +322,239 @@ async function fixture(
   };
 }
 
-test('the loopback voice route requires its own token, a whitelisted target and a capable backend', async t => {
-  const f = await fixture(t, { capable: false });
-  fs.unlinkSync(f.tokenFile);
-  assert.deepEqual(await f.submit(), { http: 401, body: { error: 'VOICE_UNAUTHORIZED' } });
-  fs.writeFileSync(f.tokenFile, token);
-  assert.equal((await f.submit({}, { auth: 'a'.repeat(64) })).http, 401);
-  assert.deepEqual(await f.submit({ conversationKey: 'wechat:group:456' }), {
-    http: 403,
-    body: { error: 'VOICE_CONVERSATION_NOT_ALLOWED' },
-  });
-  assert.deepEqual(await f.submit(), { http: 501, body: { error: 'VOICE_UNSUPPORTED' } });
+test('voice API requires its token, live capability and permitted conversation before submitting', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.submit({}, { auth: 'wrong' })).http, 401);
+  assert((await f.submit({ conversationKey: 'wechat:private:999' })).http >= 400);
+  assert.equal(f.backend.submissions.length, 0);
+  f.backend.voiceEnabled = false;
+  assert((await f.submit()).http >= 400);
   assert.equal(f.backend.submissions.length, 0);
 });
-
-test('only a unique outgoing type-34 row with a server receipt confirms a SILK delivery', async t => {
+test('File Transfer exposes normal voice capability and still queries a submitted operation only once', async t => {
   const f = await fixture(t);
-  assert.equal((await f.submit({ wavBase64: 'AAAA' })).body.error, 'VOICE_INVALID_WAV');
-  assert.equal((await f.submit({ wavBase64: Buffer.alloc(2 * 1024 * 1024 + 1).toString('base64') })).http, 413);
-  assert.equal((await f.submit()).http, 202);
-  const [submission] = f.backend.submissions;
-  assert.equal(submission.wxidorgid, chat);
-  assert.equal(submission.durationMs, 100);
-  assert.equal((await decodeVoice(Buffer.from(submission.silkBase64, 'base64'))).durationSeconds, 0.1);
-  for (const rows of [
-    [row({ localType: 49 })],
-    [row({ isSend: 0 })],
-    [row({ serverId: '0' })],
-    [row({ localId: 3 })],
-    [row(), row()],
-  ]) {
-    f.backend.rows = rows;
-    assert.equal((await f.status()).body.status, 'pending');
-  }
-  f.backend.rows = [row()];
-  const confirmed = await f.status();
-  assert.deepEqual(confirmed, {
-    http: 200,
-    body: {
-      status: 'confirmed',
-      deliveryId: 'fixture-id',
-      durationMs: 100,
-      messageId: '2',
-      receipt: 'wechat-server-id',
-    },
-  });
-  assert.deepEqual(await f.submit(), confirmed);
-  const different = Buffer.from(wav);
-  different[44] = 1;
-  assert.equal((await f.submit({ wavBase64: different.toString('base64') })).body.error, 'VOICE_DELIVERY_ID_CONFLICT');
-  assert.equal(f.backend.submissions.length, 1);
-});
-
-test('a lost submission response survives restart and recovers a late receipt without resending', async t => {
-  const f = await fixture(t, { loseResponse: true, receiptTimeoutMs: 0 });
-  assert.equal((await f.submit()).body.status, 'unconfirmed');
-  await f.restart();
-  assert.equal((await f.submit()).body.status, 'unconfirmed');
-  f.backend.rows = [row()];
-  assert.equal((await f.status()).body.status, 'confirmed');
-  assert.equal(f.backend.submissions.length, 1);
-});
-
-test('the 4.2 Hook accepts a suffixed reader account and recovers its SILK receipt', async t => {
-  const f = await fixture(t, { hookVoice: true, loseResponse: true });
-  f.backend.readerOwnWxid = account;
-  f.backend.rows = [row({ localId: 1, serverId: '900000000000000000' })];
+  f.adapter().voiceSend.synthesis.candidates = () => [{ id: 'fixture', generation: '1' }];
+  assert.equal((await f.adapter().voiceSend.capability('private', 'filehelper')).voice, true);
+  assert.equal((await f.adapter().realtime.capability('private', 'filehelper')).voice, true);
+  assert.equal((await f.adapter().realtime.capability('private', 'wxid_other')).voice, true);
+  assert.equal((await f.adapter().realtime.capability('group', 'fixture@chatroom')).voice, true);
   assert.equal((await f.submit()).body.status, 'pending');
-  assert.equal(f.backend.submissions[0].accountWxid, 'wxid_fixture');
+  const operation = f.backend.submissions[0].deliveryId;
+  assert.equal(f.backend.submissions[0].target, 'filehelper');
+  assert.equal((await f.submit()).body.status, 'pending');
+  assert.equal(f.backend.submissions.length, 1);
+  f.backend.confirmLatest();
+  const result = await f.status();
+  assert.equal(result.body.status, 'confirmed');
+  assert.equal(f.adapter().voiceSend.load('fixture-id').operationId, operation);
+  assert.equal(f.backend.submissions.length, 1);
+});
+test('a pending logical operation confirms only from its acoustic segment receipt and never resubmits', async t => {
+  const f = await fixture(t);
+  const initial = await f.submit();
+  assert.equal(initial.body.status, 'pending');
+  assert.equal(f.backend.submissions.length, 1);
+  assert.equal(Buffer.from(f.backend.submissions[0].pcmBase64, 'base64').length, 32000);
+  f.backend.confirmLatest();
+  const confirmed = await f.status();
+  assert.equal(confirmed.body.status, 'confirmed');
+  assert.equal(confirmed.body.receiptSource, 'desktop-acoustic-match');
   await f.restart();
-  assert.equal((await f.status()).body.submitted, undefined);
-  assert.equal(f.backend.receiptQueries.length, 0);
-  f.backend.hookVoiceState = 'accepted';
-  f.backend.hookVoiceMapping = { target: 'other@chatroom' };
-  assert.equal((await f.status()).body.submitted, undefined);
-  assert.equal(f.backend.receiptQueries.length, 0);
-  f.backend.hookVoiceMapping = {};
-  const silk = Buffer.from(f.backend.submissions[0].silkBase64, 'base64');
-  const { start, end } = validateSilk(silk);
-  f.backend.contentReceipt = query => {
-    assert.equal(query.get('talker'), chat);
-    assert.equal(query.get('account'), account);
-    assert.equal(query.get('baseline'), '1');
-    assert.equal(query.get('digest'), crypto.createHash('sha256').update(silk.subarray(start, end)).digest('hex'));
-    return row({ createTime: Number(query.get('after')) });
-  };
-  assert.deepEqual((await f.status()).body, {
-    deliveryId: 'fixture-id',
-    durationMs: 100,
-    status: 'confirmed',
-    messageId: '2',
-    serverMessageId: '900000000000000001',
-    receipt: 'wechat-server-id',
-    receiptSource: 'silk-sha256',
-  });
   assert.equal((await f.submit()).body.status, 'confirmed');
   assert.equal(f.backend.submissions.length, 1);
 });
 
-test('the 4.2 Hook never resubmits an operation after queue rejection', async t => {
-  const f = await fixture(t, { hookVoice: true });
+test('OneBot can still admit a voice while all desktop input is paused', async t => {
+  const f = await fixture(t);
+  f.backend.paused = true;
+  f.backend.nextResult = { state: 'queued', submitted: false, submission: 'not-started', segments: [] };
+  const voice = f.adapter().voiceSend;
+  voice.synthesis.candidates = () => [{ id: 'fixture', generation: '1' }];
+  assert.equal((await voice.capability('private', 'filehelper')).voice, true);
   assert.equal((await f.submit()).body.status, 'pending');
-  f.backend.hookVoiceState = 'uncertain';
+  assert.equal(f.backend.submissions.length, 1);
+  const job = voice.load('fixture-id');
+  voice.save({ ...job, deadline: Date.now() - 1 });
   assert.equal((await f.status()).body.status, 'pending');
-  f.backend.hookVoiceState = 'rejected';
-  assert.equal((await f.status()).body.status, 'rejected');
-  assert.equal((await f.submit()).body.status, 'rejected');
-  assert.equal(f.backend.receiptQueries.length, 0);
+  f.backend.paused = false;
+  const { deliveryId } = f.backend.submissions[0];
+  f.backend.results.get(deliveryId).segments = [segment(deliveryId, 0, 1000)];
+  f.backend.confirmLatest();
+  assert.equal((await f.status()).body.status, 'confirmed');
   assert.equal(f.backend.submissions.length, 1);
 });
 
-test('the opt-in 4.2 voice candidate rejects other chats before submission', async t => {
-  const f = await fixture(t, { hookVoice: true });
-  f.backend.hookVoiceTestOnly = true;
-  assert.deepEqual(await f.submit(), { http: 403, body: { error: 'VOICE_HOOK_TARGET_NOT_ALLOWED' } });
-  assert.equal(f.backend.submissions.length, 0);
-});
-
-test('an existing type-34 row and changes to authorization cannot confirm a delivery', async t => {
+test('an automated voice binds the original roster grant and can queue behind a different send', async t => {
   const f = await fixture(t);
-  f.backend.rows = [row()];
-  await f.submit();
-  assert.equal((await f.status()).body.status, 'pending');
-  f.backend.account = 'wxid_other_1234';
-  assert.equal((await f.status()).body.error, 'VOICE_ACCOUNT_OR_TARGET_CHANGED');
-  f.backend.account = account;
-  f.backend.chat = 'different@chatroom';
-  assert.equal((await f.status()).body.error, 'VOICE_ACCOUNT_OR_TARGET_CHANGED');
-  f.config.wechat.whitelist.groups = [];
+  const adapter = f.adapter();
+  const key = 'wechat:private:filehelper';
+  const grant = 'old-grant';
+  f.config.wechat.rosterGrants = { [key]: grant };
   f.saveConfig();
-  assert.equal((await f.status()).body.error, 'VOICE_CONVERSATION_NOT_ALLOWED');
-  assert.equal(f.backend.submissions.length, 1);
-});
-
-test('a definite backend rejection persists and is never resubmitted', async t => {
-  const f = await fixture(t);
-  f.backend.ret = 7;
-  assert.equal((await f.submit()).body.status, 'rejected');
-  await f.restart();
-  assert.equal((await f.submit()).body.status, 'rejected');
-  assert.equal(f.backend.submissions.length, 1);
-});
-
-test('the desktop path sends only filehelper PCM and leaves an uncorrelated receipt unconfirmed', async t => {
-  const f = await fixture(t, { desktop: true });
-  assert.deepEqual(await f.submit({ conversationKey: 'wechat:private:124' }), {
-    http: 403,
-    body: { error: 'VOICE_FILEHELPER_ONLY' },
+  const originalCheck = adapter.checkNative.bind(adapter);
+  adapter.checkNative = async () => {
+    const identity = await originalCheck();
+    f.config.wechat.rosterGrants[key] = 'new-grant';
+    f.saveConfig();
+    return identity;
+  };
+  let syntheses = 0;
+  const selected = { id: 'fixture', generation: 'current' };
+  Object.assign(adapter.voiceSend.synthesis, {
+    selected: () => selected,
+    candidates: () => [selected],
+    generate: async () => {
+      syntheses++;
+      return { wav, allowed: () => true };
+    },
   });
-  assert.equal((await f.submit()).body.status, 'unconfirmed');
-  const [submission] = f.backend.submissions;
-  assert.equal(submission.wxid, 'filehelper');
-  assert.deepEqual(Buffer.from(submission.pcmBase64, 'base64'), wav.subarray(44));
-  await f.restart();
-  f.backend.rows = [row()];
-  assert.equal((await f.submit()).body.status, 'unconfirmed');
-  assert.equal(f.backend.submissions.length, 1);
-});
-
-test('Helper voice-only mode recovers acceptance and blocks account changes without a native Hook', async t => {
-  const f = await fixture(t, { helper: true, loseResponse: true, receiptTimeoutMs: 0 });
-  assert.equal(
-    (await f.submit({ conversationKey: 'wechat:private:124' })).body.error,
-    'VOICE_HELPER_TARGET_NOT_ALLOWED',
-  );
-  f.backend.helperAccount = 'wxid_other';
-  assert.equal((await f.submit()).http, 503);
+  const bridge = new WechatOneBotAdapter();
+  bridge.server.action = async (action, params) => {
+    const reply = await adapter.action({ action, params });
+    assert.equal(reply.status, 'ok', reply.message);
+    return reply;
+  };
+  const request = { kind: 'private', target, text: '合成夹具', deliveryId: 'a'.repeat(64) };
+  const revoked = await bridge.sendVoiceText({ ...request, rosterGrant: grant });
+  assert.deepEqual(revoked, { status: 'rejected', fallback: false, error: 'VOICE_CONVERSATION_GRANT_CHANGED' });
+  assert.equal(syntheses, 0);
   assert.equal(f.backend.submissions.length, 0);
-  f.backend.helperAccount = 'wxid_fixture';
-  assert.deepEqual((await f.submit()).body, { deliveryId: 'fixture-id', durationMs: 100, status: 'unconfirmed' });
-  assert.equal((await decodeVoice(Buffer.from(f.backend.submissions[0].silkBase64, 'base64'))).durationSeconds, 0.1);
-  await f.restart();
-  f.backend.rows = [row()];
-  assert.deepEqual((await f.status()).body, {
-    deliveryId: 'fixture-id',
-    durationMs: 100,
-    status: 'unconfirmed',
-    submitted: true,
-  });
-  assert.equal((await f.submit()).body.submitted, true);
+
+  adapter.targetsSending.add('private:wxid_other');
+  const pending = await bridge.sendVoiceText({ ...request, rosterGrant: 'new-grant' });
+  assert.deepEqual(pending, { status: 'pending', fallback: false });
+  assert.equal(syntheses, 1);
+  assert.equal(f.backend.submissions.length, 1);
+  assert.equal(f.backend.submissions[0].rosterGrant, 'new-grant');
+  f.backend.confirmLatest();
+  const confirmed = await bridge.sendVoiceText({ ...request, rosterGrant: 'new-grant', receiptOnly: true });
+  assert.equal(confirmed.status, 'confirmed');
   assert.equal(f.backend.submissions.length, 1);
 });
-
-test('Helper sends to the permitted private and group chat and confirms only an exact target receipt', async t => {
-  const f = await fixture(t, { helper: true });
-  const friend = { conversationKey: 'wechat:private:124', deliveryId: 'friend-voice' };
-  const group = { conversationKey: 'wechat:group:125', deliveryId: 'group-voice' };
-  f.backend.helperTargets = ['filehelper', chat];
-  assert.equal((await f.submit(friend)).body.error, 'VOICE_HELPER_TARGET_NOT_ALLOWED');
-  assert.equal((await f.submit(group)).body.error, 'VOICE_CONVERSATION_NOT_ALLOWED');
-  assert.deepEqual(f.backend.submissions, []);
-
-  f.backend.helperTargets.push('wxid_other');
-  f.config.wechat.whitelist.groups.push('125');
-  f.saveConfig();
-  for (const request of [friend, group]) assert.equal((await f.submit(request)).body.submitted, true);
-  assert.deepEqual(
-    f.backend.submissions.map(item => item.wxidorgid),
-    ['wxid_other', chat],
+test('filehelper acceptance uses production VoiceSend admission and aggregate query receipts', async t => {
+  const f = await fixture(t);
+  let waited = 0;
+  const result = await acceptVoiceDelivery(
+    f.adapter().voiceSend,
+    { deliveryId: 'acceptance-fixture', kind: 'private', target: 'filehelper', wav: acceptanceVoiceSource().wav },
+    {
+      wait: async () => {
+        waited++;
+        f.backend.confirmLatest();
+      },
+    },
   );
-  assert.equal((await f.submit({ ...group, deliveryId: friend.deliveryId })).body.error, 'VOICE_DELIVERY_ID_CONFLICT');
-
-  f.backend.targetRows.set('wxid_other', [row()]);
-  f.backend.helperReceipt = { target: chat, localId: 2 };
-  assert.equal((await f.status(friend.deliveryId)).body.status, 'pending');
-  f.backend.helperReceipt = { localId: 2 };
-  assert.equal((await f.status(friend.deliveryId)).body.status, 'confirmed');
-  f.backend.targetRows.set(chat, [row({ serverId: '0' })]);
-  assert.equal((await f.status(group.deliveryId)).body.status, 'pending');
-  f.backend.targetRows.set(chat, [row()]);
-  assert.equal((await f.status(group.deliveryId)).body.status, 'confirmed');
-  f.backend.helperTargets = ['filehelper', 'wxid_other'];
-  assert.equal((await f.status(group.deliveryId)).body.error, 'VOICE_HELPER_TARGET_NOT_ALLOWED');
-  assert.equal(f.backend.submissions.length, 2);
-});
-
-test('Helper voice receipts can be recovered by a unique SILK digest after restart', async t => {
-  const f = await fixture(t, { helper: true, loseResponse: true });
-  f.backend.rows = [row({ localId: 1, serverId: '900000000000000000' })];
-  await f.submit();
-  await f.restart();
-  const silk = Buffer.from(f.backend.submissions[0].silkBase64, 'base64');
-  const { start, end } = validateSilk(silk);
-  const digest = crypto.createHash('sha256').update(silk.subarray(start, end)).digest('hex');
-  f.backend.contentReceipt = query => {
-    assert.equal(query.get('talker'), 'filehelper');
-    assert.equal(query.get('account'), 'wxid_fixture');
-    assert.equal(query.get('baseline'), '1');
-    assert.equal(query.get('digest'), digest);
-    return row({ localId: 1, createTime: Number(query.get('after')) });
-  };
-  assert.equal((await f.status()).body.status, 'pending');
-  assert.equal(f.backend.receiptQueries.length, 1);
-  f.backend.contentReceipt = query => row({ createTime: Number(query.get('after')) });
-  assert.deepEqual((await f.status()).body, {
-    deliveryId: 'fixture-id',
-    durationMs: 100,
-    status: 'confirmed',
-    messageId: '2',
-    serverMessageId: '900000000000000001',
-    receipt: 'wechat-server-id',
-    receiptSource: 'silk-sha256',
-  });
+  assert.equal(result.receiptSource, 'desktop-acoustic-match');
+  assert.equal(result.segments.length, 1);
+  assert.equal(waited, 1);
   assert.equal(f.backend.submissions.length, 1);
-  f.backend.rows = [row()];
-  await f.submit({ deliveryId: 'new-same-voice' });
-  f.backend.contentReceipt = query => {
-    assert.equal(query.get('baseline'), '2');
-    return row({ localId: 3, createTime: Number(query.get('after')) });
+  assert.equal(f.backend.submissions[0].target, 'filehelper');
+});
+test('an interruption before voice admission reuses the original audio and operation ID after restart', async t => {
+  const f = await fixture(t);
+  const adapter = f.adapter(),
+    original = adapter.dispatchDesktop.bind(adapter);
+  let attempts = 0;
+  adapter.dispatchDesktop = async (...args) => {
+    if (++attempts === 1) throw Error('reader lookup interrupted');
+    return original(...args);
   };
-  assert.equal((await f.status('new-same-voice')).body.status, 'pending');
-  f.backend.contentReceipt = query =>
-    row({
-      localId: 3,
-      serverId: '900000000000000002',
-      createTime: Number(query.get('after')),
-    });
-  assert.equal((await f.status('new-same-voice')).body.messageId, '3');
-  assert.equal((await f.status()).body.messageId, '2');
-  assert.equal(f.backend.submissions.length, 2);
+  const response = await f.submit();
+  assert.equal(response.body.status, 'pending');
+  assert.equal(f.backend.submissions.length, 0);
+  const pending = adapter.voiceSend.load('fixture-id');
+  assert(pending.pendingPcm);
+  await f.restart();
+  await f.status();
+  assert.equal(f.backend.submissions.length, 1);
+  assert.equal(f.backend.submissions[0].deliveryId, pending.operationId);
+  assert.equal(f.backend.submissions[0].pcmBase64, pending.pendingPcm);
+  assert.equal(f.adapter().voiceSend.load('fixture-id').pendingPcm, undefined);
+  await f.status();
+  assert.equal(f.backend.submissions.length, 1);
+});
+test('observing an interrupted voice never dispatches PCM that the desktop did not accept', async t => {
+  const f = await fixture(t),
+    adapter = f.adapter();
+  adapter.dispatchDesktop = async () => {
+    throw Error('interrupted before admission');
+  };
+  await f.submit();
+  const job = adapter.voiceSend.load('fixture-id');
+  assert(job.pendingPcm);
+  const result = await adapter.voiceSend.status(job, null, true);
+  assert.equal(result.status, 'rejected');
+  assert.equal(f.backend.submissions.length, 0);
+  assert.equal(adapter.voiceSend.load('fixture-id').pendingPcm, undefined);
 });
 
-test('identical audio submitted more than once in a chat cannot confirm by content alone', async t => {
-  const f = await fixture(t, { helper: true });
+test('a lost submission response survives restart and queries the same UUID without sending again', async t => {
+  const f = await fixture(t, { loseResponse: true });
   await f.submit();
-  await f.submit({ deliveryId: 'repeat-voice' });
+  const operation = f.backend.submissions[0].deliveryId;
   await f.restart();
-  f.backend.contentReceipt = query => row({ createTime: Number(query.get('after')) });
-  for (const id of ['fixture-id', 'repeat-voice']) assert.equal((await f.status(id)).body.status, 'pending');
-  assert.equal(f.backend.receiptQueries.length, 0);
-  assert.equal(f.backend.submissions.length, 2);
+  await f.submit();
+  assert.equal(f.backend.submissions.length, 1);
+  assert.equal(f.adapter().voiceSend.load('fixture-id').operationId, operation);
+  f.backend.confirmLatest();
+  assert.equal((await f.status()).body.status, 'confirmed');
+  assert.equal(f.backend.submissions.length, 1);
+});
+test('claimed confirmation with no segments cannot confirm a logical voice', async t => {
+  const f = await fixture(t);
+  f.backend.nextResult = { state: 'confirmed', pending: false, submission: 'confirmed', confirmed: true, segments: [] };
+  const result = await f.submit();
+  assert.notEqual(result.body.status, 'confirmed');
+  assert.equal(f.backend.submissions.length, 1);
+});
+test('long voice keeps confirmed earlier parts and unknown later parts without a text fallback', async t => {
+  const f = await fixture(t);
+  const parts = Array.from({ length: 9 }, (_, index) =>
+    segment(
+      'long',
+      index,
+      index === 8 ? 1000 : 8000,
+      index < 8 ? String(900000000000000001n + BigInt(index)) : undefined,
+    ),
+  );
+  parts[8].state = 'unknown';
+  f.backend.nextResult = {
+    state: 'unconfirmed',
+    pending: false,
+    submission: 'unknown',
+    confirmed: false,
+    segments: parts,
+  };
+  const result = await f.submit({ wavBase64: pcmWave(Buffer.alloc(32000 * 65).toString('base64')).toString('base64') });
+  assert.notEqual(result.body.status, 'confirmed');
+  assert.equal(result.body.segments.filter(part => part.state === 'confirmed').length, 8);
+  assert.equal(result.body.segments.at(-1).state, 'unknown');
+  assert.equal(f.backend.submissions.length, 1);
+  assert.equal(f.backend.textSubmissions.length, 0);
+  await f.restart();
+  await f.status();
+  assert.equal(f.backend.submissions.length, 1);
+});
+
+test('a cancelled later bubble after a confirmed segment is terminal and cannot fall back', async t => {
+  const f = await fixture(t);
+  const parts = [segment('partial', 0, 7500, '12345'), { ...segment('partial', 1, 1500), state: 'cancelled' }];
+  f.backend.nextResult = {
+    state: 'cancelled',
+    pending: false,
+    submission: 'submitted',
+    confirmed: false,
+    segments: parts,
+  };
+  const result = await f.submit();
+  assert.equal(result.body.status, 'unconfirmed');
+  assert.equal(result.body.submitted, true);
+  assert.equal((await f.status()).body.status, 'unconfirmed');
+  assert.equal(f.backend.submissions.length, 1);
 });
 
 test('the installed TTS plugin tests settings and submits normalized speech once per delivery', async t => {
-  const f = await fixture(t, { helper: true });
+  const f = await fixture(t, {});
   const calls = [];
   const providerWav = pcmWav(Buffer.alloc(24000 * 2 * 9));
   providerWav.writeUInt32LE(24000, 24);
@@ -626,7 +602,7 @@ test('the installed TTS plugin tests settings and submits normalized speech once
     voice: 'fixture-voice',
     recognitionModel: 'team/asr',
   };
-  const set = (enabled, chats = ['wechat:private:123']) =>
+  const set = (enabled, chats = ['wechat:private:filehelper']) =>
     updatePlugin(f.directory, 'speech-synthesis', {
       revision: configuration(f.directory).revision,
       enabled,
@@ -634,7 +610,7 @@ test('the installed TTS plugin tests settings and submits normalized speech once
       settings,
       permissions: ['audio_read', 'audio_synthesize'],
     });
-  const text = { conversationKey: 'wechat:private:123', deliveryId: 'text-tts', text: '测试后台发送。' };
+  const text = { conversationKey: 'wechat:private:filehelper', deliveryId: 'text-tts', text: '测试后台发送。' };
   const send = overrides => f.call('/api/voice/send-text', { body: { ...text, ...overrides } });
   assert.equal((await send()).body.error, 'VOICE_TTS_PLUGIN_DISABLED');
   assert.equal(calls.length, 0);
@@ -673,8 +649,7 @@ test('the installed TTS plugin tests settings and submits normalized speech once
     authorization: 'Bearer fixture-key',
     body: { model: 'team/tts', voice: 'fixture-voice', input: text.text, response_format: 'wav' },
   });
-  const { silkBase64 } = f.backend.submissions[0];
-  assert.equal((await decodeVoice(Buffer.from(silkBase64, 'base64'))).durationSeconds, 9);
+  assert.equal(Buffer.from(f.backend.submissions[0].pcmBase64, 'base64').length / 32000, 9);
   await f.restart();
   assert.equal((await send()).body.submitted, true);
   assert.equal((await send({ text: '另一段文字' })).body.error, 'VOICE_DELIVERY_ID_CONFLICT');
@@ -699,8 +674,8 @@ test('the installed TTS plugin tests settings and submits normalized speech once
   assert.equal(calls.at(-1).url, '/tenant/v1/audio/transcriptions');
 });
 
-test('1.6.0 capabilities: TTS and single-file recognition use their own services and keys; WeChat gets one native voice', async t => {
-  const f = await fixture(t, { helper: true });
+test('TTS and single-file recognition keep independent services and keys while the desktop engine gets one logical voice', async t => {
+  const f = await fixture(t, {});
   const calls = [];
   const providerWav = pcmWav(Buffer.alloc(16000 * 2, 4));
   const provider = http.createServer(async (req, res) => {
@@ -756,7 +731,7 @@ test('1.6.0 capabilities: TTS and single-file recognition use their own services
   updatePlugin(f.directory, 'speech-synthesis', {
     revision: configuration(f.directory).revision,
     enabled: true,
-    chats: ['wechat:private:123'],
+    chats: ['wechat:private:filehelper'],
     permissions: ['audio_read', 'audio_synthesize'],
     settings: {
       voiceMode: 'separate',
@@ -767,13 +742,13 @@ test('1.6.0 capabilities: TTS and single-file recognition use their own services
     },
   });
   const submitted = await f.call('/api/voice/send-text', {
-    body: { conversationKey: 'wechat:private:123', deliveryId: 'v16-tts', text: 'DSH 选择了语音回复。' },
+    body: { conversationKey: 'wechat:private:filehelper', deliveryId: 'v16-tts', text: 'DSH 选择了语音回复。' },
   });
   assert.equal(submitted.http, 202);
   assert.equal(submitted.body.submitted, true);
   assert.deepEqual(calls, [{ url: '/tts/v1/audio/speech', authorization: 'Bearer tts-key' }]);
   assert.equal(f.backend.submissions.length, 1);
-  assert.equal((await decodeVoice(Buffer.from(f.backend.submissions[0].silkBase64, 'base64'))).durationSeconds, 1);
+  assert.equal(Buffer.from(f.backend.submissions[0].pcmBase64, 'base64').length / 32000, 1);
   const runner = createSettingsActionRunner({
     root: f.directory,
     describe: () => ({ ui: { settings: { actions: ['check-input', 'credentials'] } } }),
@@ -845,8 +820,8 @@ async function realtimeProvider(t, choices, { audioStatus = () => 'completed', o
 }
 
 async function realtimeFixture(t, choices, providerOptions) {
-  const f = await fixture(t, { helperFull: true, stream: true, receiptTimeoutMs: 1500 });
-  f.backend.helperTargets = ['wxid_other'];
+  const f = await fixture(t, { stream: true, receiptTimeoutMs: 1500 });
+  f.backend.autoConfirm = true;
   const { provider, events } = await realtimeProvider(t, choices, providerOptions);
   const installer = new PluginInstaller(f.directory);
   t.after(() => installer.dispose());
@@ -857,7 +832,7 @@ async function realtimeFixture(t, choices, providerOptions) {
   updatePlugin(f.directory, 'speech-synthesis', {
     revision: configuration(f.directory).revision,
     enabled: true,
-    chats: ['wechat:private:124'],
+    chats: ['wechat:private:wxid_other'],
     permissions: ['audio_read', 'audio_synthesize'],
     settings: {
       voiceMode: 'realtime',
@@ -867,9 +842,7 @@ async function realtimeFixture(t, choices, providerOptions) {
       voice: 'fixture-voice',
     },
   });
-  // Voice receipts: the reader reports a unique outgoing voice for the submitted SILK.
-  f.backend.contentReceipt = query =>
-    row({ localId: 50, createTime: Number(query.get('after')), serverId: '920000000000000001' });
+  // The desktop engine supplies per-segment acoustic receipts.
   f.backend.targetRows.set('wxid_other', []);
   const textEvent = (rawid, content) => ({
     event: 'message.new',
@@ -877,7 +850,7 @@ async function realtimeFixture(t, choices, providerOptions) {
     rawid,
     sessionId: 'wxid_other',
     talkerId: 'wxid_other',
-    conversationId: '124',
+    conversationId: 'wxid_other',
     content,
   });
   const voiceEvent = id => ({
@@ -886,12 +859,12 @@ async function realtimeFixture(t, choices, providerOptions) {
     rawid: 'v' + id.slice(0, 6),
     sessionId: 'wxid_other',
     talkerId: 'wxid_other',
-    conversationId: '124',
+    conversationId: 'wxid_other',
     content: '[语音]',
     voice: { id, durationSeconds: 0.1 },
   });
   const settle = async () => {
-    await new Promise(resolve => setTimeout(resolve, 60));
+    await until(() => f.backend.inbox.length === 0, 'durable Reader acknowledgements');
     await f.adapter().realtimeQueue;
   };
   const records = () =>
@@ -927,13 +900,13 @@ test('Realtime chooses per turn: text in -> one voice, voice in -> one text, dup
     f.events.find(event => event.type === 'conversation.item.create').item.content[0].text,
     '用语音回答：你好吗？',
   );
-  assert.equal(f.backend.submissions[0].wxidorgid, 'wxid_other');
+  assert.equal(f.backend.submissions[0].target, 'wxid_other');
 
   const spoken = f.voiceEvent('d'.repeat(64));
   f.backend.emitVoice(spoken);
   await until(() => f.backend.textSubmissions.length === 1, 'text submit');
   await f.settle();
-  assert.equal(f.backend.textSubmissions[0].msg, '这是你要复制的命令：ls -la');
+  assert.equal(f.backend.textSubmissions[0].text, '这是你要复制的命令：ls -la');
   assert.equal(f.backend.submissions.length, 1);
   await until(() => f.records().every(record => record.stage === 'sent'), 'records sent');
   assert.deepEqual(
@@ -974,7 +947,7 @@ test('an invalid choice ends the turn; a definite synthesis failure sends the ch
   f.backend.emitVoice(second);
   await until(() => f.backend.textSubmissions.length === 1, 'fallback text');
   await f.settle();
-  assert.equal(f.backend.textSubmissions[0].msg, '语音没生成，改回文字。');
+  assert.equal(f.backend.textSubmissions[0].text, '语音没生成，改回文字。');
   assert.equal(f.backend.submissions.length, 0);
   const record = f.records().find(item => item.fallback === 'text');
   assert.deepEqual([record.mode, record.voiceError, record.stage], ['voice', 'VOICE_REALTIME_AUDIO', 'sent']);
@@ -1004,10 +977,10 @@ test('permission revoked before sending stops both forms; an uncertain voice sub
   assert.deepEqual([f.backend.submissions.length, f.backend.textSubmissions.length], [0, 0]);
 
   revoke = undefined;
-  f.config.wechat.whitelist.private = [target, '124'];
+  f.config.wechat.whitelist.private = [target, 'wxid_other'];
   f.saveConfig();
   f.backend.loseVoice = true;
-  f.backend.contentReceipt = null;
+
   const uncertain = f.textEvent('3002', '用语音说');
   f.backend.emitVoice(uncertain);
   await until(() => f.backend.submissions.length === 1, 'uncertain voice submit');
@@ -1020,21 +993,47 @@ test('permission revoked before sending stops both forms; an uncertain voice sub
   await f.settle();
   assert.deepEqual([f.backend.submissions.length, f.backend.textSubmissions.length], [1, 0]);
   // A late receipt confirms the original delivery without sending again.
-  f.backend.contentReceipt = query =>
-    row({ localId: 51, createTime: Number(query.get('after')), serverId: '920000000000000002' });
+  f.backend.confirmLatest('920000000000000002');
   const status = await f.status(record.id);
   assert.equal(status.body.status, 'confirmed');
-  assert.equal(status.body.receiptSource, 'silk-sha256');
+  assert.equal(status.body.receiptSource, 'desktop-acoustic-match');
   assert.equal(f.backend.submissions.length, 1);
 });
 
 test('a backend without voice offers the model text only and sends the reply as text', async t => {
   const f = await realtimeFixture(t, [{ mode: 'voice', text: '本轮只能打字回复。' }]);
-  f.backend.helperTargets = [];
+  f.backend.voiceEnabled = false;
   f.backend.emitVoice(f.textEvent('4001', '你好'));
   await until(() => f.backend.textSubmissions.length === 1, 'text-only reply');
   await f.settle();
   assert.match(f.events.find(event => event.type === 'session.update').session.instructions, /本轮只能回复文字/);
   assert.equal(f.backend.submissions.length, 0);
   assert.equal(f.events.filter(event => event.type === 'response.create').length, 1);
+});
+
+test('Realtime sends copyable content as the original text even when a provider selected voice', async t => {
+  const f = await realtimeFixture(t, [{ mode: 'voice', text: 'www.example.test' }]);
+  f.backend.emitVoice(f.textEvent('5001', '地址发我'));
+  await until(() => f.backend.textSubmissions.length === 1, 'copyable reply');
+  await f.settle();
+  assert.equal(f.backend.textSubmissions[0].text, 'www.example.test');
+  assert.equal(f.backend.submissions.length, 0);
+});
+
+test('a Realtime text survives an interrupted admission and a Reader acknowledgement lost at reconnect', async t => {
+  const f = await realtimeFixture(t, [{ mode: 'text', text: '一次回复' }]);
+  f.backend.reconnectBeforeAck = true;
+  f.backend.interruptTextAdmission = true;
+  const adapter = f.adapter();
+  const send = adapter.socket.send.bind(adapter.socket);
+  let dshCalls = 0;
+  adapter.socket.send = raw => {
+    if (JSON.parse(raw).post_type === 'message') dshCalls++;
+    return send(raw);
+  };
+  f.backend.emitVoice(f.textEvent('replayed', '你好'));
+  await f.settle();
+  assert.equal(dshCalls, 0);
+  assert.equal(f.backend.textSubmissions.length, 1);
+  assert.equal(f.records()[0].textStatus, 'confirmed');
 });

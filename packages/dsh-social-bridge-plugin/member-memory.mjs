@@ -1,3 +1,4 @@
+import { parseChatKey, validUserId } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -14,7 +15,7 @@ const cleanName = name =>
     .trim()
     .slice(0, 80);
 export function memberObservations(key, rows) {
-  if (!/^wechat:group:[1-9]\d{0,15}$/.test(key)) return [];
+  if (parseChatKey(key)?.kind !== 'group') return [];
   return rows
     .filter(
       row =>
@@ -22,7 +23,7 @@ export function memberObservations(key, rows) {
         !row.forwardedRecord &&
         row.interaction !== 'pat' &&
         HEX.test(row.sender_key ?? '') &&
-        /^[1-9]\d{0,15}$/.test(row.sender_id ?? '') &&
+        validUserId(row.sender_id) &&
         row.sender_id !== row.self_id,
     )
     .slice(0, 20)
@@ -58,7 +59,12 @@ export function createMemberMemory({ root, accountScope, isAllowed = () => true,
   const fileFor = key => {
     if (!allowed(key)) throw Error('MEMBER_MEMORY_NOT_ALLOWED');
     const base = path.join(root, 'state'),
-      file = path.join(base, 'member-memory', accountScope, key.split(':')[2] + '.json');
+      file = path.join(
+        base,
+        'member-memory',
+        accountScope,
+        crypto.createHash('sha256').update(key).digest('hex') + '.json',
+      );
     for (let current = file; ; current = path.dirname(current)) {
       if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) throw Error('MEMBER_MEMORY_PATH_INVALID');
       if (current === root) break;
@@ -134,7 +140,7 @@ export function createMemberMemory({ root, accountScope, isAllowed = () => true,
       row =>
         row &&
         HEX.test(row.memberId ?? '') &&
-        /^[1-9]\d{0,15}$/.test(row.senderId ?? '') &&
+        validUserId(row.senderId) &&
         EVIDENCE.test(row.evidenceId ?? '') &&
         typeof row.name === 'string' &&
         row.name.length <= 80 &&

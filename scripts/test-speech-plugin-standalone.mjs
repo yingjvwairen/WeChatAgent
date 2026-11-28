@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fixturePluginAccount, selectPluginAccount } from './test-fixtures/plugin-account.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -212,6 +213,7 @@ test('the real ZIP works on a copied unchanged host with no bundled preset modul
     }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  selectPluginAccount(workspace);
   const installer = new PluginInstaller(workspace);
   let runtime;
   t.after(async () => {
@@ -244,7 +246,7 @@ test('the real ZIP works on a copied unchanged host with no bundled preset modul
   });
   runtime = new PluginRuntime({
     root: workspace,
-    accountScope: 'fixture-account',
+    accountScope: fixturePluginAccount,
     readAudio: async (_id, _chat, _plugin, options) => {
       assert.equal(options.format, 'wav');
       return { ...audio, id };
@@ -258,7 +260,7 @@ test('the real ZIP works on a copied unchanged host with no bundled preset modul
   const upgraded = catalog.configuration(workspace).config.plugins['speech-recognition'];
   assert.equal(upgraded.enabled, false);
   assert.deepEqual(upgraded.permissions, []);
-  assert.deepEqual(upgraded.chats, [chat]);
+  assert.deepEqual(catalog.pluginCatalog(workspace).plugins[0].chats, [chat]);
   assert.equal(upgraded.settings.apiKey, 'fixture-key');
   assert.equal(upgraded.settings.apiProtocol, 'auto');
   const before = Object.fromEntries(

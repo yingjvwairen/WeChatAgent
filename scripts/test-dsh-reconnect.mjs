@@ -63,9 +63,11 @@ function fixture(t, options = {}) {
         calls.push(args);
         return options.decide ? options.decide(...args) : 'RESPOND: fixture response';
       },
+      inspectReceipt: options.inspectReceipt,
+      deliveryRetry: { receiptDelayMs: 10 },
       send: async (...args) => {
         sent.push(args);
-        return { delivered: 'database-confirmed' };
+        return options.send ? options.send(...args) : { delivered: 'database-confirmed' };
       },
       log: line => logs.push(line),
     });
@@ -425,4 +427,78 @@ test('health readiness requires the authenticated bridge contract and exposes th
   assert.equal((await client.connectionHealth()).ready, false);
   health = { ...health, ok: true, project: 'another' };
   assert.equal((await client.connectionHealth()).ready, false);
+});
+
+test('an interrupted desktop reply survives restart as an observation of its original part only', async t => {
+  let status = 'pending';
+  const observed = [];
+  const f = fixture(t, {
+    decide: async () => 'RESPOND: first text\n\nsecond text',
+    send: async () => ({ pending: true }),
+    inspectReceipt: async (_, part) => {
+      observed.push(part.deliveryId);
+      return status;
+    },
+  });
+  await f.guard.check();
+  f.engine.receive(incoming('receipt fixture', f.now + 1000));
+  await until(() => f.buffer.pendingReplies.get(key)?.parts[0]?.state === 'submitted');
+  const id = f.sent[0][2].deliveryId;
+  f.setHealth({ ready: false });
+  await f.guard.check({ force: true });
+  assert.deepEqual(
+    f.buffer.pendingReplies.get(key).parts.map(part => part.state),
+    ['submitted', 'cancelled'],
+  );
+  f.engine.stop();
+  f.guard.stop();
+  const restored = f.make();
+  await restored.guard.check();
+  status = 'confirmed';
+  restored.engine.replay(key);
+  await until(() =>
+    restored.buffer.recent(key).some(row => row.delivery_id === id && row.delivery_status === 'confirmed'),
+  );
+  assert.equal(restored.buffer.pendingReplies.size, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.calls.length, 1);
+  assert.ok(observed.length);
+  assert.ok(observed.every(value => value === id));
+});
+
+test('DSH restart preserves an in-flight image receipt and discards its queued successor', async t => {
+  let observed = 0;
+  const f = fixture(t, {
+    inspectReceipt: async (_target, part) => {
+      assert.equal(part.stickerId, sticker);
+      observed++;
+      return 'confirmed';
+    },
+  });
+  await f.guard.check();
+  const delivered = 'c'.repeat(64),
+    queued = 'd'.repeat(64),
+    msg = incoming('image receipt', f.now);
+  const entry = (id, state) => ({
+    key,
+    message: msg,
+    part: { stickerId: sticker, deliveryId: id, state },
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 30000,
+  });
+  f.buffer.mediaReplies.set(delivered, entry(delivered, 'submitted'));
+  f.buffer.mediaReplies.set(queued, entry(queued, 'queued'));
+  f.buffer.saveMedia();
+  f.setHealth({ ready: false });
+  await f.guard.check({ force: true });
+  f.engine.stop();
+  f.guard.stop();
+  const restored = f.make();
+  await restored.guard.check();
+  await until(() =>
+    restored.buffer.recent(key).some(row => row.delivery_id === delivered && row.delivery_status === 'confirmed'),
+  );
+  assert.equal(restored.buffer.mediaReplies.size, 0);
+  assert.ok(observed >= 1);
+  assert.equal(f.sent.length, 0);
 });

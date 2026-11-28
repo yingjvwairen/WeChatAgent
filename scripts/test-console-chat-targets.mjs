@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createChatTargetsApi } from './console-chat-targets.mjs';
 import { mergeTargetSave } from '../public/console/chat-targets.js';
 import { conversationGrant, reconcileRosterGrants } from '../packages/wechat-identity.mjs';
+import { withoutLiveSettings, requiresRestart } from '../public/console/layout-model.mjs';
 
 const peer = 'fixture-friend',
   peerId = peer,
@@ -51,6 +52,8 @@ test('one immediate target save combines friends and groups without changing unr
   assert.deepEqual(saved.config.persona, before.config.persona);
   assert.deepEqual(saved.config.input, before.config.input);
   assert.equal(f.calls.length, 1);
+  assert.deepEqual(withoutLiveSettings(saved.config), withoutLiveSettings(before.config));
+  assert.equal(requiresRestart('wechat.whitelist'), false);
 });
 test('removing then readding a target revokes its original grant while retaining the chat settings', async () => {
   const f = fixture(),

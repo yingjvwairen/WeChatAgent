@@ -99,6 +99,26 @@ export async function imageBlocks(
             name: 'wechat-image-' + image.id.slice(0, 12),
           });
           const block = { type: 'image', attachment };
+          const origin =
+            Number.isInteger(content.forwardItem) && content.forwardItem >= 1 && content.forwardItem <= 50
+              ? '合并转发第 ' + content.forwardItem + ' 条历史消息的'
+              : '';
+          if (
+            content.sourceQuality === 'video-frame' &&
+            Number.isInteger(content.atMs) &&
+            content.atMs >= 0 &&
+            content.atMs <= 300000
+          ) {
+            return [
+              { type: 'text', text: `[${origin}视频采样画面，时间 ${(content.atMs / 1000).toFixed(2)} 秒]` },
+              block,
+            ];
+          }
+          if (origin)
+            return [
+              { type: 'text', text: '[' + origin + (content.sourceQuality === 'thumbnail' ? '缩略图' : '附图') + ']' },
+              block,
+            ];
           return content.sourceQuality === 'thumbnail'
             ? [
                 {

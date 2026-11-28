@@ -7,6 +7,7 @@ import zstandard
 import Crypto
 import PIL
 import imageio_ffmpeg
+import av
 import importlib.util
 import pathlib
 import subprocess

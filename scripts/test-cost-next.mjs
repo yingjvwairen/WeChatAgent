@@ -9,7 +9,7 @@ import { summarizeUsage } from '../packages/dsh-social-bridge-plugin/usage-summa
 import { sessionUsage } from '../public/console/session-usage.js';
 import { SOCIAL_FINAL_OUTPUT_HINT } from '../packages/dsh-social-bridge-plugin/prompt-context.mjs';
 const key = 'wechat:private:123',
-  other = 'wechat:group:456';
+  other = 'wechat:group:456@chatroom';
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wca-cost-next-')),
     store = new HistoryStore(root);

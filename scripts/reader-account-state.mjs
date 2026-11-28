@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { activeReaderAccount } from '../packages/wechat-identity.mjs';
+export { activeReaderAccount } from '../packages/wechat-identity.mjs';
 
 const read = (file, fallback = {}) =>
   fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) : fallback;
@@ -20,7 +22,16 @@ const stateFiles = [
   'search',
   'media',
 ];
-const chatFeatures = ['stickers', 'search', 'proactive', 'context', 'memeLibrary', 'memberMemory', 'fishNotebook'];
+const chatFeatures = [
+  'stickers',
+  'search',
+  'proactive',
+  'context',
+  'memeLibrary',
+  'memberMemory',
+  'fishNotebook',
+  'history',
+];
 const protectedKey = key => typeof key === 'string' && /^userdpapi:[A-Za-z0-9+/=]+$/.test(key);
 
 export function readerAccountDirectory(root, settings) {
@@ -43,13 +54,6 @@ export function readerAccountId(root, settings) {
   return crypto.createHash('sha256').update(directory).digest('hex');
 }
 
-export function activeReaderAccount(root) {
-  const value = read(path.join(root, 'state/weflow/active-account.json'), { id: '', legacyId: '' });
-  for (const field of ['id', 'legacyId'])
-    if (value[field] && !/^[a-f0-9]{64}$/.test(value[field])) throw Error('READER_ACCOUNT_STATE_INVALID');
-  return { id: value.id || '', legacyId: value.legacyId || '' };
-}
-
 export function cachedReaderAccount(root, id) {
   return read(path.join(root, 'state/weflow/reader-accounts.json')).entries?.[id];
 }
@@ -58,6 +62,7 @@ export function accountChatSettings(config) {
   return {
     assistant: structuredClone(config.wechat.assistant ?? {}),
     whitelist: structuredClone(config.wechat.whitelist),
+    rosterGrants: structuredClone(config.wechat.rosterGrants ?? {}),
     personaChats: structuredClone(config.persona.chats ?? {}),
     workModes: structuredClone(config.wechat.workModes ?? {}),
     modeSettings: structuredClone(config.wechat.modeSettings ?? {}),
@@ -127,6 +132,8 @@ export function applyReaderAccount(root, previousReader, nextReader, config) {
     const chats = incoming?.chats ?? { whitelist: { private: [], groups: [] }, personaChats: {}, featureChats: {} };
     selectedConfig.wechat.assistant = structuredClone(chats.assistant ?? {});
     selectedConfig.wechat.whitelist = structuredClone(chats.whitelist);
+    if (chats.rosterGrants) selectedConfig.wechat.rosterGrants = structuredClone(chats.rosterGrants);
+    else delete selectedConfig.wechat.rosterGrants;
     selectedConfig.persona.chats = structuredClone(chats.personaChats ?? {});
     selectedConfig.wechat.workModes = structuredClone(chats.workModes ?? {});
     selectedConfig.wechat.modeSettings = structuredClone(chats.modeSettings ?? {});
@@ -174,7 +181,7 @@ export function applyReaderAccount(root, previousReader, nextReader, config) {
     if (changed) write(configFile, selectedConfig);
     if (changed && fs.existsSync(ioFile)) write(ioFile, { ...read(ioFile), self_wxid: '' });
     const legacyId = currentIdentity.legacyId || (!currentIdentity.id && previousId ? previousId : '');
-    write(identityFile, { id: nextId, legacyId });
+    write(identityFile, { id: nextId, legacyId, directory: readerAccountDirectory(root, nextReader) });
     return { changed, reader: selectedReader, id: nextId, needsDshRestart: currentIdentity.id !== nextId };
   } catch (error) {
     for (const item of switched.reverse()) {

@@ -1,13 +1,13 @@
 import hashlib
 import json
-import os
 import pathlib
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from wechat_files import FILE_TYPE, FileCatalog, file_policy, parse_file_message
 
-KEY, SENDER = 'wechat:group:123', 'wxid_fixture'
+KEY, SENDER = 'wechat:group:123@chatroom', 'wxid_fixture'
 
 
 class Files(unittest.TestCase):
@@ -20,13 +20,23 @@ class Files(unittest.TestCase):
         (self.root / 'config').mkdir()
         self.config = {
             'wechat': {
-                'whitelist': {'groups': ['123'], 'private': []},
+                'whitelist': {'groups': ['123@chatroom'], 'private': []},
                 'workModes': {KEY: 'assistant'},
                 'assistant': {'administrators': [SENDER], 'fileTransferChats': {KEY: True}},
             }
         }
         self.save()
-        self.catalog = FileCatalog(self.root, self.account)
+        self.active = True
+        self.generation = 'first'
+        self.reader = SimpleNamespace(
+            root=self.root,
+            account=self.account,
+            intake=SimpleNamespace(pinned_media=frozenset),
+            sticker_account_active=lambda: self.active,
+            intake_grant=lambda talker: self.generation if talker == '123@chatroom' else None,
+            media_source_row=lambda *_: self.row,
+        )
+        self.catalog = FileCatalog(self.reader)
 
     def save(self):
         (self.root / 'config/wechatagent.json').write_text(json.dumps(self.config), encoding='utf-8')
@@ -35,8 +45,20 @@ class Files(unittest.TestCase):
         return {'name': '报告.txt', 'size': len(data), 'md5': hashlib.md5(data).hexdigest()}
 
     def remember(self, info=None):
+        info = info or self.info()
+        stamp = int(time.time())
+        coords = {'localId': 11, 'serverId': '101', 'localType': FILE_TYPE, 'sourceShard': 'e' * 64}
+        xml = f'<msg><appmsg><type>6</type><title>{info["name"]}</title><appattach><totallen>{info["size"]}</totallen><md5>{info["md5"]}</md5></appattach></appmsg></msg>'
+        self.row = {**coords, 'createTime': stamp, 'senderUsername': SENDER, 'fullText': xml}
         return self.catalog.remember(
-            {'rawid': 'a' * 64, 'talkerId': SENDER, 'timestamp': int(time.time()), 'file': info or self.info()}, KEY
+            {
+                'rawid': 'a' * 64,
+                'sessionId': '123@chatroom',
+                'talkerId': SENDER,
+                'timestamp': stamp,
+                'file': {**info, **coords},
+            },
+            KEY,
         )
 
     def test_file_xml_types_are_verified_and_nested_cards_are_not_current_files(self):
@@ -59,50 +81,66 @@ class Files(unittest.TestCase):
         data = b'file proof'
         target = self.account / 'msg/file/2026-10/报告.txt'
         target.write_bytes(data)
-        self.remember()
-        restarted = FileCatalog(self.root, self.account)
-        result = restarted.resolve('a' * 64, KEY, SENDER)
+        ref = self.remember()['id']
+        restarted = FileCatalog(self.reader)
+        result = restarted.resolve(ref, KEY, SENDER)
         self.assertEqual(result['status'], 'ready')
         self.assertEqual(result['sha256'], hashlib.sha256(data).hexdigest())
         self.assertEqual(pathlib.Path(result['path']), target)
 
     def test_not_downloaded_returns_immediately_and_unauthorized_refs_are_rejected(self):
-        self.remember()
+        ref = self.remember()['id']
         started = time.monotonic()
-        self.assertEqual(self.catalog.resolve('a' * 64, KEY, SENDER)['status'], 'not_downloaded')
+        self.assertEqual(self.catalog.resolve(ref, KEY, SENDER)['status'], 'not_downloaded')
         self.assertLess(time.monotonic() - started, 1)
-        for key, sender in [(KEY, 'wxid_other'), ('wechat:group:124', SENDER)]:
+        for key, sender in [(KEY, 'wxid_other'), ('wechat:group:124@chatroom', SENDER)]:
             with self.assertRaises(PermissionError):
-                self.catalog.resolve('a' * 64, key, sender)
+                self.catalog.resolve(ref, key, sender)
         self.config['wechat']['assistant']['fileTransferChats'][KEY] = False
         self.save()
         with self.assertRaises(PermissionError):
-            self.catalog.resolve('a' * 64, KEY, SENDER)
+            self.catalog.resolve(ref, KEY, SENDER)
 
-    def test_wrong_digest_and_ambiguous_filenames_are_not_substituted(self):
+    def test_no_digest_never_exposes_a_unique_matching_name_and_size(self):
         (self.account / 'msg/file/2026-10/报告.txt').write_bytes(b'wrong data')
-        self.remember()
-        self.assertEqual(self.catalog.resolve('a' * 64, KEY, SENDER)['status'], 'integrity_failed')
+        ref = self.remember()['id']
+        self.assertEqual(self.catalog.resolve(ref, KEY, SENDER)['status'], 'integrity_failed')
         info = self.info()
         info['md5'] = ''
         self.remember(info)
-        folder = self.account / 'msg/file/other'
-        folder.mkdir()
-        (folder / '报告.txt').write_bytes(b'wrong data')
-        self.assertEqual(self.catalog.resolve('a' * 64, KEY, SENDER)['status'], 'ambiguous')
+        result = self.catalog.resolve(ref, KEY, SENDER)
+        self.assertEqual(result['status'], 'unverified')
+        self.assertNotIn('path', result)
 
-    def test_group_open_mode_does_not_open_private_or_unselected_chats(self):
+    def test_recalled_source_cannot_reuse_an_attachment_from_the_cache(self):
+        (self.account / 'msg/file/2026-10/报告.txt').write_bytes(b'file proof')
+        ref = self.remember()['id']
+        self.row = None
+        with self.assertRaisesRegex(ValueError, 'FILE_MESSAGE_CHANGED'):
+            self.catalog.resolve(ref, KEY, SENDER)
+
+    def test_recapturing_the_same_message_after_regrant_cannot_revive_its_old_handle(self):
+        original = self.remember()['id']
+        self.assertEqual(self.remember()['id'], original)
+        self.generation = 'second'
+        fresh = self.remember()['id']
+        self.assertNotEqual(original, fresh)
+        with self.assertRaises(PermissionError):
+            self.catalog.resolve(original, KEY, SENDER)
+        self.assertEqual(self.catalog.resolve(fresh, KEY, SENDER)['status'], 'not_downloaded')
+
+    def test_file_handles_require_an_administrator_even_with_an_old_group_setting(self):
         w = self.config['wechat']
         w['assistant']['adminOnlyGroups'] = {KEY: False}
-        self.assertTrue(file_policy(self.config, KEY, 'wxid_other'))
+        self.assertFalse(file_policy(self.config, KEY, 'wxid_other'))
         self.assertFalse(file_policy(self.config, 'wechat:private:123', 'wxid_other'))
-        self.assertFalse(file_policy(self.config, 'wechat:group:999', SENDER))
+        self.assertFalse(file_policy(self.config, 'wechat:group:999@chatroom', SENDER))
 
     def test_account_change_and_cache_junctions_fail_closed(self):
-        self.remember()
-        self.catalog.active = lambda: False
+        ref = self.remember()['id']
+        self.active = False
         with self.assertRaises(PermissionError):
-            self.catalog.resolve('a' * 64, KEY, SENDER)
+            self.catalog.resolve(ref, KEY, SENDER)
 
 
 if __name__ == '__main__':

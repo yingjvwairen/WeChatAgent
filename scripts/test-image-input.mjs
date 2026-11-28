@@ -15,8 +15,9 @@ import { normalizeOneBotEvent } from '../components/qq-bridge/src/onebot/normali
 test('image references stay typed through OneBot and reject arbitrary paths', () => {
   const event = {
     post_type: 'message',
+    self_id: 'wxid_self',
     message_type: 'private',
-    user_id: 123,
+    user_id: '123',
     message: [{ type: 'image', data: { file: 'wechatagent://image/' + 'a'.repeat(64), media_id: 'a'.repeat(64) } }],
   };
   const message = normalizeOneBotEvent('wechat', 'wechat-onebot', event);

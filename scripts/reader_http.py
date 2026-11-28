@@ -60,7 +60,8 @@ def reader_request_handler(reader, token):
             if not self.authorized(query.get('access_token', [''])[0]):
                 return
             try:
-                limit = min(500, max(1, int(query.get('limit', ['100'])[0])))
+                max_limit = 1000 if url.path == '/api/v1/sessions' else 500
+                limit = min(max_limit, max(1, int(query.get('limit', ['100'])[0])))
                 if url.path == '/api/v1/push/messages':
                     with reader.push_events() as events:
                         self.close_connection = True

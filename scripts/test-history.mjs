@@ -21,7 +21,7 @@ import { MessageBuffer } from '../components/qq-bridge/src/core/message-buffer.j
 import { usageReport, compareReports } from './history-cost.mjs';
 import { prepare } from './project-config.mjs';
 const key = 'wechat:private:123',
-  other = 'wechat:group:456',
+  other = 'wechat:group:456@chatroom',
   policy = { ...HISTORY_DEFAULTS, enabled: true, recentMessages: 4 };
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-history-')),
@@ -163,6 +163,29 @@ test('Chinese and English retrieval is bounded, scoped and does not expose unrel
   assert.equal(a.db.prepare('SELECT count(*) n FROM native_events').get().n, 2);
   assert.equal(a.search(key, '绝密推理').length, 0);
   assert(a.search(key, '原始旧聊天')[0].source === 'legacy-context');
+});
+test('expanding history uses Reader order for messages that arrived out of order in the same second', t => {
+  const store = fixture(t).open();
+  const stamp = 1000;
+  const incoming = n => ({
+    ...row(n),
+    timestamp: stamp,
+    readerOrder: String(stamp).padStart(20, '0') + '-' + String(n).padStart(20, '0') + '-' + 'a'.repeat(64),
+  });
+  const later = store.append(key, incoming(3));
+  const target = store.append(key, incoming(2));
+  store.append(other, incoming(2));
+  const earlier = store.append(key, incoming(1));
+  const withoutOrder = store.append(key, { ...row(4), timestamp: stamp });
+  const chronological = [withoutOrder, earlier, target, later];
+  assert.deepEqual(
+    store.rows(key).map(entry => entry.archiveSeq),
+    chronological,
+  );
+  assert.deepEqual(
+    store.message(key, target, { context: 2 }).map(entry => entry.id),
+    chronological,
+  );
 });
 test('recent seed respects budgets and excludes the admitted batch; summary coverage survives late imports and failed attempts', t => {
   const f = fixture(t),

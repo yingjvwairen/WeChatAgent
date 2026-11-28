@@ -9,7 +9,7 @@ import { spawn, execFile } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { HookOneBot, adapterStartupMessage } from './hook-onebot.mjs';
+import { WechatOneBot, adapterStartupMessage } from './wechat-onebot.mjs';
 import { EventEmitter } from 'node:events';
 import { windowsPowerShellExecutable, windowsPowerShellEnvironment, taskFailureMessage } from './console-process.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,7 +19,7 @@ function fixture(t) {
   fs.writeFileSync(
     path.join(directory, 'config/wechatagent.json'),
     JSON.stringify({
-      runtime: { sender: 'wechat-hook', weflowMode: 'nt' },
+      runtime: { sender: 'wechat-ui', weflowMode: 'nt' },
       hook: { baseUrl: 'http://127.0.0.1:30001', expectedVersion: '4.1.10.27' },
       ports: { adapter: 0 },
       wechat: { whitelist: { private: [], groups: [] } },
@@ -31,19 +31,36 @@ function fixture(t) {
   );
   fs.writeFileSync(path.join(directory, 'state/hook/native-token.txt'), 'a'.repeat(64));
   const calls = [],
-    adapter = new HookOneBot({
+    adapter = new WechatOneBot({
       directory,
+      desktopSender: {
+        request: async () => ({
+          backend: 'wechat-ui',
+          version: '4.2.0.53',
+          databaseAccounts: ['wxid_fixture'],
+          ready: true,
+          voiceSend: false,
+        }),
+        resumePending: async () => [],
+        close: async () => {},
+      },
       fetchImpl: async input => {
         const url = new URL(input);
         calls.push(url.pathname);
         return new Response(
           JSON.stringify(
             url.pathname === '/api/v1/reader/status'
-              ? { backend: 'weflow-cli-nt', ownWxid: 'wxid_fixture', accountDirectory: 'wxid_fixture' }
+              ? {
+                  backend: 'weflow-cli-nt',
+                  intakeProtocol: 'reader-inbox-v2',
+                  ownWxid: 'wxid_fixture',
+                  accountDirectory: 'wxid_fixture',
+                  accountRef: 'a'.repeat(64),
+                }
               : {
-                  backend: 'wechat-hook',
+                  backend: 'wechat-ui',
                   integration: 'WeChatAgent-1',
-                  version: '4.1.10.27',
+                  version: '4.2.0.53',
                   databaseAccounts: ['wxid_fixture'],
                 },
           ),
@@ -51,7 +68,7 @@ function fixture(t) {
       },
     });
   adapter.connectOneBot = async () => {};
-  adapter.receiveSse = async () => {};
+  adapter.receiveReaderInbox = async () => {};
   t.after(async () => {
     if (adapter.server?.listening) await adapter.stop();
     assert(directory.startsWith(os.tmpdir() + path.sep));
@@ -96,6 +113,7 @@ test('adapter preserves an occupied-port error after a successful native prechec
   await new Promise(resolve => blocker.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => blocker.close(resolve)));
   f.adapter.project.ports.adapter = blocker.address().port;
+  fs.writeFileSync(path.join(f.directory, 'config/wechatagent.json'), JSON.stringify(f.adapter.project));
   await f.adapter.checkNative();
   await assert.rejects(f.adapter.start(), error => {
     assert.equal(error.message, 'ADAPTER_PORT_IN_USE');
@@ -118,6 +136,7 @@ test(
     const f = fixture(t),
       bound = await boundSocket(t);
     f.adapter.project.ports.adapter = bound.port;
+    fs.writeFileSync(path.join(f.directory, 'config/wechatagent.json'), JSON.stringify(f.adapter.project));
     await f.adapter.checkNative();
     await assert.rejects(f.adapter.start(), error => {
       assert.match(error.message, /^ADAPTER_PORT_(IN_USE|DENIED)$/);
@@ -132,6 +151,7 @@ test(
 test('Windows bind denial is classified separately and retains EACCES without starting reply tasks', async t => {
   const f = fixture(t);
   f.adapter.project.ports.adapter = 8766;
+  fs.writeFileSync(path.join(f.directory, 'config/wechatagent.json'), JSON.stringify(f.adapter.project));
   t.mock.method(http, 'createServer', () => {
     const server = new EventEmitter();
     server.listen = () => {
@@ -148,10 +168,9 @@ test('Windows bind denial is classified separately and retains EACCES without st
   assert.equal(f.adapter.tasks, undefined);
 });
 
-test('reader resets and Hook failures retain their own stage and port instead of becoming a generic backend failure', async t => {
+test('reader transport failures retain their own stage and port', async t => {
   for (const [stage, code, expected] of [
     ['reader', 'ECONNRESET', 'READER_CONNECTION_RESET'],
-    ['hook', 'ECONNRESET', 'HOOK_CONNECTION_RESET'],
     ['reader', 'ECONNREFUSED', 'READER_NOT_LISTENING'],
   ]) {
     const f = fixture(t),
@@ -186,6 +205,45 @@ test('adapter status identifies the actual PID, project and readiness without ex
   assert(!JSON.stringify(data).includes('a'.repeat(64)));
 });
 
+test('recovery must finish before readiness, and rejected startup releases its listener', async t => {
+  const { adapter } = fixture(t);
+  const { promise, reject } = Promise.withResolvers();
+  let bound;
+  const recovering = new Promise(resolve => {
+    bound = resolve;
+  });
+  adapter.desktopSender.resumePending = () => {
+    bound();
+    return promise;
+  };
+  const starting = adapter.start();
+  await recovering;
+  const url = 'http://127.0.0.1:' + adapter.server.address().port;
+  assert.equal((await (await fetch(url + '/status')).json()).ready, false);
+  reject(Error('fixture recovery failed'));
+  await assert.rejects(starting, /fixture recovery failed/);
+  assert.equal(adapter.server.listening, false);
+  assert.equal(adapter.tasks, undefined);
+});
+
+test('a second shutdown request retries failed cleanup and releases the port', async t => {
+  const { adapter, directory } = fixture(t);
+  let attempts = 0;
+  adapter.desktopSender.close = async () => {
+    if (++attempts === 1) throw Error('fixture cleanup');
+  };
+  await adapter.start();
+  const url = 'http://127.0.0.1:' + adapter.server.address().port + '/desktop/shutdown';
+  const token = fs.readFileSync(path.join(directory, 'state/desktop/control.token'), 'utf8');
+  const stop = () => fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + token } });
+  assert.equal((await (await stop()).json()).accepted, true);
+  assert.equal(adapter.status.last_error, 'DESKTOP_SHUTDOWN_UNCONFIRMED');
+  assert.equal((await (await stop()).json()).accepted, true);
+  await adapter.stop();
+  assert.equal(adapter.server.listening, false);
+  assert.equal(attempts, 2);
+});
+
 test('startup formatting keeps only diagnostic codes and never prints arbitrary error bodies or tokens', () => {
   const secret = 'Bearer ' + 'f'.repeat(64),
     message = adapterStartupMessage(Object.assign(new Error(secret), { code: 'EACCES' }), { stage: 'configuration' });
@@ -200,7 +258,7 @@ test('startup formatting keeps only diagnostic codes and never prints arbitrary 
     ),
     /Windows.*8766/,
   );
-  assert.match(taskFailureMessage('SERVICE_PORT_IN_USE service=adapter port=8766 owners=123', 1), /再次确认/);
+  assert.match(taskFailureMessage('SERVICE_PORT_IN_USE service=adapter port=8766 owners=123', 1), /核对/);
   assert.match(
     taskFailureMessage(
       'Adapter startup failed: READER_CONNECTION_RESET stage=reader-status port=5031 system=ECONNRESET',
@@ -261,7 +319,7 @@ if(-not $failed -or $script:spawned){throw 'foreign bound socket was reused or c
       ports: [bound.port],
       wechatExecutable: 'C:/fixture/not-Weixin.exe',
       protectedPids: [process.pid],
-      includeMatchingWeChat: false,
+      matchingWeChatOnly: false,
     };
     const inspection = await promisify(execFile)(
       windowsPowerShellExecutable(),
@@ -304,13 +362,13 @@ $root=$PSScriptRoot;$stateDir=$PSScriptRoot;$script:record=@{};$script:owner=777
 function Get-NetTCPConnection{param($LocalPort,$ErrorAction)@([pscustomobject]@{State='Listen';LocalAddress='::';OwningProcess=999},[pscustomobject]@{State='Listen';LocalAddress='127.0.0.1';OwningProcess=777})}
 $ipv4=@(Get-PortBindings 8766);if($ipv4.Count -ne 1 -or $ipv4[0].OwningProcess -ne 777){throw 'IPv6-only listener caused a false IPv4 conflict'}
 function Get-PortBindings{param($Port)$script:queries++;if($script:mode -eq 'race' -and $script:queries -eq 1){return};[pscustomobject]@{State='Listen';OwningProcess=$script:owner}}
-function Invoke-RestMethod{param($Uri,$TimeoutSec)if($script:mode -eq 'legacy'){return [pscustomobject]@{backend='wechat-hook'}};[pscustomobject]@{project='WeChatAgent';component='adapter';statusVersion=1;backend='wechat-hook';pid=$(if($script:mode -eq 'bad-pid'){'invalid'}else{777});projectRoot=$(if($script:mode -eq 'wrong-project'){$root+'-other'}elseif($script:mode -eq 'bad-root'){[string][char]0}else{$root});ready=$true}}
+function Invoke-RestMethod{param($Uri,$TimeoutSec)if($script:mode -eq 'legacy'){return [pscustomobject]@{backend='wechat-ui'}};[pscustomobject]@{project='WeChatAgent';component='adapter';statusVersion=1;backend='wechat-ui';pid=$(if($script:mode -eq 'bad-pid'){'invalid'}else{777});projectRoot=$(if($script:mode -eq 'wrong-project'){$root+'-other'}elseif($script:mode -eq 'bad-root'){[string][char]0}else{$root});ready=$true}}
 if(-not(Test-ServiceReady 'adapter' 8766 777)){throw 'owned ready service was rejected'}
 foreach($case in @('wrong-project','legacy','bad-pid','bad-root')){$script:mode=$case;$failed=$false;try{Test-ServiceReady 'adapter' 8766 777|Out-Null}catch{if($_.Exception.Message -notmatch 'ADAPTER_IDENTITY_MISMATCH'){throw};$failed=$true};if(-not $failed){throw 'foreign or legacy identity accepted'}}
 $script:mode='ready';$script:owner=999;$failed=$false;try{Test-ServiceReady 'adapter' 8766 777|Out-Null}catch{if($_.Exception.Message -notmatch 'SERVICE_PORT_OWNER_MISMATCH'){throw};$failed=$true};if(-not $failed){throw 'foreign listener accepted'}
 function Assert-PortBindable{param($Name,$Port)}
 function Save-Record{}
-function Start-Process{$script:spawned++;$p=[pscustomobject]@{Id=777;HasExited=$false};$p|Add-Member ScriptMethod Refresh {};return $p}
+function Start-Process{$script:spawned++;$p=[pscustomobject]@{Id=777;HasExited=$false;StartTime=[DateTime]::UtcNow};$p|Add-Member ScriptMethod Refresh {};return $p}
 $script:mode='race';$script:queries=0;$failed=$false
 try{Start-ServiceProcess 'adapter' 'fixture.exe' '' $root 'fixture' 8766 $false}catch{if($_.Exception.Message -notmatch 'SERVICE_PORT_OWNER_MISMATCH'){throw};$failed=$true}
 if(-not $failed -or $script:spawned -ne 1){throw 'startup race was accepted'}
@@ -345,12 +403,17 @@ test(
       script = path.join(f.directory, 'supervisor-live.ps1');
     fs.writeFileSync(
       entry,
-      "import http from 'node:http';const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({project:'WeChatAgent',component:'adapter',statusVersion:1,backend:'wechat-hook',pid:process.pid,projectRoot:process.cwd(),ready:true}));});server.listen(Number(process.argv[2]),'127.0.0.1');",
+      "import http from 'node:http';const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.url==='/desktop/shutdown'){res.end(JSON.stringify({ok:true,accepted:true}));server.close(()=>process.exit(0));return;}res.end(JSON.stringify({project:'WeChatAgent',component:'adapter',statusVersion:1,backend:'wechat-ui',pid:process.pid,projectRoot:process.cwd(),ready:true}));});server.listen(Number(process.argv[2]),'127.0.0.1');",
     );
+    fs.mkdirSync(path.join(f.directory, 'state/desktop'), { recursive: true });
+    fs.writeFileSync(path.join(f.directory, 'state/desktop/control.token'), 'fixture');
     const temporary = net.createServer();
     await new Promise(resolve => temporary.listen(0, '127.0.0.1', resolve));
     const port = temporary.address().port;
     await new Promise(resolve => temporary.close(resolve));
+    const currentConfig = JSON.parse(fs.readFileSync(path.join(f.directory, 'config/wechatagent.json'), 'utf8'));
+    currentConfig.ports.adapter = port;
+    fs.writeFileSync(path.join(f.directory, 'config/wechatagent.json'), JSON.stringify(currentConfig));
     fs.writeFileSync(
       script,
       '\uFEFF' +
@@ -395,3 +458,15 @@ try{
     assert.match(output.stdout, /adapter stopped/);
   },
 );
+
+test('an incompatible Reader cannot silently disable durable intake', async t => {
+  const { adapter } = fixture(t);
+  adapter.fetch = async () =>
+    Response.json({
+      backend: 'weflow-cli-nt',
+      ownWxid: 'self',
+      accountDirectory: 'account',
+      accountRef: 'a'.repeat(64),
+    });
+  await assert.rejects(adapter.checkNative(), /READER_INTAKE_PROTOCOL_REQUIRED/);
+});

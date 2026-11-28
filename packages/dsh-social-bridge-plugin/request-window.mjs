@@ -1,3 +1,4 @@
+import { parseChatKey } from '../wechat-identity.mjs';
 import crypto from 'node:crypto';
 
 export const REQUEST_WINDOW_MODE = 'recent-window-v1';
@@ -115,7 +116,7 @@ export function selectWakeWindow(rows, policy, { key, workMode = 'social', hint,
   const normal = () => ({ recent: recentWindow(rows, policy) }),
     minutes = policy.coldWakeMinutes ?? 30;
   if (
-    !/^wechat:group:[1-9]\d*$/.test(key ?? '') ||
+    parseChatKey(key)?.kind !== 'group' ||
     workMode !== 'social' ||
     !minutes ||
     hint?.policy !== COLD_WAKE_POLICY ||

@@ -1,14 +1,14 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicJson, hash, fail } from './catalog.mjs';
-const KEY = /^wechat:(private|group):[1-9]\d*$/,
-  ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,119}$/;
+const ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,119}$/;
 export class PluginDocuments {
   constructor(root, accountScope, accountId, item) {
     Object.assign(this, { root: path.resolve(root), accountScope, accountId, item });
   }
   folder(key) {
-    if (!KEY.test(key ?? '')) throw fail('PLUGIN_DOCUMENT_CHAT_INVALID');
+    if (!validChatKey(key ?? '')) throw fail('PLUGIN_DOCUMENT_CHAT_INVALID');
     const relative =
       this.item.dataNamespace === 'fish-notebook-v1'
         ? ['fish-notebook', this.accountId, hash(key)]

@@ -1,0 +1,8 @@
+-r reader-requirements.txt
+numpy==1.26.4
+scipy==1.17.1
+starlette==1.10.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+opencv-python-headless==4.11.0.86
+ruff==0.14.4

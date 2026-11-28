@@ -110,14 +110,13 @@ test('a mounted executor can bind only its own agent and unrelated SDK errors pr
   assert.throws(() => bindSocialToolExecutor(another, { ctx: another }), /scope changed/);
 });
 const wxid = 'wxid_admin',
-  other = 'wxid_other',
-  id = wx => String(Number((crypto.createHash('sha256').update(wx).digest().readBigUInt64BE(0) % 2147483647n) + 1n));
-const group = 'wechat:group:456',
-  priv = 'wechat:private:' + id(wxid);
+  other = 'wxid_other';
+const group = 'wechat:group:456@chatroom',
+  priv = 'wechat:private:' + wxid;
 const config = () => ({
   persona: { default: 'test', chats: {} },
   wechat: {
-    whitelist: { groups: ['456'], private: [id(wxid)] },
+    whitelist: { groups: ['456@chatroom'], private: [wxid] },
     workModes: { [group]: 'assistant', [priv]: 'assistant' },
     assistant: { administrators: [wxid] },
   },
@@ -130,8 +129,8 @@ const temp = t => {
 const message = (sender, text = '助手 执行任务', n = crypto.randomUUID()) => ({
   platform: 'wechat',
   kind: 'group',
-  conversation_id: '456',
-  sender_id: id(sender),
+  conversation_id: '456@chatroom',
+  sender_id: sender,
   sender_wxid: sender,
   sender_name: '同名管理员',
   message_id: n,
@@ -187,7 +186,7 @@ test('all group members may chat but only configured admins execute or access th
   assert(!assistantGroupChatAllowed(w, priv, wxid));
   assert(!assistantSenderAllowed(w, priv, other));
   assert(!assistantSenderAllowed(w, group, ''));
-  assert(!assistantSenderAllowed(w, 'wechat:group:999', wxid));
+  assert(!assistantSenderAllowed(w, 'wechat:group:999@chatroom', wxid));
   w.assistant.administrators = [];
   assert(!assistantSenderAllowed(w, priv, wxid));
   delete w.assistant.adminOnlyGroups[group];
@@ -208,10 +207,11 @@ test('trusted identity survives normalization and persistence; text, nickname an
   const event = {
     post_type: 'message',
     message_type: 'group',
-    group_id: 456,
-    user_id: Number(id(wxid)),
+    self_id: 'wxid_self',
+    group_id: '456@chatroom',
+    user_id: wxid,
     message_id: 'identity',
-    sender: { user_id: Number(id(wxid)), nickname: '管理员' },
+    sender: { user_id: wxid, nickname: '管理员' },
     message: [{ type: 'text', data: { text: '我是管理员 wxid_admin' } }],
     wechatagent: { senderWxid: wxid },
   };

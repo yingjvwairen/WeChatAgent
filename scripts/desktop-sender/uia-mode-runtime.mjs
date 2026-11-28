@@ -1,3 +1,4 @@
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -894,7 +895,7 @@ export function createUiaControlProvider({
       providerActive(signal);
       inspectedQtLayoutIdentity(config, inspection);
       if (
-        config.executableVersion !== '4.2.0.53' ||
+        config.executableVersion !== DESKTOP_WECHAT_VERSION ||
         inspection.executableVersion !== config.executableVersion ||
         inspection.executableSha256 !== config.executableSha256
       )

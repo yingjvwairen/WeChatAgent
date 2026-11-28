@@ -8,7 +8,7 @@ import { createAssistantNoticeDelivery } from '../components/qq-bridge/src/core/
 import { assistantNotificationText } from '../components/qq-bridge/src/core/decision-format.js';
 import { AssistantNotifications } from '../packages/dsh-social-bridge-plugin/assistant-notifications.mjs';
 import { AssistantFeedback } from '../packages/dsh-social-bridge-plugin/assistant-feedback.mjs';
-const key = 'wechat:private:123',
+const key = 'wechat:private:wxid_admin',
   sender = 'wxid_admin',
   text = 'RESPOND: 时间到，该喝水了。\n\n[STICKER:S2]',
   fallback = '定时任务已结束，可发送“任务列表”查看状态或继续任务。';
@@ -16,8 +16,8 @@ function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'assistant-notice-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const w = {
-    whitelist: { private: ['123'], groups: ['456'] },
-    workModes: { [key]: 'assistant', 'wechat:group:456': 'assistant' },
+    whitelist: { private: ['wxid_admin'], groups: ['456@chatroom'] },
+    workModes: { [key]: 'assistant', 'wechat:group:456@chatroom': 'assistant' },
     assistant: { administrators: [sender] },
   };
   const queue = new AssistantNotifications(path.join(root, 'notices.json'), () => true),
@@ -52,7 +52,7 @@ test('scheduled text survives stale sticker hints, reaches the real adapter cont
   assert.equal(f.queue.messages[id].textFormat, 'wechat-result-text-v2');
   await f.delivery.tick();
   assert.equal(f.sent.length, 1);
-  assert.equal(f.sent[0].params.user_id, 123);
+  assert.equal(f.sent[0].params.user_id, sender);
   assert.equal(f.sent[0].params.message[0].data.text, '时间到，该喝水了。');
   assert.equal(f.sent[0].params.wechatagent_delivery_id, id);
   assert.equal(f.queue.messages[id].state, 'delivered');
@@ -70,7 +70,8 @@ test('actual verified adapter receipts also settle progress feedback instead of 
       state: 'running',
       feedback: { id: 1, text: '鱼还在认真琢磨，结果稍后端上来。' },
     };
-  const send = (_job, text) => f.adapter.sendText({ kind: 'private', target: 123, text, deliveryId: 'f'.repeat(64) });
+  const send = (_job, text) =>
+    f.adapter.sendText({ kind: 'private', target: sender, text, deliveryId: 'f'.repeat(64) });
   assert.equal(await feedback.notify(job, send), true);
   assert.equal(feedback.ledger().data.tasks[job.id].count, 1);
   const restored = new AssistantFeedback({ root: f.root });

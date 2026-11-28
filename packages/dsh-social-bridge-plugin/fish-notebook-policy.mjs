@@ -1,3 +1,4 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import crypto from 'node:crypto';
 import { allowedConversation } from './conversation-policy.mjs';
 import { verifiedAssistantSender } from './assistant-policy.mjs';
@@ -20,9 +21,7 @@ export function validateFishNotebook(settings) {
     (!settings.chats ||
       typeof settings.chats !== 'object' ||
       Array.isArray(settings.chats) ||
-      Object.entries(settings.chats).some(
-        ([key, value]) => !/^wechat:(private|group):[1-9]\d{0,15}$/.test(key) || typeof value !== 'boolean',
-      ))
+      Object.entries(settings.chats).some(([key, value]) => !validChatKey(key) || typeof value !== 'boolean'))
   )
     throw Error('记事本聊天开关无效。');
 }

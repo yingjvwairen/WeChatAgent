@@ -16,3 +16,15 @@ export function releaseIdentity(pkg) {
   } else if (!base.test(version) || packageVersion !== version) throw Error('RELEASE_VERSION_INVALID');
   return { version, packageVersion, buildVersion, tag: 'v' + version };
 }
+
+export function launcherAssemblyInfo(pkg) {
+  const release = releaseIdentity(pkg);
+  const numeric = release.buildVersion ?? release.packageVersion + '.0';
+  return [
+    'using System.Reflection;',
+    '[assembly: AssemblyVersion("' + numeric + '")]',
+    '[assembly: AssemblyFileVersion("' + numeric + '")]',
+    '[assembly: AssemblyInformationalVersion("' + release.version + '")]',
+    '',
+  ].join('\n');
+}

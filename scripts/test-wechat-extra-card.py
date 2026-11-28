@@ -40,14 +40,18 @@ class CardAndNoticeTests(unittest.TestCase):
         self.assertFalse(ref['unavailable'])
 
     def test_reader_emits_visible_text_from_the_authorized_senders_card(self):
-        from reader_payload import push_payload
+        import importlib.util
+        from pathlib import Path
 
+        spec = importlib.util.spec_from_file_location('card_reader', Path(__file__).with_name('reader-api.py'))
+        api = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(api)
         row = {'localType': 48, 'senderUsername': 'friend', 'fullText': '<location poiname="图书馆" label="北路1号" />'}
-        payload = push_payload('friend', row, {}, 'self')
+        payload = api.push_payload('friend', row, {}, 'self')
         self.assertEqual(payload['type'], 1)
         self.assertEqual(payload['content'], '[位置] 图书馆 · 北路1号')
-        self.assertIsNone(push_payload('friend', {**row, 'isSend': True}, {}, 'self'))
-        unavailable = push_payload('friend', {**row, 'fullText': '<invalid/>'}, {}, 'self')
+        self.assertIsNone(api.push_payload('friend', {**row, 'isSend': True}, {}, 'self'))
+        unavailable = api.push_payload('friend', {**row, 'fullText': '<invalid/>'}, {}, 'self')
         self.assertTrue(unavailable['contextOnly'])
         self.assertIn('没有可解析的显示内容', unavailable['content'])
 

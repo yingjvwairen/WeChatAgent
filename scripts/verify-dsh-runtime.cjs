@@ -344,11 +344,13 @@ const { pathToFileURL } = require('node:url');
     fs.mkdirSync(path.join(fixture, 'config'), { recursive: true });
     fs.writeFileSync(
       path.join(fixture, 'config/wechatagent.json'),
-      JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: true } } }),
+      JSON.stringify({
+        wechat: { whitelist: { private: ['wxid_fixture_123'], groups: [] }, search: { enabled: true } },
+      }),
     );
     const searchIdentity = {
       ...identity,
-      conversationKey: 'wechat:private:123',
+      conversationKey: 'wechat:private:wxid_fixture_123',
       conversationName: '空会话系统消息头验收',
     };
     const searchConfigured = await rpc('/configure', searchIdentity);
@@ -364,7 +366,7 @@ const { pathToFileURL } = require('node:url');
     );
     const damagedIdentity = {
       ...identity,
-      conversationKey: 'wechat:private:456',
+      conversationKey: 'wechat:private:wxid_fixture_456',
       conversationName: '旧错误历史的隔离恢复验收',
     };
     const damagedConfigured = await rpc('/configure', damagedIdentity);
@@ -436,11 +438,11 @@ const { pathToFileURL } = require('node:url');
     fs.mkdirSync(path.join(fixture, 'config'), { recursive: true });
     fs.writeFileSync(
       path.join(fixture, 'config/wechatagent.json'),
-      JSON.stringify({ wechat: { whitelist: { private: ['321'], groups: [] } } }),
+      JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture_321'], groups: [] } } }),
     );
     const workspaceIdentity = {
       ...identity,
-      conversationKey: 'wechat:private:321',
+      conversationKey: 'wechat:private:wxid_fixture_321',
       conversationName: '工作区移动验收',
     };
     readerConversationKey = workspaceIdentity.conversationKey;
@@ -504,13 +506,13 @@ const { pathToFileURL } = require('node:url');
     );
     assert(JSON.stringify(calls.at(-1).messages).includes('workspace-42'));
     // Exercise bounded generations in the real 0.2 runtime, including a paid-call-free social summary fixture.
-    const historyKey = 'wechat:private:987',
+    const historyKey = 'wechat:private:wxid_fixture_987',
       historyIdentity = { ...identity, conversationKey: historyKey, conversationName: '有界记忆验收' };
     fs.writeFileSync(
       path.join(fixture, 'config/wechatagent.json'),
       JSON.stringify({
         wechat: {
-          whitelist: { private: ['987'], groups: [] },
+          whitelist: { private: ['wxid_fixture_987'], groups: [] },
           history: { enabled: true, maxSessionTurns: 4, recentMessages: 4 },
         },
       }),
@@ -519,9 +521,9 @@ const { pathToFileURL } = require('node:url');
       id: 'history-' + i,
       platform: 'wechat',
       kind: 'private',
-      conversation_id: '987',
+      conversation_id: 'wxid_fixture_987',
       message_id: String(i),
-      sender_id: '987',
+      sender_id: 'wxid_fixture_987',
       sender_name: '测试好友',
       text: i === 0 ? '去年苏州桂花面的约定' : '近期原文 ' + i,
       timestamp: Date.now() / 1000 - 600 + i,
@@ -586,7 +588,7 @@ const { pathToFileURL } = require('node:url');
     // A stable visible Session with a freshly bounded request on every turn.
     const windowConfig = {
       wechat: {
-        whitelist: { private: ['987'], groups: [] },
+        whitelist: { private: ['wxid_fixture_987'], groups: [] },
         history: {
           enabled: true,
           mode: 'window',
@@ -603,7 +605,7 @@ const { pathToFileURL } = require('node:url');
     archive.append(historyKey, {
       id: 'ancient-display',
       message_id: 'ancient-display',
-      sender_id: '987',
+      sender_id: 'wxid_fixture_987',
       sender_name: '测试好友',
       text: 'DISPLAY_ONLY_SECRET: 周五去过兰亭书店',
       timestamp: Date.now() / 1000 - 10000,
@@ -680,7 +682,7 @@ const { pathToFileURL } = require('node:url');
     echoArchive.append(historyKey, {
       id: 'confirmed-echo',
       message_id: 'confirmed-echo',
-      sender_id: '987',
+      sender_id: 'wxid_fixture_987',
       sender_name: 'AI',
       outgoing: true,
       delivery_status: 'confirmed',
@@ -693,7 +695,7 @@ const { pathToFileURL } = require('node:url');
     );
     const echoPrompt = buildPrivatePrompt({
       key: historyKey,
-      rows: [{ sender_id: '987', text: 'WINDOW_DEDUP_CURRENT_MESSAGE', timestamp: Date.now() / 1000 }],
+      rows: [{ sender_id: 'wxid_fixture_987', text: 'WINDOW_DEDUP_CURRENT_MESSAGE', timestamp: Date.now() / 1000 }],
       previousReply: { text: echoText, delivery_status: 'confirmed' },
     });
     await rpc('/followup', { ...historyIdentity, message: echoPrompt, batchId: 'c'.repeat(64) });
@@ -814,7 +816,7 @@ const { pathToFileURL } = require('node:url');
       appendArchive.append(historyKey, {
         id: 'append-' + i,
         message_id: 'append-' + i,
-        sender_id: '987',
+        sender_id: 'wxid_fixture_987',
         sender_name: '测试好友',
         text: 'CANONICAL_APPEND_' + i,
         timestamp: Date.now() / 1000 + i,
@@ -916,9 +918,9 @@ const { pathToFileURL } = require('node:url');
     assert.equal(ctx.agents.get(visibleId).session.id, visibleId);
     // Each owner persona is registered in that agent's system scope, including
     // literal template-looking text. Other social and coding scopes stay separate.
-    const alternateKey = 'wechat:private:986',
+    const alternateKey = 'wechat:private:wxid_fixture_986',
       alternatePersona = '这是其他聊天的独立人格 {{literal_fixture}}，只回复 SILENT。';
-    windowConfig.wechat.whitelist.private.push('986');
+    windowConfig.wechat.whitelist.private.push('wxid_fixture_986');
     fs.writeFileSync(path.join(fixture, 'config/wechatagent.json'), JSON.stringify(windowConfig));
     const roleFile = path.join(fixture, 'state/bridge-config.json'),
       roleConfig = JSON.parse(fs.readFileSync(roleFile, 'utf8'));
@@ -947,13 +949,13 @@ const { pathToFileURL } = require('node:url');
       }),
     );
     {
-      const searchKey = 'wechat:private:985',
+      const searchKey = 'wechat:private:wxid_fixture_985',
         searchIdentity = { ...historyIdentity, conversationKey: searchKey, conversationName: '首次搜索顺序验收' };
       const { SEARCH_DEFAULTS } = await import(pathToFileURL(path.join(plugin, 'search-policy.mjs')).href);
       const { WebSearch } = await import(
         pathToFileURL(path.join(project, 'components/qq-bridge/src/core/web-search.js')).href
       );
-      windowConfig.wechat.whitelist.private.push('985');
+      windowConfig.wechat.whitelist.private.push('wxid_fixture_985');
       windowConfig.wechat.search = { ...SEARCH_DEFAULTS, enabled: true };
       fs.writeFileSync(path.join(fixture, 'config/wechatagent.json'), JSON.stringify(windowConfig));
       const searchService = new WebSearch({
@@ -1009,12 +1011,12 @@ const { pathToFileURL } = require('node:url');
       const { buildSocialPrompt } = await import(
         pathToFileURL(path.join(project, 'components/qq-bridge/src/core/social-engine.js')).href
       );
-      windowConfig.wechat.whitelist.groups.push('984', '983');
+      windowConfig.wechat.whitelist.groups.push('984@chatroom', '983@chatroom');
       windowConfig.wechat.history.coldWakeMinutes = 30;
       fs.writeFileSync(path.join(fixture, 'config/wechatagent.json'), JSON.stringify(windowConfig));
       const at = Math.floor(Date.now() / 1000),
-        coldKey = 'wechat:group:984',
-        memoryKey = 'wechat:group:983';
+        coldKey = 'wechat:group:984@chatroom',
+        memoryKey = 'wechat:group:983@chatroom';
       const roles = JSON.parse(fs.readFileSync(roleFile, 'utf8'));
       for (const key of [coldKey, memoryKey])
         roles.roles[key] = { name: historyIdentity.personaName, persona: historyIdentity.persona };
@@ -1023,7 +1025,7 @@ const { pathToFileURL } = require('node:url');
         id: 'cold-original-' + i,
         platform: 'wechat',
         kind: 'group',
-        conversation_id: '984',
+        conversation_id: '984@chatroom',
         sender_id: '42',
         sender_name: '群友',
         timestamp: at - 4000 + i,
@@ -1033,7 +1035,7 @@ const { pathToFileURL } = require('node:url');
         memory = {
           ...current,
           id: 'cold-memory',
-          conversation_id: '983',
+          conversation_id: '983@chatroom',
           text: '上次我们约在哪里？ WINDOW_HISTORY_LOOKUP',
         };
       const archive = new HistoryStore(fixture);

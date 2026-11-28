@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { quotedHistoryMatches } from './native-quote-source.mjs';
 import { SOCIAL_FINAL_OUTPUT_HINT } from './prompt-context.mjs';
 const { HISTORY_POLICY, readHistoryPolicy } = await import(
   new URL('./history-policy.mjs' + new URL(import.meta.url).search, import.meta.url)
@@ -140,7 +141,7 @@ export function bindHistory(agentCtx, store, root, key, turnFor, isAllowed) {
           return {
             content: JSON.stringify({
               source: 'untrusted_local_chat_archive',
-              matches: batchMatches(store, key, query, queries),
+              matches: quotedHistoryMatches(store, key, turn, batchMatches(store, key, query, queries)),
               reused: true,
               budget: budget(),
               notice: '这些关键词在本轮已经检索过，复用已有证据，不再次搜索。' + historyNotice,
@@ -161,10 +162,14 @@ export function bindHistory(agentCtx, store, root, key, turnFor, isAllowed) {
         } else
           result = {
             source: 'untrusted_local_chat_archive',
-            matches:
+            matches: quotedHistoryMatches(
+              store,
+              key,
+              turn,
               query.mode === 'message'
                 ? store.message(key, query.messageId, query)
                 : batchMatches(store, key, query, queries),
+            ),
             notice: historyNotice,
           };
         cache.set(fingerprint, result);

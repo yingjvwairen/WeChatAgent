@@ -1,23 +1,26 @@
+import { validFileReference } from '../../../../packages/wechat-file-reference.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import modelFields from '../../../../packages/speech-contract/local-model-fields.json' with { type: 'json' };
 import { buildConversationKey } from './conversation-key.js';
 import { normalizeForwardedRecord, normalizeQuoteReply } from './wechat-events.js';
 import { STICKER_CANDIDATE_MAX } from './sticker-policy.js';
 import { validReplyMessageLimit } from '../../../../packages/dsh-social-bridge-plugin/reply-layout-policy.mjs';
 import { verifiedAssistantSender } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
+import { validQuoteRefs, nativeQuoteKind } from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 
 export function replyDeliveryParts(result, deliveryId) {
   // A voice reply is one part; its text fallback is derived from the same delivery.
-  const parts =
-    result.decision === 'RESPOND'
-      ? result.mode === 'voice'
-        ? [{ voiceText: result.text }]
-        : (result.textParts ?? [result.text]).map(text => ({ text }))
-      : [];
+  const parts = [];
+  if (result.decision === 'RESPOND') {
+    if (result.mode === 'voice') parts.push({ voiceText: result.text });
+    else parts.push(...(result.textParts ?? [result.text]).map(text => ({ text })));
+  }
   if (result.stickerId) parts.push({ stickerId: result.stickerId });
   return parts.map((part, index) => ({
     ...part,
+    ...(index === 0 && result.quoteEventId ? { quoteEventId: result.quoteEventId } : {}),
     deliveryId:
       index === 0
         ? deliveryId
@@ -27,6 +30,35 @@ export function replyDeliveryParts(result, deliveryId) {
             .digest('hex'),
     state: 'queued',
   }));
+}
+
+function validQuotedDecision(result) {
+  if (result.quoteEventId === undefined) return true;
+  return (
+    /^[a-f0-9]{64}$/.test(result.quoteEventId) &&
+    result.decision === 'RESPOND' &&
+    result.mode !== 'voice' &&
+    !result.stickerId &&
+    !result.textParts
+  );
+}
+
+function replyTextLimit(item) {
+  if (item.result.mode === 'voice') return modelFields.speechLimits.maxReplyChars;
+  return item.message?.work_mode === 'assistant' ? 12000 : 1200;
+}
+function validReplyText({ text, textParts }, limit) {
+  if (typeof text !== 'string' || !text.trim()) return false;
+  if (textParts === undefined) return text.length <= limit;
+  if (!Array.isArray(textParts) || textParts.length < 2 || textParts.length > limit) return false;
+  let length = 0;
+  for (const part of textParts) {
+    if (typeof part !== 'string' || !part.trim()) return false;
+    length += part.length;
+    if (length > limit) return false;
+  }
+  // The blank lines are display separators; only the parts are sent.
+  return textParts.join('\n\n') === text;
 }
 function validReplyParts(item) {
   if (item.parts === undefined) return true;
@@ -42,6 +74,7 @@ function validReplyParts(item) {
         part.text === target.text &&
         part.stickerId === target.stickerId &&
         part.voiceText === target.voiceText &&
+        part.quoteEventId === target.quoteEventId &&
         part.deliveryId === target.deliveryId &&
         (part.voiceFallback === undefined || (part.voiceFallback === true && typeof part.voiceText === 'string')) &&
         ['queued', 'sending', 'submitted', 'confirmed', 'unconfirmed', 'failed', 'cancelled', 'expired'].includes(
@@ -75,6 +108,7 @@ function validPendingRequest(item) {
     /^[a-f0-9]{64}$/.test(item.metadata.batchId ?? '') &&
     JSON.stringify(item.metadata.historyExcludeIds) === JSON.stringify(item.rowIds) &&
     (item.metadata.replyMaxMessages === undefined || validReplyMessageLimit(item.metadata.replyMaxMessages)) &&
+    (item.quoteRefs === undefined || validQuoteRefs(item.quoteRefs)) &&
     [
       [item.stickerRefs, STICKER_CANDIDATE_MAX],
       [item.annotationRefs, 4],
@@ -128,7 +162,7 @@ export class MessageBuffer {
         this.archive?.backfill(key, rows);
         this.chats.set(
           key,
-          rows.slice(-this.maxPerChat).map(row => ({ ...row, id: row.id ?? crypto.randomUUID() })),
+          this.trimRecent(rows).map(row => ({ ...row, id: row.id ?? crypto.randomUUID() })),
         );
       }
       for (const [key, item] of Object.entries(saved.pendingReplies ?? {})) {
@@ -137,17 +171,10 @@ export class MessageBuffer {
           !/^[a-f0-9]{64}$/.test(item.deliveryId ?? '') ||
           typeof item.throughId !== 'string' ||
           !['RESPOND', 'STICKER'].includes(item.result?.decision) ||
-          (item.result.decision === 'RESPOND' &&
-            (typeof item.result.text !== 'string' ||
-              !item.result.text.trim() ||
-              item.result.text.length > (item.message?.work_mode === 'assistant' ? 12000 : 1200))) ||
-          (item.result.textParts !== undefined &&
-            (!Array.isArray(item.result.textParts) ||
-              item.result.textParts.length < 2 ||
-              item.result.textParts.length > item.result.text.length ||
-              item.result.textParts.some(part => typeof part !== 'string' || !part.trim()) ||
-              item.result.textParts.join('\n\n') !== item.result.text)) ||
-          (item.result.decision === 'STICKER' && !/^[a-f0-9]{64}$/.test(item.result.stickerId ?? '')) ||
+          !validQuotedDecision(item.result) ||
+          (item.result.decision === 'RESPOND' && !validReplyText(item.result, replyTextLimit(item))) ||
+          (item.result.decision === 'STICKER' &&
+            (item.result.textParts !== undefined || !/^[a-f0-9]{64}$/.test(item.result.stickerId ?? ''))) ||
           !item.message ||
           (item.result.stickerId !== undefined && !/^[a-f0-9]{64}$/.test(item.result.stickerId)) ||
           !validReplyParts(item) ||
@@ -211,49 +238,63 @@ export class MessageBuffer {
       self_id: String(message.self_id ?? ''),
       ...(message.work_mode ? { work_mode: message.work_mode } : {}),
       ...(message.assistant_chat_only === true ? { assistant_chat_only: true } : {}),
-      text: String(message.text ?? '').slice(0, 4000),
+      text: String(message.text ?? '').slice(0, 16000),
       timestamp: Number(message.timestamp) || Date.now() / 1000,
       images: outgoing
         ? []
         : (message.images ?? []).filter(image => /^[a-f0-9]{64}$/.test(image?.id ?? '')).slice(0, 4),
-      files: outgoing
-        ? []
-        : (message.files ?? [])
-            .filter(
-              file =>
-                /^[a-f0-9]{64}$/.test(file?.id ?? '') &&
-                typeof file.name === 'string' &&
-                file.name.length <= 180 &&
-                Number.isSafeInteger(file.size) &&
-                file.size >= 0 &&
-                file.size <= 50 * 1024 * 1024,
-            )
-            .slice(0, 3),
+      files: outgoing ? [] : (message.files ?? []).filter(validFileReference).slice(0, 3),
       direct_mention: Boolean(message.direct_mention),
       outgoing,
       processed: outgoing,
     };
+    if (
+      !outgoing &&
+      message.platform === 'wechat' &&
+      message.kind === 'group' &&
+      ['self', 'all'].includes(message.mentionTarget)
+    )
+      row.mentionTarget = message.mentionTarget;
+    if (typeof message.readerGrant === 'string') row.readerGrant = message.readerGrant;
+    if (message.readerOrder) row.readerOrder = message.readerOrder;
+    if (message.readerReplay === 'context' || message.readerReplay === 'reply') row.readerReplay = message.readerReplay;
+    if (message.contextOnly === true) row.contextOnly = true;
+    if (message.attachmentUnavailable === true) row.attachmentUnavailable = true;
+    if (!outgoing) {
+      const quoteKind = nativeQuoteKind(message);
+      if (quoteKind) row.quoteKind = quoteKind;
+    }
     if (!outgoing && message.interaction === 'pat') row.interaction = 'pat';
     const record = !outgoing && normalizeForwardedRecord(message.forwardedRecord);
     if (record) row.forwardedRecord = record;
     const quoteReply = !outgoing && normalizeQuoteReply(message.quoteReply);
     if (quoteReply) row.quoteReply = quoteReply;
+    const previousNotice = this.contextNotices.get(key);
     if (!outgoing && skipReason) {
       row.processed = true;
       row.reply_skip_reason = skipReason;
       row.reply_skipped_at = Date.now();
       if (row.work_mode === 'assistant') row.reply_review_required = true;
-      this.contextNotices.set(key, {
-        id: crypto.randomUUID(),
-        text: '离线旧消息仅作为背景，不能逐条补答或自动执行旧任务。请根据恢复后的当前新消息处理。',
-      });
+      if (skipReason !== 'context_only')
+        this.contextNotices.set(key, {
+          id: crypto.randomUUID(),
+          text: '离线旧消息仅作为背景，不能逐条补答或自动执行旧任务。请根据恢复后的当前新消息处理。',
+        });
     }
-    const rows = this.chats.get(key) ?? [];
-    this.archive?.append(key, row, { fullText: message.text });
-    rows.push(row);
-    if (rows.length > this.maxPerChat) rows.splice(0, rows.length - this.maxPerChat);
+    const previous = this.chats.get(key);
+    const rows = this.trimRecent([...(previous ?? []), row]);
     this.chats.set(key, rows);
-    this.#save();
+    try {
+      // History acts as an intake receipt only after the reply decision can survive a restart.
+      this.#save();
+    } catch (error) {
+      if (previous) this.chats.set(key, previous);
+      else this.chats.delete(key);
+      if (previousNotice) this.contextNotices.set(key, previousNotice);
+      else this.contextNotices.delete(key);
+      throw error;
+    }
+    this.archive?.append(key, row, { fullText: row.text });
     return row;
   }
 
@@ -265,10 +306,17 @@ export class MessageBuffer {
         row =>
           !row.outgoing &&
           row.message_id === String(message.message_id) &&
-          row.sender_id === String(message.sender_id ?? '') &&
-          row.text === String(message.text ?? '').slice(0, 4000),
+          row.sender_id === String(message.sender_id ?? ''),
       ) ?? null
     );
+  }
+
+  confirmBuffered(message) {
+    const row = this.findIncoming(message);
+    if (!row) return false;
+    const key = buildConversationKey(message.platform, message.kind, message.conversation_id);
+    this.archive?.append(key, row, { fullText: row.text });
+    return true;
   }
   rememberReply(key, item) {
     const message = item.message;
@@ -279,6 +327,7 @@ export class MessageBuffer {
         platform: message.platform,
         kind: message.kind,
         conversation_id: String(message.conversation_id),
+        ...(typeof message.readerGrant === 'string' ? { readerGrant: message.readerGrant } : {}),
         conversation_name: String(message.conversation_name ?? ''),
         self_id: String(message.self_id ?? ''),
         sender_id: String(message.sender_id ?? ''),
@@ -384,8 +433,7 @@ export class MessageBuffer {
         ...(/^[a-f0-9]{64}$/.test(outgoing.sticker_id ?? '') ? { sticker_id: outgoing.sticker_id } : {}),
       });
     }
-    if (rows.length > this.maxPerChat) rows.splice(0, rows.length - this.maxPerChat);
-    this.chats.set(key, rows);
+    this.chats.set(key, this.trimRecent(rows));
     this.#save();
   }
   completeReply(key, item, outgoing) {
@@ -397,13 +445,24 @@ export class MessageBuffer {
         if ((row.work_mode ?? 'social') === (through.work_mode ?? 'social')) row.processed = true;
         if (row.id === item.throughId) break;
       }
-    if (rows.length > this.maxPerChat) rows.splice(0, rows.length - this.maxPerChat);
-    this.chats.set(key, rows);
+    this.chats.set(key, this.trimRecent(rows));
     this.pendingReplies.delete(key);
     if (item.noticeId && this.contextNotices.get(key)?.id === item.noticeId) this.contextNotices.delete(key);
     this.#save();
   }
 
+  trimRecent(rows) {
+    let excess = rows.length - this.maxPerChat;
+    if (excess <= 0) return rows;
+    const latest = rows.at(-1);
+    return rows.filter(row => {
+      if (row !== latest && excess > 0 && (row.processed || row.readerReplay !== 'reply')) {
+        excess--;
+        return false;
+      }
+      return true;
+    });
+  }
   recent(key, limit = 50) {
     return (this.chats.get(key) ?? []).slice(-Math.min(this.maxPerChat, Math.max(1, Number(limit) || 50)));
   }
@@ -411,9 +470,7 @@ export class MessageBuffer {
     return [...this.chats.keys()];
   }
   unread(key, limit = 50) {
-    return this.recent(key, this.maxPerChat)
-      .filter(row => !row.processed)
-      .slice(0, limit);
+    return (this.chats.get(key) ?? []).filter(row => !row.processed).slice(0, limit);
   }
   markProcessed(key, throughId = null, noticeId = null) {
     const rows = this.chats.get(key) ?? [];
@@ -424,6 +481,7 @@ export class MessageBuffer {
       if (throughId && row.id === throughId) break;
     }
     if (noticeId && this.contextNotices.get(key)?.id === noticeId) this.contextNotices.delete(key);
+    this.chats.set(key, this.trimRecent(rows));
     this.pendingRequests.delete(key);
     this.#save();
   }
@@ -443,7 +501,7 @@ export class MessageBuffer {
         contextNotices: Object.fromEntries(this.contextNotices),
         pendingRequests: Object.fromEntries(this.pendingRequests),
       }),
-      { mode: 0o600 },
+      { mode: 0o600, flush: true },
     );
     fs.renameSync(temp, this.file);
   }

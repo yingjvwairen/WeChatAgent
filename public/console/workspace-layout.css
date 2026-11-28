@@ -377,3 +377,10 @@
     padding: 16px;
   }
 }
+.delivery-preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.delivery-preview p {
+  margin-block: 0.5rem;
+}

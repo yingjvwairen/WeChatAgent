@@ -1,6 +1,7 @@
 import { audioSegments } from '../packages/plugin-api/audio.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fixturePluginAccount, selectPluginAccount } from './test-fixtures/plugin-account.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -24,6 +25,7 @@ import { PluginInstaller } from '../packages/plugin-api/installer.mjs';
 import { PluginRuntime } from '../packages/plugin-api/index.mjs';
 import { packZip } from '../packages/plugin-api/zip.mjs';
 import { createAudioReader } from '../packages/plugin-api/audio.mjs';
+import { buildPrivatePrompt } from '../components/qq-bridge/src/core/social-engine.js';
 import { VoiceIngress } from '../components/qq-bridge/src/core/voice-ingress.js';
 import { normalizeOneBotEvent } from '../components/qq-bridge/src/onebot/normalize.js';
 
@@ -32,7 +34,7 @@ const source = path.resolve('optional-extensions/speech-recognition'),
   defaults = manifest.settings;
 const id = 'a'.repeat(64),
   key = 'wechat:private:123',
-  other = 'wechat:group:456';
+  other = 'wechat:group:456@chatroom';
 const audio = {
   id,
   b64: Buffer.from('synthetic-audio').toString('base64'),
@@ -160,7 +162,7 @@ test('a five-minute message is transcribed in five authorized chunks and returns
     let body = '';
     for await (const chunk of req) body += chunk;
     uploads.push(body);
-    res.end(JSON.stringify({ text: 'segment ' + uploads.length }));
+    res.end(JSON.stringify({ text: ('segment ' + uploads.length).padEnd(900, 'x') }));
   });
   const result = await recognize(
     context({ endpoint, cacheResults: false, maxDurationSeconds: 300 }, async (voice, options) => {
@@ -173,7 +175,30 @@ test('a five-minute message is transcribed in five authorized chunks and returns
   );
   assert.deepEqual(reads, [0, 1, 2, 3, 4]);
   assert.equal(uploads.length, 5);
-  assert.deepEqual(result, { ok: true, id, text: 'segment 1\nsegment 2\nsegment 3\nsegment 4\nsegment 5' });
+  let delivered;
+  const ingress = new VoiceIngress({
+    recognize: async () => result,
+    deliver: message => {
+      delivered = message;
+    },
+  });
+  await ingress.push({
+    platform: 'wechat',
+    kind: 'private',
+    conversation_id: 'peer',
+    message_id: id,
+    text: '视频',
+    voice: { id },
+    voiceSource: 'video',
+  });
+  assert.ok(delivered.text.endsWith(result.text));
+  const prompt = buildPrivatePrompt({ key: 'wechat:private:peer', rows: [{ ...delivered, quoteKind: 'video' }] });
+  assert.ok(prompt.includes(result.text));
+  assert.deepEqual(result, {
+    ok: true,
+    id,
+    text: [1, 2, 3, 4, 5].map(n => ('segment ' + n).padEnd(900, 'x')).join('\n'),
+  });
 });
 
 test('revoking permission between video chunks prevents the next upload and discards partial text', async t => {
@@ -271,9 +296,10 @@ test('templates, paths and headers reject ambiguity without evaluating code', ()
 
 test('runtime only allows a bound voice in the current authorized chat; revocation discards prepared bytes', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-plugin-test-'));
+  selectPluginAccount(root);
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   atomicJson(path.join(root, 'config/wechatagent.json'), {
-    wechat: { whitelist: { private: ['123'], groups: ['456'] } },
+    wechat: { whitelist: { private: ['123'], groups: ['456@chatroom'] } },
   });
   const installer = new PluginInstaller(root);
   t.after(() => installer.dispose());
@@ -308,7 +334,7 @@ test('runtime only allows a bound voice in the current authorized chat; revocati
     revoke = false;
   const runtime = new PluginRuntime({
     root,
-    accountScope: 'fixture-account',
+    accountScope: fixturePluginAccount,
     readAudio: async () => {
       reads++;
       if (revoke) grant(false);
@@ -374,6 +400,7 @@ test('the actual ZIP runs in its isolated worker and only uploads its bound synt
     res.end('{"text":"真实插件子进程的模拟转写"}');
   });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-actual-plugin-'));
+  selectPluginAccount(root);
   atomicJson(path.join(root, 'config/wechatagent.json'), { wechat: { whitelist: { private: ['123'], groups: [] } } });
   const installer = new PluginInstaller(root),
     preview = installer.inspect({ name: 'speech.zip', zip: packZip(packageFiles(source)).toString('base64') });
@@ -388,7 +415,7 @@ test('the actual ZIP runs in its isolated worker and only uploads its bound synt
   assert(!JSON.stringify(pluginCatalog(root)).includes('secret-only-in-settings'));
   const runtime = new PluginRuntime({
     root,
-    accountScope: 'fixture-account',
+    accountScope: fixturePluginAccount,
     readAudio: async (voiceId, chat, plugin) => {
       assert.equal(voiceId, id);
       assert.equal(chat, key);
@@ -493,8 +520,8 @@ test('asynchronous permission checks cannot exceed the two-upload concurrency li
 test('normalization admits only bounded reader references, never arbitrary audio URLs', () => {
   const event = {
     message_type: 'private',
-    user_id: 123,
-    self_id: 99,
+    user_id: '123',
+    self_id: '99',
     message: [
       { type: 'text', data: { text: '[语音]' } },
       { type: 'record', data: { voice_id: id, file: 'wechatagent://voice/' + id, duration: 2 } },

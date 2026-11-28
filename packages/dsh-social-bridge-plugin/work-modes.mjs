@@ -1,3 +1,4 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { conversationWorkMode } from './conversation-policy.mjs';
@@ -79,7 +80,7 @@ export function scopeHistory(store, modeFor, { fixedMode } = {}) {
 // Only mapping metadata is switched. DSH owns and preserves the actual journals.
 export function createWorkModeSlots({ mappings, profiles, slots = {}, identity, persist, isBusy, release }) {
   for (const [key, modes] of Object.entries(slots)) {
-    if (!/^wechat:(private|group):[1-9]\d*$/.test(key) || !modes || typeof modes !== 'object' || Array.isArray(modes))
+    if (!validChatKey(key) || !modes || typeof modes !== 'object' || Array.isArray(modes))
       throw Error('WORK_MODE_STATE_INVALID');
     for (const [mode, entry] of Object.entries(modes))
       if (

@@ -1,3 +1,4 @@
+import { parseChatKey, allowedConversation } from '../wechat-identity.mjs';
 export const MEMBER_MEMORY_POLICY = Symbol.for('wechatagent.member-memory.v1');
 export const MEMBER_TAGS = Object.freeze([
   '爱玩梗',
@@ -11,11 +12,9 @@ export const MEMBER_TAGS = Object.freeze([
   '认真讨论',
 ]);
 export function memberMemoryEnabled(wechat, key) {
-  const match = /^wechat:group:([1-9]\d{0,15})$/.exec(key ?? '');
   return (
-    !!match &&
-    Number.isSafeInteger(Number(match[1])) &&
-    (wechat?.whitelist?.groups ?? []).some(id => String(id) === match[1]) &&
+    parseChatKey(key)?.kind === 'group' &&
+    allowedConversation(wechat, key) &&
     (wechat.memberMemory?.chats?.[key] ?? wechat.memberMemory?.enabled ?? true) === true
   );
 }
@@ -36,7 +35,7 @@ export function validateMemberMemory(settings) {
       typeof settings.chats !== 'object' ||
       Array.isArray(settings.chats) ||
       Object.entries(settings.chats).some(
-        ([key, value]) => !/^wechat:group:[1-9]\d{0,15}$/.test(key) || typeof value !== 'boolean',
+        ([key, value]) => parseChatKey(key)?.kind !== 'group' || typeof value !== 'boolean',
       ))
   )
     throw Error('Invalid member memory chat settings');

@@ -45,7 +45,7 @@ function fixture(
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'WeChatAgent web-reader ')),
     file = path.join(root, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file));
-  const settings = { wechat: { whitelist: { private: [123], groups: [] }, search: { enabled: false } } };
+  const settings = { wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: false } } };
   const save = () => fs.writeFileSync(file, JSON.stringify(settings));
   save();
   let tool,
@@ -117,7 +117,7 @@ test('legacy configs default enabled while disable, whitelist removal, corrupt c
   fs.writeFileSync(f.file, '{');
   assert.equal(localWebReaderEnabled(f.root, key), false);
   assert.equal(
-    webReaderEnabled({ whitelist: { private: [123] }, webReader: { enabled: true } }, 'wechat:private:other'),
+    webReaderEnabled({ whitelist: { private: ['123'] }, webReader: { enabled: true } }, 'wechat:private:other'),
     false,
   );
   assert.throws(() => validateWebReaderSettings({ enabled: 'true' }), /settings/);

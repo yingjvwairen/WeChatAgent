@@ -1,3 +1,4 @@
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
 import { ocrPython } from './ocr-runtime.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -656,7 +657,7 @@ export function resolveQtBootstrapLayout(options, dependencies) {
     !(client instanceof qt.QtActionsClient) ||
     client.enableInput !== false ||
     config?.sharedDesktop !== true ||
-    config.executableVersion !== '4.2.0.53' ||
+    config.executableVersion !== DESKTOP_WECHAT_VERSION ||
     !digest(config.accountRef) ||
     !digest(config.executableSha256) ||
     !path.isAbsolute(config.executable ?? '') ||

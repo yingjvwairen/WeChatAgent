@@ -1,3 +1,4 @@
+import { desktopManifest, seedDesktopPayloads } from './test-fixtures/desktop-deployment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -22,15 +23,14 @@ function fixture(t) {
         fs.writeFileSync(target, typeof value === 'string' ? value : JSON.stringify(value));
       };
     write('project/config/wechatagent.example.json', {
-      runtime: { python: 'python', dshDesktop: '' },
+      runtime: { sender: 'wechat-ui', python: 'python', dshDesktop: '' },
       persona: { default: 'Fixture', chats: {} },
       wechat: { whitelist: { private: [], groups: [] } },
     });
-    write('project/deployment.json', {
-      version,
-      files: ['config/wechatagent.example.json'],
-      ...(bundled ? {} : { dshBundled: false, dshSdkVersion: DSH_SDK_VERSION }),
-    });
+    write(
+      'project/deployment.json',
+      desktopManifest({ version, files: ['config/wechatagent.example.json'], dshSdkVersion: DSH_SDK_VERSION }),
+    );
     for (const file of [
       'runtime/python/python.exe',
       'runtime/node.exe',
@@ -39,7 +39,7 @@ function fixture(t) {
     ])
       write(file, 'fixture');
     write('vendor/hook/build.json', {});
-    if (bundled) write('vendor/dsh/DeepSeek Harness.exe', 'legacy-fixture');
+    seedDesktopPayloads(write);
     return resources;
   };
   return { base, home, resourcesFor };
@@ -60,30 +60,6 @@ test('new external-only installations deploy successfully without a DSH payload 
   assert(!fs.existsSync(path.join(f.home, 'dsh')));
   await deployment.bootstrapDeployment(resources, f.home);
   assert.equal(JSON.parse(fs.readFileSync(path.join(result.root, 'config/wechatagent.json'))).runtime.dshDesktop, '');
-});
-
-test('upgrading from a bundled release preserves the old DSH executable and its history without copying it into the new runtime', async t => {
-  const f = fixture(t),
-    legacy = await deployment.bootstrapDeployment(f.resourcesFor('legacy', { bundled: true }), f.home),
-    configFile = path.join(legacy.root, 'config/wechatagent.json'),
-    oldConfig = JSON.parse(fs.readFileSync(configFile)),
-    oldExe = oldConfig.runtime.dshDesktop;
-  const history = path.join(f.home, 'dsh/sessions/fixture/session.v4.jsonl.zstd'),
-    bytes = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3]);
-  fs.mkdirSync(path.dirname(history), { recursive: true });
-  fs.writeFileSync(history, bytes);
-  oldConfig.wechat.whitelist.private = ['123'];
-  fs.writeFileSync(configFile, JSON.stringify(oldConfig));
-  const next = await deployment.bootstrapDeployment(f.resourcesFor('external-only', { version: 'fixture-2' }), f.home),
-    config = JSON.parse(fs.readFileSync(configFile)),
-    dist = JSON.parse(fs.readFileSync(path.join(next.root, 'config/distribution.json')));
-  assert.equal(config.runtime.dshDesktop, oldExe);
-  assert.equal(dist.dsh, oldExe);
-  assert.equal(dist.dshBundled, false);
-  assert(fs.existsSync(oldExe));
-  assert.deepEqual(fs.readFileSync(history), bytes);
-  assert.deepEqual(config.wechat.whitelist.private, ['123']);
-  assert(!fs.existsSync(path.join(f.home, 'runtimes/fixture-2/dsh')));
 });
 
 test('external-only upgrades retain the independently configured program instead of replacing it with a managed executable', async t => {

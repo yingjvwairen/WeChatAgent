@@ -1,20 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { validUserId } from '../packages/wechat-identity.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => JSON.parse(fs.readFileSync(path.join(root, file), 'utf8').replace(/^\uFEFF/, ''));
-const weflow = read('state/weflow/WeFlow-config.json');
 const project = read('config/wechatagent.json');
-const io = read('state/wechat-io-config.json');
+const io = fs.existsSync(path.join(root, 'state/wechat-io-config.json')) ? read('state/wechat-io-config.json') : {};
 const keyword = process.argv.slice(2).join(' ').trim();
 const show = (wxid, name) => {
-  const id = (
-    (crypto.createHash('sha256').update(String(wxid)).digest().readBigUInt64BE(0) % 2147483647n) +
-    1n
-  ).toString();
   console.log(
-    JSON.stringify({ name, onebotId: id, alreadyAllowed: project.wechat.whitelist.private.map(String).includes(id) }),
+    JSON.stringify({ name, wechatId: wxid, alreadyAllowed: project.wechat.whitelist.private.includes(wxid) }),
   );
 };
 if (keyword) {
@@ -30,8 +25,7 @@ if (keyword) {
     const data = await response.json();
     if (data.success === false || !Array.isArray(data.contacts)) throw new Error('Invalid contact response');
     const contacts = data.contacts.filter(
-      contact =>
-        contact.username && !String(contact.username).includes('@chatroom') && contact.username !== io.self_wxid,
+      contact => validUserId(contact.username) && contact.username !== io.self_wxid,
     );
     for (const contact of contacts)
       show(contact.username, contact.remark || contact.displayName || contact.nickname || 'Unnamed contact');
@@ -44,9 +38,13 @@ if (keyword) {
     process.exitCode = 1;
   }
 } else {
-  for (const wxid of weflow.messagePushFilterList ?? []) {
-    if (String(wxid).includes('@chatroom')) continue;
-    let name = 'Name unavailable (open the WeFlow database to resolve it)';
+  for (const wxid of project.wechat.whitelist.private) {
+    if (!validUserId(wxid)) continue;
+    let name = wxid;
+    if (!io.reader_base_url || !io.reader_token) {
+      show(wxid, name);
+      continue;
+    }
     try {
       const response = await fetch(
         `${io.reader_base_url}/api/v1/contacts?keyword=${encodeURIComponent(wxid)}&limit=5`,

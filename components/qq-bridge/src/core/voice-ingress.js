@@ -33,7 +33,7 @@ export class VoiceIngress {
     if (this.closed) return Promise.resolve();
     const key = buildConversationKey(message.platform, message.kind, message.conversation_id),
       identity = key + '\0' + message.message_id;
-    if (!message.voice && !this.queues.has(key))
+    if (!message.voice && !message.forwardedVoices?.length && !this.queues.has(key))
       return Promise.resolve().then(() => {
         if (!this.closed) return this.deliver(message);
       });
@@ -53,7 +53,9 @@ export class VoiceIngress {
         this.controllers.add(controller);
         try {
           let prepared = message;
-          if (message.voice) {
+          const voices = message.forwardedVoices ?? (message.voice ? [message.voice] : []);
+          for (const voice of voices) {
+            const current = message.forwardedVoices ? { ...message, voice: { id: voice.id } } : message;
             let generation = '';
             try {
               generation = this.generationFor(message);
@@ -66,7 +68,7 @@ export class VoiceIngress {
               try {
                 if (!(await this.canRecognize(message)))
                   result = { ok: false, code: 'VOICE_INPUT_UNAVAILABLE', stage: 'host' };
-                else result = await this.recognize(message, { signal: controller.signal });
+                else result = await this.recognize(current, { signal: controller.signal });
               } catch (error) {
                 result = {
                   ok: false,
@@ -83,7 +85,7 @@ export class VoiceIngress {
               result?.ok === true &&
               typeof result.text === 'string' &&
               !!result.text.trim() &&
-              result.text.length <= 4000;
+              result.text.length <= 12000;
             const code = /^VOICE_[A-Z0-9_]{3,80}$/.test(result?.code ?? '') ? result.code : 'VOICE_INPUT_FAILED';
             const plugin = /^[a-z][a-z0-9-]{0,39}$/.test(result?.plugin ?? '') ? { plugin: result.plugin } : {};
             try {
@@ -103,6 +105,41 @@ export class VoiceIngress {
             } catch {
               this.log('[Voice] diagnostic_write_failed');
             }
+            if (message.forwardedVoices) {
+              const record = prepared.forwardedRecord;
+              const items = record.items.slice();
+              const length = text => [...text].length;
+              const available = Math.max(
+                0,
+                Math.min(
+                  760,
+                  6200 -
+                    items.reduce(
+                      (n, item, i) =>
+                        n + length(item.sender) + length(item.time) + 12 + (i === voice.index ? 0 : length(item.text)),
+                      length(record.title),
+                    ),
+                ),
+              );
+              const source = items[voice.index];
+              const transcript = success
+                ? '[历史音轨自动转写] ' + result.text.trim()
+                : code === 'VOICE_VIDEO_NO_AUDIO'
+                  ? '[历史视频没有音轨]'
+                  : '[历史音轨未能转写]';
+              const label =
+                source.kind === '1'
+                  ? source.text + '\n[以下音轨属于被引用的历史消息]\n' + transcript
+                  : source.kind === '4'
+                    ? source.text + '\n' + transcript
+                    : transcript;
+              items[voice.index] = { ...items[voice.index], text: [...label].slice(0, available).join('') };
+              prepared = {
+                ...prepared,
+                forwardedRecord: { ...record, items, truncated: record.truncated || length(label) > available },
+              };
+              continue;
+            }
             prepared = {
               ...message,
               message_type: 'text',
@@ -112,6 +149,41 @@ export class VoiceIngress {
                   code +
                   '。这是转写失败，本轮未提供语音内容；不要猜测或声称没有收到消息，可以请对方改发文字，并提示检查语音识别插件配置。]',
             };
+            if (message.voiceSource === 'video') {
+              prepared.text =
+                message.text +
+                '\n' +
+                (success
+                  ? '[视频音轨自动转写] ' + result.text.trim()
+                  : code === 'VOICE_VIDEO_NO_AUDIO'
+                    ? '[视频没有音轨]'
+                    : '[视频音轨未转写；可使用已取得的画面。]');
+            } else if (['34', '43', '62'].includes(message.quoteReply?.reference?.kind)) {
+              const quote = message.quoteReply;
+              const transcript = success ? [...result.text.trim()] : [];
+              prepared.text = message.text;
+              const video = quote.reference.kind !== '34';
+              const label = video ? '[历史视频音轨自动转写]' : '[历史语音自动转写]';
+              const videoSummary = video ? quote.reference.text + '\n' : '';
+              const text =
+                videoSummary +
+                (success
+                  ? label + ' ' + transcript.join('')
+                  : video
+                    ? code === 'VOICE_VIDEO_NO_AUDIO'
+                      ? '[历史视频没有音轨]'
+                      : '[历史视频音轨未转写]'
+                    : '[引用的语音未能转写]');
+              prepared.quoteReply = {
+                ...quote,
+                reference: {
+                  ...quote.reference,
+                  unavailable: !success && !(video && message.images?.length),
+                  text: [...text].slice(0, 1600).join(''),
+                  truncated: [...text].length > 1600,
+                },
+              };
+            }
             this.log(
               '[Voice] ' +
                 key +
@@ -123,7 +195,7 @@ export class VoiceIngress {
                     : 'VOICE_INPUT_FAILED'),
             );
           }
-          if (!this.closed) await this.deliver(prepared);
+          if (!this.closed) return await this.deliver(prepared);
         } finally {
           controller.abort();
           this.controllers.delete(controller);

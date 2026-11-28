@@ -1,3 +1,7 @@
+// The durable Reader selects a single reply candidate after checking the current grant.
+export const acceptsReaderMessage = (connection, message) =>
+  !connection.skips(message) || (connection.ready && message.readerReplay === 'reply');
+
 // A reconnect boundary acknowledges old inputs without deleting their history.
 export class DshConnectionGuard {
   constructor({ buffer, probe, now = Date.now, log = () => {}, pollMs = 2000 }) {

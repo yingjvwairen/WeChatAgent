@@ -1,3 +1,4 @@
+import { DESKTOP_WECHAT_VERSION } from './desktop-settings.mjs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 
@@ -110,10 +111,6 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
       portLabel +
       '）。请查看 reader.stderr.log 中的状态，并停止后重新启动助手服务；这一步尚未确认微信发送组件异常。'
     );
-  if (/HOOK_CONNECTION_RESET|HOOK_HEALTH_FAILED/.test(output))
-    return (
-      '微信发送组件连接被中断或检查失败（' + portLabel + '）。请查看 hook-init.log；持续失败时使用“修复微信连接”。'
-    );
   if (/ADAPTER_LISTEN_FAILED|ADAPTER_START_FAILED/.test(output))
     return '应用适配器未能启动。下方日志已保留失败阶段和系统错误码，请结合 adapter.stderr.log 检查。';
   if (/SERVICE_START_TIMEOUT/.test(output))
@@ -130,17 +127,14 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
     return '已尝试打开匹配微信，但它尚未完成启动。请查看微信窗口是否提示升级或启动失败；确认后再重试。';
   if (/WECHAT_LAUNCH_FAILED/.test(output))
     return 'Windows 未能打开所选微信程序。请检查连接设置中的程序路径，并查看下方具体启动错误。';
-  if (/HOOK_PROFILE_MISMATCH/.test(output))
-    return '微信版本或已加载的发送组件不匹配。请正常退出该微信后重新打开，并确认使用对应版本的组件。';
   if (/Another desktop WeChat is running|WECHAT_MULTIPLE/i.test(output))
     return '检测到其他微信客户端。点击“检查占用进程”，确认并停止对应微信后，再打开匹配微信。';
-  if (/HOOK_CLIENT_UNHEALTHY|HOOK_INITIALIZATION_TIMEOUT|HOOK_NOT_LISTENING/.test(output))
-    return '微信发送组件尚未就绪。可稍后重试；持续失败时点击“修复微信连接”，核对进程并再次确认后重开匹配微信。详情见 hook-init.log。';
-  if (/HOOK_AUTH_FAILED|HOOK_PORT_OWNER_MISMATCH/.test(output))
-    return '微信发送端口或令牌与当前客户端不一致。请检查占用进程和 hook-init.log；可通过“修复微信连接”重新打开匹配微信。';
-  if (/HOOK_HEALTH_TIMEOUT/.test(output)) return '微信发送组件响应超时，请稍后重试；持续失败时查看 hook-init.log。';
-  if (/HOOK_HEALTH_INVALID_RESPONSE/.test(output))
-    return '微信发送端口返回了无效响应，可能被其他程序占用；请检查 hook-init.log 和发送端口。';
+  if (/DESKTOP_SHUTDOWN/.test(output))
+    return '桌面发送器尚未完成录音或输入清理，已保留运行进程。请稍后重试停止；不会强制关闭正在录音的微信。';
+  if (/DESKTOP_VERSION_UNSUPPORTED/.test(output))
+    return '当前桌面发送支持微信 ' + DESKTOP_WECHAT_VERSION + '，请在连接设置选择已安装的对应版本。';
+  if (/DESKTOP_(?:CLIENT_REQUIRED|ACCOUNT_UNVERIFIED|SENDER_NOT_READY)|INPUT_WECHAT_NOT_RUNNING/.test(output))
+    return '请在连接设置选择微信程序，并登录所选读取账号后重试。';
   if (/ACCOUNT_SWITCH_REQUIRES_DSH_RESTART/.test(output))
     return '账号已切换。请从 DSH 托盘完整退出并重新打开，再启动助手服务。';
   if (code === 124) return '操作等待超时。请查看连接检查与日志，确认当前服务状态后重试。';
@@ -160,8 +154,6 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
     return inline
       ? '数据库读取器未能启动。请在首次配置中重新连接并验证微信；具体错误见“设置 → 运行日志”。'
       : '数据库读取器未能启动。请在首次配置中重新连接并验证微信；下方会显示读取器的具体错误。';
-  if (/HOOK_COMPONENT_UPDATE_PENDING/.test(output))
-    return '发送组件已更新。点击“修复微信连接”，核对并再次确认后重开匹配微信以应用更新。';
   if (
     /CouldNotAutoloadMatchingModule|Microsoft\.PowerShell\.Security.*module|Get-AuthenticodeSignature.*ObjectNotFound/is.test(
       output,
@@ -170,20 +162,6 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
     return 'Windows PowerShell 安全模块未能加载。请退出应用后重新打开更新后的 WeChatAgent.exe。';
   if (/WECHAT_LAUNCH_EXITED/i.test(output))
     return '微信启动后已退出。若微信提示必须升级，当前固定版本的发送组件需要重新适配；请保留完整微信提示。';
-  if (/HOOK_VERSION_MISMATCH|Client version mismatch/i.test(output))
-    return '微信版本与发送组件不匹配，请在连接设置中选择匹配的微信程序。';
-  if (/HOOK_LOGIN_REQUIRED/i.test(output))
-    return '发送组件已连接，但微信尚未打开账号数据库。请完成登录并等待聊天同步，然后重试。';
-  if (/HOOK_MULTIPLE_ACCOUNT_DATABASES/i.test(output))
-    return '匹配微信进程仍打开多个账号的数据库。点击“修复微信连接”，核对并再次确认后重开匹配微信，再登录目标账号。';
-  if (/HOOK_ACCOUNT_MISMATCH/i.test(output))
-    return '微信当前账号与所选数据库不一致。请重新选择当前账号，或在微信切换到所选账号后重试。';
-  if (/HOOK_ACCOUNT_METADATA_INVALID/i.test(output))
-    return '微信发送组件未提供有效账号信息。请检查组件版本或使用“修复微信连接”。';
-  if (/HOOK_ACCOUNT_NOT_READY/i.test(output))
-    return '微信账号数据库尚未与读取设置匹配。请确认登录了对应账号，并等待聊天同步完成。';
-  if (/WeChat-Hook is not ready|BACKEND_UNAVAILABLE|Matching WeChat client missing/i.test(output))
-    return '匹配微信尚未就绪。点击“打开微信”，登录配置的账号后再启动。';
   if (/Install the DSH plugin|Fully.*reopen DSH|ECONNREFUSED.*11230/i.test(output))
     return 'DSH 插件尚未就绪。打开 DSH，启用本项目插件并完整重开后再启动。';
   if (/Invalid project configuration|configuration.*failed/i.test(output))

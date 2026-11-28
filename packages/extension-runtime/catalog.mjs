@@ -1,3 +1,4 @@
+import { allowedConversation } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -297,12 +298,7 @@ export function publicSettings(item, settings) {
 }
 export function allowedChat(root, key) {
   try {
-    const match = /^wechat:(private|group):([1-9]\d*)$/.exec(key ?? '');
-    const config = readJson(path.join(root, 'config/wechatagent.json'));
-    return (
-      !!match &&
-      (config.wechat?.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(match[2])
-    );
+    return allowedConversation(readJson(path.join(root, 'config/wechatagent.json')).wechat, key);
   } catch {
     return false;
   }

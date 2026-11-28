@@ -1,3 +1,4 @@
+import { allowedConversation } from '../wechat-identity.mjs';
 // Trusted, bundled skill policy. Chat text cannot grant permissions.
 export const WEB_READER_TOOL = 'web_reader_read';
 export const WEB_READER_POLICY = Symbol.for('wechatagent.builtin-web-reader.v1');
@@ -19,13 +20,7 @@ export function validateWebReaderSettings(value) {
 
 export function webReaderEnabled(wechat, key) {
   validateWebReaderSettings(wechat?.webReader);
-  const match = /^wechat:(private|group):([1-9]\d{0,15})$/.exec(key);
-  return (
-    !!match &&
-    Number.isSafeInteger(Number(match[2])) &&
-    wechat?.whitelist?.[match[1] === 'group' ? 'groups' : 'private']?.some(id => String(id) === match[2]) &&
-    (wechat.webReader?.enabled ?? true)
-  );
+  return allowedConversation(wechat, key) && (wechat.webReader?.enabled ?? true);
 }
 
 export function normalizeWebUrl(raw) {

@@ -1,17 +1,32 @@
 import crypto from 'node:crypto';
 import {
+  desktopTextPrefix,
+  MAX_TEXT_CHARS,
+  normalizeDesktopText,
+  truncateDesktopReply,
+  validDesktopText,
+} from '../../../../scripts/desktop-sender/text-contract.mjs';
+import {
+  maxAutomaticVoiceChars,
+  suitableForAutomaticVoice,
+} from '../../../../packages/speech-contract/automatic-voice.mjs';
+import {
   replyLayoutNotice,
   splitReplyParts,
 } from '../../../../packages/dsh-social-bridge-plugin/reply-layout-policy.mjs';
 import { splitStickerLabels } from './sticker-policy.js';
+import {
+  hasQuoteControl,
+  parseQuoteReply,
+} from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 
 import {
   SOCIAL_PROTOCOL_NOTICE,
   SOCIAL_VOICE_NOTICE,
 } from '../../../../packages/dsh-social-bridge-plugin/prompt-context.mjs';
 export { SOCIAL_VOICE_NOTICE };
-// A voice reply is read aloud: one message within about 60 seconds.
-export const MAX_VOICE_REPLY_CHARS = 400;
+// Long logical replies are split by the desktop voice outbox, with per-part receipts.
+export const MAX_VOICE_REPLY_CHARS = maxAutomaticVoiceChars;
 export const SOCIAL_OUTPUT_NOTICE = SOCIAL_PROTOCOL_NOTICE;
 
 export function hasStickerControl(text) {
@@ -79,7 +94,14 @@ function shortStickerDecision(text, stickerRefs) {
 export function parseSocialDecision(
   output,
   stickerRefs = {},
-  { allowStickerCaption = false, allowTextParts = true, maxTextParts = 2, maxChars = 1200, allowVoice = false } = {},
+  {
+    allowStickerCaption = false,
+    allowTextParts = true,
+    maxTextParts = 2,
+    maxChars = 1200,
+    allowVoice = false,
+    quoteRefs = {},
+  } = {},
 ) {
   const text = String(output ?? '')
     .trim()
@@ -90,21 +112,16 @@ export function parseSocialDecision(
   if (/^(OBSERVE|DEFER)$/i.test(text)) return { decision: text.toUpperCase(), text: '' };
   const standalone = shortStickerDecision(text, stickerRefs);
   if (standalone) return standalone;
-  // RESPOND_VOICE: asks for one native voice message. When voice cannot be
+  // RESPOND_VOICE: asks for one logical native voice reply (split into bubbles when needed). When voice cannot be
   // sent this turn, or the text is not suitable for reading aloud, its valid
   // text is handled exactly like RESPOND:.
   const voiceTagged = /^(?:RESPOND_VOICE|语音回复)\s*[:：]\s*([\s\S]+)$/i.exec(text);
   if (voiceTagged) {
     const spoken = cleanReplyProtocol(voiceTagged[1]);
-    if (!spoken || hasReasoningControl(spoken) || hasReplyProtocolControl(spoken))
+    if (!spoken || hasReasoningControl(spoken) || hasReplyProtocolControl(spoken) || hasQuoteControl(spoken))
       return { decision: 'INVALID', text: '' };
     if (/^\[?SILENT\]?$/i.test(spoken)) return { decision: 'SILENT', text: '' };
-    if (
-      allowVoice &&
-      spoken.length <= MAX_VOICE_REPLY_CHARS &&
-      !hasStickerControl(spoken) &&
-      !/(?:`{3,}|~{3,}|https?:\/\/)/i.test(spoken)
-    ) {
+    if (allowVoice && suitableForAutomaticVoice(spoken) && !hasStickerControl(spoken)) {
       return { decision: 'RESPOND', mode: 'voice', text: spoken };
     }
   }
@@ -115,14 +132,44 @@ export function parseSocialDecision(
   const reply = cleanReplyProtocol(tagged[1]);
   if (hasReasoningControl(reply)) return { decision: 'INVALID', text: '' };
   if (hasReplyProtocolControl(reply)) return { decision: 'INVALID', text: '' };
-  const response = value => {
-    const text = value.trim().slice(0, Math.min(12000, Math.max(1200, maxChars)));
-    if (hasReplyProtocolControl(text)) return { decision: 'INVALID', text: '' };
+  const response = (value, quoteEventId) => {
+    const limit = Math.min(12000, Math.max(1200, maxChars));
+    const text = truncateDesktopReply(normalizeDesktopText(value.trim()).toWellFormed(), limit, Infinity);
     // A code example must not lose its quoting boundary across two messages.
-    const textParts = /^\s*(?:`{3,}|~{3,})/m.test(text) ? null : splitReplyParts(text, allowTextParts, maxTextParts);
-    if (!textParts) return { decision: 'RESPOND', text };
-    return { decision: 'RESPOND', text: textParts.join('\n\n'), textParts };
+    const split = !quoteEventId && allowTextParts && !/^\s*(?:`{3,}|~{3,})/m.test(text);
+    let parts = splitReplyParts(text, split, maxTextParts) ?? [text];
+    if (parts.some(part => desktopTextPrefix(part) !== part)) {
+      parts = [];
+      const slots = split ? maxTextParts || Infinity : 1;
+      let remaining = text,
+        budget = limit;
+      while (remaining && budget > 0) {
+        const partLimit = Math.min(budget, MAX_TEXT_CHARS);
+        if (parts.length + 1 === slots || desktopTextPrefix(remaining, partLimit) === remaining) {
+          parts.push(truncateDesktopReply(remaining, partLimit));
+          break;
+        }
+        const prefix = desktopTextPrefix(remaining, Math.min(budget - 3, MAX_TEXT_CHARS));
+        if (!prefix.trim()) {
+          parts.push(truncateDesktopReply(remaining, partLimit));
+          break;
+        }
+        parts.push(prefix.trimEnd());
+        remaining = remaining.slice(prefix.length).trimStart();
+        budget -= parts.at(-1).length;
+      }
+    }
+    if (parts.some(part => !validDesktopText(part) || hasReplyProtocolControl(part)))
+      return { decision: 'INVALID', text: '' };
+    return {
+      decision: 'RESPOND',
+      text: parts.join('\n\n'),
+      ...(parts.length > 1 ? { textParts: parts } : {}),
+      ...(quoteEventId ? { quoteEventId } : {}),
+    };
   };
+  const quoted = parseQuoteReply(reply, quoteRefs);
+  if (quoted) return quoted.decision === 'RESPOND' ? response(quoted.text, quoted.quoteEventId) : quoted;
   if (!reply) return { decision: 'INVALID', text: '' };
   if (/^\[?SILENT\]?$/i.test(reply)) return { decision: 'SILENT', text: '' };
   const sticker = /^\[STICKER:([a-f0-9]{64})\]$/.exec(reply);
@@ -175,6 +222,7 @@ export async function resolveSocialDecision({
   metadata,
   decide,
   stickerRefs = {},
+  quoteRefs = {},
   allowStickerCaption = false,
   allowTextParts = true,
   maxTextParts = 2,
@@ -183,13 +231,8 @@ export async function resolveSocialDecision({
   log = () => {},
 }) {
   let output = splitStickerLabels(rawOutput);
-  let result = parseSocialDecision(output.text, stickerRefs, {
-    allowStickerCaption,
-    allowTextParts,
-    maxTextParts,
-    maxChars,
-    allowVoice,
-  });
+  const format = { allowStickerCaption, allowTextParts, maxTextParts, maxChars, allowVoice, quoteRefs };
+  let result = parseSocialDecision(output.text, stickerRefs, format);
   if (result.decision !== 'INVALID') return { output, result };
   log(`[Social] ${key} format_repair reason=${output.text.trim() ? 'invalid' : 'empty'}`);
   const repairMetadata = { ...metadata };
@@ -211,15 +254,12 @@ export async function resolveSocialDecision({
     (choices.length
       ? `如需原生表情，仅可输出 RESPOND: [STICKER:S编号]，本轮允许 ${choices.join('、')}；不能使用其他编号。\n`
       : '本次仅允许文字回复或沉默，不使用历史表情编号。\n') +
+    (Object.keys(quoteRefs).length
+      ? '如需引用，仅可用 RESPOND: [QUOTE:编号] 正文，本轮允许 ' + Object.keys(quoteRefs).join('、') + '。\n'
+      : '') +
     (allowTextParts ? replyLayoutNotice(maxTextParts) + '\n' + SOCIAL_PROTOCOL_NOTICE : SOCIAL_PROTOCOL_NOTICE) +
     (allowVoice ? '\n' + SOCIAL_VOICE_NOTICE : '');
   output = splitStickerLabels(await decide(key, prompt, repairMetadata));
-  result = parseSocialDecision(output.text, stickerRefs, {
-    allowStickerCaption,
-    allowTextParts,
-    maxTextParts,
-    maxChars,
-    allowVoice,
-  });
+  result = parseSocialDecision(output.text, stickerRefs, format);
   return { output, result };
 }

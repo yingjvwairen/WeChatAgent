@@ -1,3 +1,4 @@
+import { deliveryPages } from '../public/console/workspace-layout.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -9,13 +10,15 @@ import {
   chatRows,
   filterChats,
   effectiveChatFeature,
+  requiresRestart,
+  withoutLiveSettings,
 } from '../public/console/layout-model.mjs';
 import { createWorkspaceLayout } from '../public/console/workspace-layout.js';
 const key = 'wechat:private:123',
-  group = 'wechat:group:456';
+  group = 'wechat:group:456@chatroom';
 const config = () => ({
   wechat: {
-    whitelist: { private: ['123'], groups: ['456'] },
+    whitelist: { private: ['123'], groups: ['456@chatroom'] },
     workModes: { [key]: 'assistant' },
     search: { enabled: false, chats: { [key]: true } },
     stickers: { enabled: true, chats: {} },
@@ -35,7 +38,44 @@ const esc = value =>
     /[&<>"']/g,
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
   );
-function fixture({ offline = false, tab = 'summary', historyMode, running = false, workMode = 'assistant' } = {}) {
+test('fast strategy and typing changes share live persistence semantics without changing executable restart rules', () => {
+  const before = {
+    runtime: { sender: 'wechat-ui', python: 'python' },
+    input: {
+      controlMode: 'ocr',
+      typeText: false,
+      paused: false,
+      python: 'D:/fixture/python.exe',
+      wechatExecutable: 'D:/fixture/Weixin.exe',
+    },
+  };
+  const original = structuredClone(before),
+    after = structuredClone(before);
+  Object.assign(after.input, { controlMode: 'uia', typeText: true, paused: true });
+  for (const key of ['controlMode', 'typeText', 'paused', 'offscreen'])
+    assert.equal(requiresRestart('input.' + key), false);
+  assert.deepEqual(withoutLiveSettings(before), withoutLiveSettings(after));
+  assert.deepEqual(before, original);
+  for (const key of ['runtime.sender', 'runtime.python', 'input.python', 'input.wechatExecutable'])
+    assert.equal(requiresRestart(key), true);
+  after.input.python = 'D:/other/python.exe';
+  assert.notDeepEqual(withoutLiveSettings(before), withoutLiveSettings(after));
+});
+test('adding only per-request input preferences does not create a restart-only section', () => {
+  assert.deepEqual(
+    withoutLiveSettings({ runtime: { sender: 'wechat-ui' } }),
+    withoutLiveSettings({ runtime: { sender: 'wechat-ui' }, input: { controlMode: 'ocr', typeText: false } }),
+  );
+  assert.equal(requiresRestart('input.controlMode.extra'), true);
+});
+function fixture({
+  offline = false,
+  tab = 'summary',
+  historyMode,
+  running = false,
+  workMode = 'assistant',
+  deliveries,
+} = {}) {
   const original = config(),
     state = {
       config: original,
@@ -52,6 +92,7 @@ function fixture({ offline = false, tab = 'summary', historyMode, running = fals
   const api = async (route, body) => {
     requests.push({ route, body });
     if (offline) throw Error('offline fixture');
+    if (route.startsWith('/api/chat-deliveries?') && deliveries) return deliveries;
     if (route === '/api/sessions')
       return {
         sessions: [
@@ -186,6 +227,84 @@ test('merged chat rendering is read-only, escaped and retains one settings entry
   assert.equal(JSON.stringify(f.state.draft), before);
   assert(f.requests.every(item => item.body === undefined));
 });
+test('queue previews show text, voice, media and quotes with escaped expandable content', async () => {
+  const previews = [
+    '待发送的文字 <script>alert(1)</script>',
+    '语音内容：你好',
+    '猫咪.gif',
+    '引用：原消息\n\n' + '长回复'.repeat(150),
+  ];
+  const native = previews.map((preview, index) => ({
+    id: String(index).repeat(64),
+    channel: 'native',
+    name: index === 1 ? '语音回复' : '文字回复',
+    preview,
+    state: 'waiting',
+    revision: 0,
+    createdAt: Date.now(),
+    canPause: true,
+  }));
+  const f = fixture({ tab: 'deliveries', deliveries: { account: 'fixture', jobs: [], native } });
+  const html = await f.ui.chatsPage();
+  for (const preview of previews) assert.ok(html.includes(esc(preview)));
+  assert.match(html, /<details class="delivery-preview">/);
+  assert.doesNotMatch(html, /<script>/);
+});
+
+test('file queue shows controls for upcoming deliveries and keeps confirmed records read-only', async () => {
+  const now = Date.now();
+  const job = {
+    id: 'a'.repeat(64),
+    name: '<sample>.txt',
+    size: 10,
+    createdAt: now,
+    deadlineAt: now + 60000,
+    revision: 0,
+  };
+  const f = fixture({
+    tab: 'deliveries',
+    deliveries: {
+      account: 'b'.repeat(64),
+      jobs: [
+        { ...job, state: 'queued' },
+        { ...job, state: 'paused' },
+        { ...job, state: 'submitted' },
+        { ...job, state: 'confirmed' },
+      ],
+    },
+  });
+  const html = await f.ui.chatsPage();
+  assert.match(html, /&lt;sample&gt;\.txt/);
+  assert.match(html, /发送队列/);
+  assert.match(html, /等待回执/);
+  assert.equal([...html.matchAll(/data-file-delivery="cancel"/g)].length, 2);
+  assert.equal([...html.matchAll(/data-file-delivery="pause"/g)].length, 1);
+  assert.equal([...html.matchAll(/data-file-delivery="resume"/g)].length, 1);
+  assert(f.requests.every(({ body }) => body === undefined));
+});
+
+test('model-selected image and GIF replies share the ordinary reply controls', async () => {
+  const f = fixture({
+    tab: 'deliveries',
+    deliveries: {
+      account: 'fixture',
+      grant: 'grant',
+      held: false,
+      holdRevision: 0,
+      jobs: [],
+      replies: [
+        { id: 'a'.repeat(64), kind: 'sticker', state: 'paused', revision: 1, createdAt: Date.now() },
+        { id: 'b'.repeat(64), kind: 'sticker', state: 'submitted', revision: 2, createdAt: Date.now() },
+      ],
+    },
+  });
+  const html = await f.ui.chatsPage();
+  assert.match(html, /图片 \/ GIF \/ 表情回复/);
+  assert.match(html, /本聊天的机器人回复/);
+  assert.equal([...html.matchAll(/data-file-delivery="cancel"/g)].length, 1);
+  assert.equal([...html.matchAll(/data-file-delivery="resume"/g)].length, 1);
+  assert.match(html, /data-channel="reply"/);
+});
 test('offline DSH leaves contact settings available and never invents a session', async () => {
   const f = fixture({ offline: true }),
     before = JSON.stringify(f.state.config),
@@ -203,8 +322,8 @@ test('memory shortcuts keep the selected saved chat and do not expose unsaved gr
   let html = await f.ui.chatsPage();
   assert(html.includes('data-memory-open="' + group + '"'));
   assert(html.includes('data-memory-section="members"'));
-  f.state.draft.wechat.whitelist.groups.push('789');
-  f.state.selectedChat = 'wechat:group:789';
+  f.state.draft.wechat.whitelist.groups.push('789@chatroom');
+  f.state.selectedChat = 'wechat:group:789@chatroom';
   html = await f.ui.chatsPage();
   assert(!html.includes('data-memory-open='));
   f.state.selectedChat = key;
@@ -298,4 +417,37 @@ test('usage tab shows current context against the compaction threshold as a mete
   const offHtml = await off.ui.chatsPage();
   assert.match(offHtml, /此聊天已关闭自动压缩/);
   assert(!offHtml.includes('usage-meter'));
+});
+
+test('reader diagnostics show the current per-chat frontier and escaped display name', async () => {
+  const { createWorkspaceLayout } = await import('../public/console/workspace-layout.js');
+  const key = 'wechat:private:123';
+  const state = {
+    status: { intakeProgress: [{ key, scannedThrough: 100, catchUpThrough: 150, pending: 2 }] },
+    names: new Map([[key, '<Peer>']]),
+  };
+  const view = createWorkspaceLayout({
+    state,
+    escapeHtml: value => String(value).replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+  });
+  assert.match(view.readerProgress(), /共 2 条/);
+  assert.match(view.readerProgress(), /&lt;Peer&gt;/);
+  assert.match(view.readerProgress(), /待补读至/);
+  state.status.intakeProgress[0].scannedThrough = 151;
+  assert.doesNotMatch(view.readerProgress(), /待补读至/);
+});
+
+test('queue history pages keep older pending and unresolved work on every page', () => {
+  const finished = Array.from({ length: 150 }, (_, i) => ({ id: String(i), state: 'confirmed', createdAt: i + 3 }));
+  const draft = { id: 'draft', state: 'unconfirmed', createdAt: 1 },
+    pending = { id: 'pending', state: 'waiting', createdAt: 2 };
+  const rows = [...finished, draft, pending],
+    first = deliveryPages(rows),
+    last = deliveryPages(rows, 99);
+  assert.deepEqual(first.pending, [pending, draft]);
+  assert.deepEqual(last.pending, first.pending);
+  assert.equal(first.pages, 7);
+  assert.equal(first.history.length, 20);
+  assert.equal(last.current, 6);
+  assert.equal(last.history.length, 8);
 });

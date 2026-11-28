@@ -1,8 +1,10 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PluginProcess } from './process.mjs';
 import {
   configuration,
+  pluginChatAllowed,
   scanPlugins,
   allowedChat,
   validateValue,
@@ -75,7 +77,8 @@ export class PluginRuntime {
   }
   active(record, key, permission) {
     try {
-      const saved = this.policy().config.plugins[record.id];
+      const policy = this.policy();
+      const saved = policy.config.plugins[record.id];
       return (
         !this.closed &&
         this.isAllowed() &&
@@ -88,7 +91,7 @@ export class PluginRuntime {
         !!record.process &&
         record.permissions.every(p => saved.permissions?.includes(p)) &&
         (!permission || (record.permissions.includes(permission) && saved.permissions.includes(permission))) &&
-        (!key || (allowedChat(this.root, key) && (saved.chats === null || saved.chats?.includes(key))))
+        (!key || (this.accountId === policy.account && pluginChatAllowed(policy, saved, key)))
       );
     } catch {
       return false;
@@ -186,7 +189,7 @@ export class PluginRuntime {
     }));
   }
   toolDefinitions(key) {
-    if (typeof key !== 'string' || !/^wechat:(private|group):[1-9]\d*$/.test(key)) return [];
+    if (typeof key !== 'string' || !validChatKey(key)) return [];
     return [...this.records.values()]
       .filter(record => this.active(record, key))
       .flatMap(record =>
@@ -404,7 +407,7 @@ export class PluginRuntime {
           const item = {
             id: String(row.id ?? '').slice(0, 200),
             text: text(row.text),
-            senderId: String(row.sender_wxid ?? row.sender_id ?? '').slice(0, 200),
+            senderId: String(row.sender_wxid ?? row.sender_id ?? '').slice(0, 256),
             senderName: String(row.sender_name ?? '').slice(0, 100),
             timestamp: row.timestamp,
             outgoing: !!row.outgoing,

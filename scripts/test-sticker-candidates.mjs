@@ -299,6 +299,35 @@ test('unknown resources keep the two-preview limit and ordinary chat never loads
   assert(!ordinary.inputs[0].prompt.includes('S1：'));
 });
 
+test('manual project labels remain selectable with automatic label caching off and never become Reader image URIs', async t => {
+  const f = fixture(t, { requestText: '你好' });
+  f.engine.stickerPolicyFor = () => ({ enabled: true, labelCache: false });
+  f.engine.stickerChoicesFor = async () => [
+    { ...catalog()[0], source: 'local-library', mediaKind: 'image' },
+    catalog()[1],
+  ];
+  f.engine.decide = async (_key, prompt, metadata) => {
+    assert(prompt.includes('S1：'));
+    assert(prompt.includes('【普通图片】'));
+    assert(!prompt.includes('S2：'));
+    assert.deepEqual(metadata.images, []);
+    return 'RESPOND: [STICKER:S1]';
+  };
+  f.engine.receive(f.message);
+  await until(() => f.packets.length === 1 && f.engine.buffer.mediaReplies.size === 0);
+  assert.equal(f.packets[0].params.message[0].data.id, catalog()[0].id);
+  const selected = selectStickerChoices(
+    [{ ...catalog()[0], source: 'local-library' }, catalog()[1]],
+    '你好',
+    new Set(),
+    { labelCache: false },
+  );
+  assert.deepEqual(
+    selected.map(item => item.id),
+    [catalog()[0].id],
+  );
+});
+
 test('lowering the limit preserves a submitted twenty-candidate table and applies immediately to the next batch', async t => {
   const f = fixture(t, { candidateLimit: 20, pickLast: true, rejectFirst: true });
   f.engine.receive(f.message);

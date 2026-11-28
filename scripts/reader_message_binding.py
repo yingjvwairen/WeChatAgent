@@ -17,7 +17,9 @@ def bound_message(reader, record, error_code):
         or row.get('senderUsername') != record['sender']
         or row.get('localType') != kind
         or not isinstance(row.get('fullText'), str)
-        or not 0 < len(row['fullText']) <= 512000
+        # Voice is bound by the database row and the matching media record.
+        or (not row['fullText'] and kind != 34)
+        or len(row['fullText']) > 512000
     ):
         raise ValueError(error_code)
     if not reader.sticker_account_active() or not record.get('grant') or reader.intake_grant(talker) != record['grant']:

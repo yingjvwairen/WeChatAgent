@@ -21,9 +21,16 @@ export function parseStickerTags(value) {
   if (tags.length > 6 || tags.some(tag => tag.length > 16)) throw Error('标签最多 6 个，每个最多 16 字，用逗号分隔。');
   return tags;
 }
+const stickerExtension = /\.(gif|png|jpe?g|webp)$/i;
+export function directoryStickerFiles(selection) {
+  if (selection.length > 10000) throw Error('文件夹包含超过一万个文件，请选择较小的文件夹。');
+  return Array.from(selection)
+    .filter(file => file.webkitRelativePath?.split('/').length === 2 && stickerExtension.test(file.name))
+    .sort((first, second) => first.name.localeCompare(second.name, 'zh-CN'));
+}
 export function validateStickerFile(file) {
-  if (!file.size || file.size > 8 * 1024 * 1024) throw Error('每张图片需大于 0 字节且不超过 8 MB。');
-  if (!/\.(gif|png|jpe?g|webp)$/i.test(file.name)) throw Error('请选择 GIF、PNG、JPG 或 WebP 图片。');
+  if (!file.size || file.size > 20 * 1024 * 1024) throw Error('每张图片需大于 0 字节且不超过 20 MiB。');
+  if (!stickerExtension.test(file.name)) throw Error('请选择 GIF、PNG、JPG 或 WebP 图片。');
 }
 async function fileBase64(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -49,7 +56,7 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
       ? items
           .map(
             item =>
-              `<article class="sticker-card"><button class="sticker-picture" data-sticker-preview="${item.id}" aria-label="预览：${esc(stickerTitle(item))}"><img data-sticker-image="${item.id}" alt="${esc(item.description || item.name)}" width="160" height="160" loading="lazy"><span>${item.animated ? 'GIF 动图' : '静态表情'}</span></button><div class="sticker-card-body"><h3 title="${esc(stickerTitle(item))}">${esc(stickerTitle(item))}</h3><p>${item.manual ? '手动添加' : '聊天收集'}${isGeneratedStickerName(item) ? ' · #' + esc(String(item.id).slice(0, 6)) : ''} · ${item.width} × ${item.height} · ${size(item.bytes)}</p><div class="sticker-tags">${item.tags.map(tag => `<span>${esc(tag)}</span>`).join('') || '<span>可添加标签帮助选图</span>'}</div><div class="sticker-actions"><button class="button small" data-sticker-edit="${item.id}">编辑</button><button class="button small danger" data-sticker-delete="${item.id}" aria-label="删除：${esc(stickerTitle(item))}">删除</button></div></div></article>`,
+              `<article class="sticker-card"><button class="sticker-picture" data-sticker-preview="${item.id}" aria-label="预览：${esc(stickerTitle(item))}"><img data-sticker-image="${item.id}" alt="${esc(item.description || item.name)}" width="160" height="160" loading="lazy"><span>${item.format === 'png' || item.format === 'jpeg' ? '普通图片' : item.animated ? 'GIF 动图' : '静态表情'}</span></button><div class="sticker-card-body"><h3 title="${esc(stickerTitle(item))}">${esc(stickerTitle(item))}</h3><p>${item.manual ? '手动添加' : '聊天收集'}${isGeneratedStickerName(item) ? ' · #' + esc(String(item.id).slice(0, 6)) : ''} · ${item.width} × ${item.height} · ${size(item.bytes)}</p><div class="sticker-tags">${item.tags.map(tag => `<span>${esc(tag)}</span>`).join('') || '<span>可添加标签帮助选图</span>'}</div><div class="sticker-actions"><button class="button small" data-sticker-edit="${item.id}">编辑</button><button class="button small danger" data-sticker-delete="${item.id}" aria-label="删除：${esc(stickerTitle(item))}">删除</button></div></div></article>`,
           )
           .join('')
       : `<div class="sticker-empty">${icon('image')}<strong>${query ? '没有匹配的表情包' : '表情池还是空的'}</strong><p>${query ? '换个名称或标签试试。' : '从本地添加图片，或在允许的聊天中收集表情。'}</p>${query ? '' : '<button class="button primary" data-sticker-import>添加表情包</button>'}</div>`;
@@ -58,7 +65,7 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
     const loaded = await api('/api/sticker-manager');
     if (pool?.scope !== loaded.scope) thumbnails.clear();
     pool = loaded;
-    return `<section class="card sticker-library"><div class="sticker-toolbar"><div><h2>账号共享表情池 <span class="status-tag">${pool.count} / ${pool.limit}</span></h2><p class="card-description">管理当前微信账号的表情，供已允许的好友与群聊选用。</p></div><button class="button primary" data-sticker-import>${icon('plus')}添加表情包</button></div><div class="sticker-help"><p>支持 GIF、PNG、JPG、WebP，每张最多 8 MB。动图保留动画；图片会转换为微信发送所需的 GIF。</p><p>手动添加的表情对所有已允许聊天可用；聊天收集的表情沿用共享开关。满 50 张需先删除；后续自动收集的满池评选仍由 DS 选择保留。${pool.waiting ? ' 当前另有 ' + pool.waiting + ' 张等待评选。' : ''}</p></div><div class="field sticker-search"><label for="sticker-search">查找表情</label><input id="sticker-search" type="search" placeholder="搜索名称、描述或标签" value="${esc(query)}"></div><p id="sticker-feedback" class="card-description" role="status"></p><div class="sticker-grid" id="sticker-grid">${cards()}</div></section>`;
+    return `<section class="card sticker-library"><div class="sticker-toolbar"><div><h2>账号共享表情池 <span class="status-tag">${pool.count} / ${pool.limit}</span></h2><p class="card-description">管理当前微信账号的表情，供已允许的好友与群聊选用。</p></div><div class="sticker-actions"><button class="button" data-sticker-directory>从文件夹添加</button><button class="button primary" data-sticker-import>${icon('plus')}添加表情包</button></div></div><div class="sticker-help"><p>支持 GIF、PNG、JPG、WebP，每张最多 20 MiB。动图保留动画；图片会转换为微信发送所需的 GIF。</p><p>手动添加的表情对所有已允许聊天可用；聊天收集的表情沿用共享开关。满 50 张需先删除；后续自动收集的满池评选仍由 DS 选择保留。${pool.waiting ? ' 当前另有 ' + pool.waiting + ' 张等待评选。' : ''}</p></div><div class="field sticker-search"><label for="sticker-search">查找表情</label><input id="sticker-search" type="search" placeholder="搜索名称、描述或标签" value="${esc(query)}"></div><p id="sticker-feedback" class="card-description" role="status"></p><div class="sticker-grid" id="sticker-grid">${cards()}</div></section>`;
   }
   function mount() {
     const thisGeneration = ++generation;
@@ -102,14 +109,15 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
       { once: true },
     );
   }
-  function importDialog() {
+  function importDialog(directory = false) {
     if (!pool) return;
     const scope = pool.scope;
-    let files = [],
+    let revision = pool.revision,
+      files = [],
       busy = false;
     modal(
-      '添加表情包',
-      `<form id="sticker-import-form"><p class="modal-description">添加到当前账号的共享池。当前 ${pool.count}/${pool.limit} 张，手动添加不调用模型。</p><div class="field"><label for="sticker-files">选择本地图片（一次最多 20 张）</label><input id="sticker-files" type="file" accept=".gif,.png,.jpg,.jpeg,.webp" multiple required><small>单张最多 8 MB、最多 64 帧、边长不超过 4096 像素。文件名作为默认描述，添加后可以编辑。</small></div><ul id="sticker-import-results" class="sticker-import-results" aria-live="polite"></ul><p id="sticker-form-error" class="extension-error" role="alert" hidden></p><div class="modal-actions"><button type="button" class="button" data-close>关闭</button><button class="button primary" type="submit">开始添加</button></div></form>`,
+      directory ? '从文件夹添加表情' : '添加表情包',
+      `<form id="sticker-import-form"><p class="modal-description">添加到当前账号的共享池。当前 ${pool.count}/${pool.limit} 张，手动添加不调用模型。</p><div class="field"><label for="sticker-files">${directory ? '选择文件夹（只添加顶层图片）' : '选择本地图片（一次最多 20 张）'}</label><input id="sticker-files" type="file" ${directory ? 'webkitdirectory' : 'accept=".gif,.png,.jpg,.jpeg,.webp"'} multiple required><small>单张最多 20 MiB、最多 200 帧、边长不超过 4096 像素、单帧不超过 400 万像素、总解码不超过 8000 万像素。文件名作为默认描述，添加后可以编辑。</small></div><label><input type="checkbox" id="sticker-preserve-static"> PNG 和 JPEG 保留原图，作为普通图片回复</label><ul id="sticker-import-results" class="sticker-import-results" aria-live="polite"></ul><p id="sticker-form-error" class="extension-error" role="alert" hidden></p><div class="modal-actions"><button type="button" class="button" data-close>关闭</button><button class="button primary" type="submit">开始添加</button></div></form>`,
       {
         beforeClose: () => {
           if (busy) {
@@ -125,8 +133,17 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
       results = form.querySelector('#sticker-import-results'),
       error = form.querySelector('#sticker-form-error');
     input.addEventListener('change', () => {
-      files = [...input.files];
+      files = [];
       error.hidden = true;
+      try {
+        files = directory ? directoryStickerFiles(input.files) : [...input.files];
+        if (directory && !files.length) throw Error('所选文件夹的顶层没有支持的图片。');
+      } catch (cause) {
+        results.replaceChildren();
+        error.textContent = cause.message;
+        error.hidden = false;
+        return;
+      }
       results.innerHTML = files
         .map(
           (file, index) =>
@@ -139,35 +156,62 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
       if (busy) return;
       error.hidden = true;
       try {
-        if (!files.length || files.length > 20) throw Error('请选择 1–20 张图片。');
-        for (const file of files) validateStickerFile(file);
+        if (directory && !files.length) throw Error('请选择包含图片的文件夹。');
+        if (!directory) {
+          if (!files.length || files.length > 20) throw Error('请选择 1–20 张图片。');
+          for (const file of files) validateStickerFile(file);
+        }
       } catch (cause) {
         error.textContent = cause.message;
         error.hidden = false;
         return;
       }
       busy = true;
+      const preserveStatic = form.querySelector('#sticker-preserve-static').checked;
       input.disabled = true;
       const submit = form.querySelector('[type="submit"]');
       submit.disabled = true;
-      let added = 0;
+      let added = 0,
+        skipped = 0,
+        failed = 0;
       for (let index = 0; index < files.length; index++) {
         const file = files[index],
           row = results.querySelector(`[data-import-row="${index}"] small`);
         row.textContent = '正在校验并添加…';
+        if (directory) {
+          try {
+            validateStickerFile(file);
+          } catch (cause) {
+            row.textContent = '已跳过：' + cause.message;
+            skipped++;
+            continue;
+          }
+        }
         try {
           if (pool.scope !== scope) throw Error('微信账号已切换，请重新打开添加窗口。');
           const name = file.name.replace(/[\x00-\x1f/\\]/g, '').slice(0, 120) || '本地表情';
-          pool = await api('/api/sticker-manager/import', {
-            ...requestBody(),
+          const next = await api('/api/sticker-manager/import', {
+            scope,
+            revision,
+            ...(directory ? { skipExisting: true } : {}),
+            ...(preserveStatic ? { preserveStatic: true } : {}),
             name,
             description: name.replace(/\.[^.]+$/, ''),
             tags: [],
             base64: await fileBase64(file),
           });
-          row.textContent = '已添加（重复图片自动合并）';
-          added++;
+          if (next.scope !== scope || pool.scope !== scope) throw Error('微信账号已切换，请重新打开添加窗口。');
+          if (directory && next.revision === revision) {
+            row.textContent = '已跳过已有表情';
+            skipped++;
+          } else {
+            row.textContent = '已添加（重复图片自动合并）';
+            added++;
+          }
+          pool = next;
+          revision = next.revision;
         } catch (cause) {
+          failed++;
           row.textContent = '未添加：' + cause.message;
           if (cause.status === 409 || !cause.status) {
             error.textContent = '本次已暂停；已添加的图片已保存，未处理的图片可稍后重新选择。';
@@ -182,7 +226,8 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
       submit.textContent = '重新选择后添加';
       files = [];
       input.value = '';
-      if (added) toast('已处理 ' + added + ' 张表情，重复图片合并。');
+      if (directory) toast(`已添加 ${added} 张，已跳过 ${skipped} 张，失败 ${failed} 张。`);
+      else if (added) toast('已处理 ' + added + ' 张表情，重复图片合并。');
       if (state.page === 'stickers') await renderPage();
     });
   }
@@ -284,6 +329,7 @@ export function createStickerManagerUI({ api, modal, closeModal, escapeHtml: esc
     const button = event.target.closest('button');
     if (!button) return;
     if (button.hasAttribute('data-sticker-import')) importDialog();
+    if (button.hasAttribute('data-sticker-directory')) importDialog(true);
     if (button.dataset.stickerEdit) editDialog(button.dataset.stickerEdit);
     if (button.dataset.stickerDelete) deleteDialog(button.dataset.stickerDelete);
     if (button.dataset.stickerPreview) void preview(button.dataset.stickerPreview);

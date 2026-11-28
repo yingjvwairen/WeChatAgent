@@ -65,7 +65,7 @@ test('default prompt clocks are evaluated on each call rather than frozen at ses
 test('group reply age uses the same injected clock as the current date', () => {
   const now = Date.parse('2026-10-27T16:00:00Z');
   assert.match(
-    buildSocialPrompt({ key: 'wechat:group:123', rows: [], now, lastReplyAt: now - 120000 }),
+    buildSocialPrompt({ key: 'wechat:group:123@chatroom', rows: [], now, lastReplyAt: now - 120000 }),
     /你上次发言：2 分钟前/,
   );
 });

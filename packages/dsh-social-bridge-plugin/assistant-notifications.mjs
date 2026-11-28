@@ -41,17 +41,18 @@ export class AssistantNotifications {
     );
     fs.renameSync(temp, this.file);
   }
-  queue({ id, key, sender, text, kind = 'status' }) {
-    if (!this.allowed(key, sender)) return;
+  queue({ id, key, sender, rosterGrant, text, kind = 'status' }) {
+    if (!this.allowed(key, sender, rosterGrant)) return;
     const hash = crypto
       .createHash('sha256')
-      .update(id + '\0' + key + '\0' + sender)
+      .update(JSON.stringify([id, key, sender, rosterGrant ?? 'legacy']))
       .digest('hex');
     if (!this.messages[hash]) {
       this.messages[hash] = {
         id: hash,
         key,
         sender,
+        rosterGrant,
         kind,
         ...(kind === 'result' ? { textFormat: 'wechat-result-text-v2' } : {}),
         text: String(text).slice(0, 12000),
@@ -72,7 +73,7 @@ export class AssistantNotifications {
       if (
         isSilentAssistantNotification(item) ||
         Date.now() - item.at > 86400000 ||
-        !this.allowed(item.key, item.sender)
+        !this.allowed(item.key, item.sender, item.rosterGrant)
       ) {
         item.state = 'cancelled';
         changed = true;
@@ -92,7 +93,12 @@ export class AssistantNotifications {
     const sid = String(session.id),
       data = event.data;
     if (event.type === 'job/registered' && job) {
-      this.bindings[sid + '\0' + data.jobId] = { key, sender: job.sender, taskId: job.id };
+      this.bindings[sid + '\0' + data.jobId] = {
+        key,
+        sender: job.sender,
+        rosterGrant: job.request?.rosterGrant,
+        taskId: job.id,
+      };
       this.persist();
     }
     if (event.type === 'job/settled') {
@@ -102,6 +108,7 @@ export class AssistantNotifications {
           id: 'job:' + sid + ':' + data.jobId,
           key: item.key,
           sender: item.sender,
+          rosterGrant: item.rosterGrant,
           text: `后台任务 ${String(data.jobId).slice(0, 100)} 已结束，状态：${String(data.status ?? '已结束').slice(0, 40)}。需要详细结果可让助手检查该任务。`,
         });
     }
@@ -123,7 +130,15 @@ export class AssistantNotifications {
       const id = value?.id ?? value?.record?.id;
       if (typeof id !== 'string' || id.length > 120 || !id) return;
       if (call.data.name === 'schedule_delete') delete this.schedules[sid + '\0' + id];
-      else this.schedules[sid + '\0' + id] = { key, sender: job.sender, taskId: job.id, sid, id };
+      else
+        this.schedules[sid + '\0' + id] = {
+          key,
+          sender: job.sender,
+          rosterGrant: job.request?.rosterGrant,
+          taskId: job.id,
+          sid,
+          id,
+        };
       this.persist();
     }
   }
@@ -148,8 +163,9 @@ export class AssistantNotifications {
     }
     if (!ids.length || ids.some(id => typeof id !== 'string' || !this.schedules[sid + '\0' + id])) return null;
     const matches = ids.map(id => this.schedules[sid + '\0' + id]);
-    if (new Set(matches.map(item => item.sender)).size !== 1) return null;
+    if (new Set(matches.map(item => JSON.stringify([item.sender, item.rosterGrant ?? 'legacy']))).size !== 1)
+      return null;
     const owner = matches[0];
-    return this.allowed(owner.key, owner.sender) ? owner : null;
+    return this.allowed(owner.key, owner.sender, owner.rosterGrant) ? owner : null;
   }
 }

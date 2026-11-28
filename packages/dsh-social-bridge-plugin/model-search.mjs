@@ -1,3 +1,4 @@
+import { allowedConversation } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -24,14 +25,8 @@ export function localSearchPolicy(root, key) {
     const file = path.join(root, 'config/wechatagent.json'),
       stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) return null;
-    const config = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')),
-      match = /^wechat:(private|group):([1-9]\d{0,15})$/.exec(key);
-    if (
-      !match ||
-      !Number.isSafeInteger(Number(match[2])) ||
-      !config.wechat?.whitelist?.[match[1] === 'group' ? 'groups' : 'private']?.some(id => String(id) === match[2])
-    )
-      return null;
+    const config = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+    if (!allowedConversation(config.wechat, key)) return null;
     const policy = searchPolicy(config.wechat, key);
     return policy.enabled ? policy : null;
   } catch {

@@ -1,11 +1,8 @@
+import { allowedConversation, validChatKey } from '../wechat-identity.mjs';
 export const MEME_LIBRARY_POLICY = Symbol.for('wechatagent.meme-library.v1');
 export function memeLibraryPolicy(wechat, key) {
-  const match = /^wechat:(private|group):([1-9]\d{0,15})$/.exec(key ?? ''),
-    settings = wechat?.memeLibrary ?? {};
-  const allowed =
-    !!match &&
-    Number.isSafeInteger(Number(match[2])) &&
-    (wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).some(id => String(id) === match[2]);
+  const settings = wechat?.memeLibrary ?? {},
+    allowed = allowedConversation(wechat, key);
   return {
     enabled:
       allowed &&
@@ -30,9 +27,7 @@ export function validateMemeLibrarySettings(settings) {
     (!settings.chats ||
       typeof settings.chats !== 'object' ||
       Array.isArray(settings.chats) ||
-      Object.entries(settings.chats).some(
-        ([key, value]) => !/^wechat:(private|group):[1-9]\d{0,15}$/.test(key) || typeof value !== 'boolean',
-      ))
+      Object.entries(settings.chats).some(([key, value]) => !validChatKey(key) || typeof value !== 'boolean'))
   )
     throw Error('Invalid meme library chat settings');
 }

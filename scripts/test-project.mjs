@@ -12,18 +12,27 @@ assert.throws(
   /distinct/,
 );
 assert.throws(() => validateConfig({ ...example, persona: { default: '../bad' } }), /persona/);
-assert.throws(
-  () => validateConfig({ ...example, hook: { ...example.hook, baseUrl: 'http://0.0.0.0:30001' } }),
-  /loopback/,
-);
-assert.throws(
-  () => validateConfig({ ...example, hook: { ...example.hook, expectedVersion: '4.1.15.56' } }),
-  /matching/,
-);
+assert.throws(() => validateConfig({ ...example, runtime: { ...example.runtime, sender: 'unavailable' } }), /sender/);
+assert.throws(() => validateConfig({ ...example, input: { ...example.input, expectedVersion: '4.1.15.56' } }), {
+  code: 'DESKTOP_VERSION_UNSUPPORTED',
+});
 const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'WeChatAgent portable '));
 try {
   fs.mkdirSync(path.join(fixture, 'config'));
   fs.mkdirSync(path.join(fixture, 'roles'));
+  fs.mkdirSync(path.join(fixture, 'state'));
+  const unsupportedFile = path.join(fixture, 'config', 'wechatagent.json');
+  const previousConnection = path.join(fixture, 'state', 'akasha-config.json');
+  const unsupportedConfig = JSON.stringify({ ...example, version: 1, ports: { ...example.ports, akasha: 12121 } });
+  const previousSettings = JSON.stringify({ bot_wxid: 'wxid_fixture', access_token: 'fixture' });
+  fs.writeFileSync(unsupportedFile, unsupportedConfig);
+  fs.writeFileSync(previousConnection, previousSettings);
+  assert.throws(() => prepare(fixture), /重新选择微信聊天/);
+  assert.equal(fs.readFileSync(unsupportedFile, 'utf8'), unsupportedConfig);
+  assert.equal(fs.readFileSync(previousConnection, 'utf8'), previousSettings);
+  assert.equal(fs.existsSync(path.join(fixture, 'state', 'wechat-io-config.json')), false);
+  fs.unlinkSync(unsupportedFile);
+  fs.unlinkSync(previousConnection);
   fs.copyFileSync(
     path.join(projectRoot, 'config', 'wechatagent.example.json'),
     path.join(fixture, 'config', 'wechatagent.example.json'),
@@ -52,6 +61,7 @@ try {
     'model-search.mjs',
     'dsh-access.mjs',
     'file-tools.mjs',
+    'file-storage.mjs',
     'file-transfers.mjs',
     'assistant-policy.mjs',
     'conversation-policy.mjs',
@@ -70,6 +80,7 @@ try {
     'history-policy.mjs',
     'history-store.mjs',
     'history-runtime.mjs',
+    'native-quote-source.mjs',
     'usage-summary.mjs',
     'request-window.mjs',
   ])
@@ -136,11 +147,15 @@ try {
     revisedPluginPatch,
     'meme library changes must invalidate the bridge revision without changing its entry',
   );
-  fs.appendFileSync(path.join(fixturePlugin, 'deadline.mjs'), '\n// fixture image timeout revision\n');
+  fs.appendFileSync(path.join(fixturePlugin, 'native-quote-source.mjs'), '\n// fixture quote policy revision\n');
   prepare(fixture);
   const mediaPluginPatch = fs.readFileSync(path.join(fixturePlugin, 'cordis.patch.yml'), 'utf8');
   assertPluginEntry(mediaPluginPatch);
-  assert.notEqual(mediaPluginPatch, memePluginPatch, 'image deadline changes must invalidate the bridge revision');
+  assert.notEqual(
+    mediaPluginPatch,
+    memePluginPatch,
+    'changes to a transitive quote helper must invalidate the bridge revision',
+  );
   const bridge = JSON.parse(fs.readFileSync(path.join(fixture, 'state', 'bridge-config.json'), 'utf8'));
   const io = JSON.parse(fs.readFileSync(path.join(fixture, 'state', 'wechat-io-config.json'), 'utf8'));
   assert.equal(bridge.role, '# Test role');
@@ -160,13 +175,17 @@ try {
   fs.writeFileSync(settingsFile, settings);
   const configFile = path.join(fixture, 'config', 'wechatagent.json');
   const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  const bufferFile = path.join(fixture, 'state/social-messages.json');
+  const unread = JSON.stringify({ chats: { 'wechat:private:456': [{ processed: false, text: 'fixture' }] } });
+  fs.writeFileSync(bufferFile, unread);
   prepare(fixture);
+  assert.equal(fs.readFileSync(bufferFile, 'utf8'), unread, 'preparing configuration must not consume pending input');
   assert.equal(fs.readFileSync(settingsFile, 'utf8'), settings, 'database configuration must remain untouched');
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(fixture, 'state', 'wechat-io-config.json'), 'utf8')).reader_token,
     io.reader_token,
   );
-  assert.throws(() => validateConfig({ ...config, runtime: { ...config.runtime, sender: 'uia' } }), /removed/);
+  assert.throws(() => validateConfig({ ...config, runtime: { ...config.runtime, sender: 'uia' } }), /sender/);
 } finally {
   fs.rmSync(fixture, { recursive: true, force: true });
 }

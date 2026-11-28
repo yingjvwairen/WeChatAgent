@@ -47,7 +47,7 @@ public static class RecoveryProcess {
         }
         $wechat=@(Get-CimInstance Win32_Process -Filter "Name='Weixin.exe' OR Name='WeChat.exe'"|Where-Object {
             if($request.matchingWeChatOnly){$_.ExecutablePath -eq $request.wechatExecutable}
-            else {$_.CommandLine -notmatch '--type=|--crashpad-handler' -and ($request.includeMatchingWeChat -or $_.ExecutablePath -ne $request.wechatExecutable)}
+            else {$_.CommandLine -notmatch '--type=|--crashpad-handler' -and $_.ExecutablePath -ne $request.wechatExecutable}
         })
         foreach($entry in $wechat){if(-not $owners.ContainsKey([string]$entry.ProcessId)){$owners[[string]$entry.ProcessId]=@()}}
         $items=@()
@@ -55,7 +55,7 @@ public static class RecoveryProcess {
             $entry=Get-CimInstance Win32_Process -Filter ('ProcessId='+[int]$key)
             if(-not $entry){continue}
             if($request.matchingWeChatOnly -and $entry.ExecutablePath -ne $request.wechatExecutable){continue}
-            if(-not $request.includeMatchingWeChat -and $entry.ExecutablePath -eq $request.wechatExecutable){continue}
+            if(-not $request.matchingWeChatOnly -and $entry.ExecutablePath -eq $request.wechatExecutable){continue}
             $identity=Identity ([int]$key);$owner=Invoke-CimMethod -InputObject $entry -MethodName GetOwnerSid -ErrorAction SilentlyContinue
             $allowed=$null -ne $identity -and $owner.Sid -eq $userSid -and -not $identity.critical -and $entry.CommandLine -and [int]$key -gt 4 -and [int]$key -ne $PID -and [int]$key -notin @($request.protectedPids)
             if($identity -and $identity.path.StartsWith([IO.Path]::GetFullPath($env:WINDIR)+'\',[StringComparison]::OrdinalIgnoreCase)){$allowed=$false}

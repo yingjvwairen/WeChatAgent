@@ -72,7 +72,7 @@ def push_payload(talker, message, names, own_wxid):
         token = link_or_file(kind, message.get('fullText', ''))
         if token and token[0] == 'file':
             file_display = token[1]
-    voice = voice_info(message.get('fullText', '')) if kind == 34 else None
+    voice = (voice_info(message.get('fullText', '')) or {}) if kind == 34 else None
     video = video_metadata(message.get('fullText')) if kind in (43, 62) else None
     sticker = (
         kind == 47
@@ -82,7 +82,7 @@ def push_payload(talker, message, names, own_wxid):
     card = parse_extra_card(kind, message.get('fullText', ''))
     link = parse_link_card(kind, message.get('fullText', ''))
     other = None
-    if kind not in (1, 3) and not any((voice, video, sticker, card, link, pat, file_display, forwarded, quote_reply)):
+    if kind not in (1, 3, 34) and not any((video, sticker, card, link, pat, file_display, forwarded, quote_reply)):
         other = parse_other_message(kind, message.get('fullText', ''))
     # Unsupported cards/notices contribute display-only context. In particular,
     # a system row without a person as sender must never become an assistant task.
@@ -93,7 +93,7 @@ def push_payload(talker, message, names, own_wxid):
         return None
     content = (
         '[语音，尚未转写]'
-        if voice
+        if voice is not None
         else '[文件] ' + file_display['name']
         if file_display
         else '[图片]'
@@ -142,11 +142,33 @@ def push_payload(talker, message, names, own_wxid):
         'timestamp': message.get('createTime', 0),
         **({'contextOnly': True} if context_only else {}),
         **(
-            {'quoteKind': 'file' if file_display else 'link' if link else 'card'}
-            if file_display or link or card
+            {
+                'quoteKind': 'voice'
+                if voice is not None
+                else 'video'
+                if video
+                else 'file'
+                if file_display
+                else 'link'
+                if link
+                else 'card'
+            }
+            if voice is not None or video or file_display or link or card
             else {}
         ),
-        **({'file': file_info} if file_info else {}),
+        **(
+            {
+                'file': {
+                    **file_info,
+                    'localId': message.get('localId'),
+                    'serverId': str(message.get('serverId') or '0'),
+                    'sourceShard': message.get('sourceShard'),
+                    'localType': kind,
+                }
+            }
+            if file_info
+            else {}
+        ),
         **(
             {
                 'voice': {
@@ -156,7 +178,7 @@ def push_payload(talker, message, names, own_wxid):
                     'createTime': message.get('createTime'),
                 }
             }
-            if voice
+            if voice is not None
             else {}
         ),
         **(

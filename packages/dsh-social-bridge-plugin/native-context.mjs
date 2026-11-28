@@ -1,3 +1,5 @@
+import { validFileReference } from '../wechat-file-reference.mjs';
+import { matchesConversationGrant, validChatKey } from '../wechat-identity.mjs';
 import { AssistantNotifications } from './assistant-notifications.mjs';
 import { apply as applyAssistantToolGuard, bindSocialToolExecutor } from './social-tool-restrict.mjs';
 import {
@@ -19,7 +21,7 @@ import { pathToFileURL } from 'node:url';
 import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm';
 import { createStickerPoolReviewer } from './sticker-pool-review.mjs';
 import { imageBlocks, offloadCompletedImages, offloadCompletedSessionImages } from './image-input.mjs';
-import { boundedTask } from './deadline.mjs';
+import { boundedTask, VOICE_TRANSCRIPTION_TIMEOUT_MS } from './deadline.mjs';
 import { BEHAVIOR_POLICY, MAX_RPC_BYTES, localPersona, assertLocalPersona } from './local-policy.mjs';
 import { bindWebReader, createWebReaderTurn, webReaderInstructions, builtinWebReader } from './web-reader.mjs';
 import { bindDshAccess, dshCatalog, retireDshSkillHistory, readDshAccess } from './dsh-access.mjs';
@@ -31,7 +33,7 @@ import {
   assistantGroupChatAllowed,
   assistantControlAllowed,
 } from './assistant-policy.mjs';
-import { conversationAccess, allowedConversation } from './conversation-policy.mjs';
+import { conversationAccess, conversationWorkMode, allowedConversation } from './conversation-policy.mjs';
 import {
   readWorkMode,
   createWorkModeSlots,
@@ -114,7 +116,8 @@ const readHistoryPolicy = (root, key, chatOnly = false) => {
 };
 export const name = 'dsh-social-bridge-plugin';
 export const inject = ['agents', 'sessions', 'agentPresets', 'tokenMeter', 'systemPrompt'];
-const KEY = /^(qq|wechat):(private|group):.{1,256}$/;
+const validKey = key => validChatKey(key) || /^qq:(private|group):[^\0\r\n]{1,256}$/.test(key);
+
 const sidFor = (key, generation = 0, scope = '') =>
   'social-' +
   crypto
@@ -257,21 +260,21 @@ export function apply(ctx, config = {}) {
   const root = config.projectRoot ? path.resolve(config.projectRoot) : path.resolve(import.meta.dirname, '..', '..');
   const loadedAccount = activeReaderAccount(root);
   const accountReady = () => activeReaderAccount(root).id === loadedAccount.id;
-  const chatInputAllowed = (key, sender) =>
-    readWorkMode(root, key) === 'assistant' &&
-    assistantGroupChatAllowed(
-      JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat,
-      key,
-      sender ?? '',
+  const liveWechat = () => JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat;
+  const chatInputAllowed = (key, sender, rosterGrant) => {
+    const wechat = liveWechat();
+    return (
+      matchesConversationGrant(wechat, key, rosterGrant) &&
+      conversationWorkMode(wechat, key) === 'assistant' &&
+      assistantGroupChatAllowed(wechat, key, sender ?? '')
     );
-  const acceptsInput = (key, sender) =>
-    internalGroupChat
-      ? chatInputAllowed(key, sender)
-      : assistantSenderAllowed(
-          JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat,
-          key,
-          sender,
-        );
+  };
+  const acceptsInput = (key, sender, rosterGrant) => {
+    if (!accountReady()) return false;
+    if (internalGroupChat) return chatInputAllowed(key, sender, rosterGrant);
+    const wechat = liveWechat();
+    return matchesConversationGrant(wechat, key, rosterGrant) && assistantSenderAllowed(wechat, key, sender);
+  };
   const chatCwd = internalGroupChat
     ? path.join(root, 'state/assistant-group-chat', loadedAccount.id || loadedAccount.legacyId || 'legacy', 'workspace')
     : null;
@@ -452,7 +455,7 @@ export function apply(ctx, config = {}) {
   for (const [key, sid] of Object.entries(mappings)) {
     const generation = profiles[key]?.generation ?? 0;
     if (
-      !KEY.test(key) ||
+      !validKey(key) ||
       !Number.isSafeInteger(generation) ||
       generation < 0 ||
       generation > 1000000 ||
@@ -487,6 +490,12 @@ export function apply(ctx, config = {}) {
       log.warn('context state persistence failed:', error.message);
     }
   };
+  function cacheBatchOutput(key, batchId, output) {
+    const cache = (profiles[key].cache ??= {});
+    cache[batchId] = { digest: profiles[key].digest, replyFormat: 'final-message-v1', output };
+    for (const id of Object.keys(cache).slice(0, -20)) delete cache[id];
+    saveQuietly();
+  }
   const modeSlots = createWorkModeSlots({
     mappings,
     profiles,
@@ -1074,14 +1083,13 @@ export function apply(ctx, config = {}) {
       );
     Object.defineProperty(agent.ctx, ASSISTANT_ACCESS, {
       configurable: true,
-      value: () =>
-        !internalGroupChat &&
-        (readWorkMode(root, key) !== 'assistant' ||
-          assistantSenderAllowed(
-            JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat,
-            key,
-            pending.get(sid)?.assistantSender,
-          )),
+      value: () => {
+        if (internalGroupChat || !accountReady()) return false;
+        const item = pending.get(sid);
+        const mode = readWorkMode(root, key);
+        if (mode !== 'assistant') return !item?.taskId && profiles[key]?.workMode !== 'assistant';
+        return acceptsInput(key, item?.assistantSender, item?.rosterGrant);
+      },
     });
     if (!fileBindings.has(sid))
       fileBindings.set(
@@ -1810,12 +1818,15 @@ export function apply(ctx, config = {}) {
               ...(failure?.code ? { code: String(failure.code) } : {}),
               ...(failure?.message ? { detail: String(failure.message).slice(0, 2000) } : {}),
             };
-      if (item.batchId && (!output.error || item.admitted)) {
-        const cache = (profiles[key].cache ??= {});
-        cache[item.batchId] = { digest: profiles[key].digest, replyFormat: 'final-message-v1', output };
-        for (const id of Object.keys(cache).slice(0, -20)) delete cache[id];
-        saveQuietly();
+      if (
+        !output.error &&
+        item.webReaderTurn?.allowHistoryQuote &&
+        Object.keys(item.webReaderTurn.historyQuoteRefs ?? {}).length
+      ) {
+        output.historyQuoteRefs = item.webReaderTurn.historyQuoteRefs;
       }
+      if (item.batchId && (output.error ? item.admitted : !item.deferReplyCache))
+        cacheBatchOutput(key, item.batchId, output);
       item.resolve(output);
     },
     { global: true },
@@ -1902,7 +1913,7 @@ export function apply(ctx, config = {}) {
   async function nativeRequest(route, body, requestController = new AbortController(), onAdmitted = () => {}) {
     const key = String(body.conversationKey ?? '');
     let message = String(body.message ?? '');
-    if (!KEY.test(key) || (route === '/followup' && (!message || message.length > 18000)))
+    if (!validKey(key) || (route === '/followup' && (!message || message.length > 18000)))
       throw taskFault('invalid_request', 400);
     if (
       ['/' + 'followup', '/configure'].includes(route) &&
@@ -1931,7 +1942,7 @@ export function apply(ctx, config = {}) {
       if (route === '/context-maintenance') return maintainContext(key, body);
       if (route === '/followup' && readWorkMode(root, key) === 'assistant') {
         const w = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat;
-        if (!acceptsInput(key, body.assistantSender)) throw Error('ASSISTANT_SENDER_DENIED');
+        if (!acceptsInput(key, body.assistantSender, body.rosterGrant)) throw Error('ASSISTANT_SENDER_DENIED');
       }
       const repairing = route === '/repair-context';
       let repairBackup;
@@ -2045,12 +2056,7 @@ export function apply(ctx, config = {}) {
               event => event.type === 'assistant/message' && event.data.turn === turn && event.seq < end.seq,
             );
             const recovered = { ...cached.output, text: assistantReplyText(final?.data.message), sessionId: sid };
-            profiles[key].cache[batchId] = {
-              digest: profiles[key].digest,
-              replyFormat: 'final-message-v1',
-              output: recovered,
-            };
-            saveQuietly();
+            cacheBatchOutput(key, batchId, recovered);
             return { ...recovered, cached: true };
           }
         }
@@ -2093,6 +2099,7 @@ export function apply(ctx, config = {}) {
         repairContinuation || body.searchOptOut === true || /^(?:不要|不用|别)(?:联网|搜索|查)/.test(message.trim());
       const webReaderTurn = createWebReaderTurn(message, networkOptOut ? [] : body.webReaderUrls);
       webReaderTurn.historyCalls = repairContinuation ? 2 : 0;
+      webReaderTurn.allowHistoryQuote = body.allowHistoryQuote === true && !repairContinuation;
       requestController.signal.addEventListener(
         'abort',
         () => webReaderTurn.controller.abort(requestController.signal.reason),
@@ -2165,24 +2172,14 @@ export function apply(ctx, config = {}) {
           reject,
           startedAt: Date.now(),
           taskId: body.assistantTaskId,
+          deferReplyCache: true,
           assistantSender: body.assistantSender,
+          rosterGrant: body.rosterGrant,
           fileTurn: {
             controller: webReaderTurn.controller,
             sender: body.assistantSender,
             batchId,
-            files: Array.isArray(body.files)
-              ? body.files
-                  .filter(
-                    file =>
-                      /^[a-f0-9]{64}$/.test(file?.id ?? '') &&
-                      typeof file.name === 'string' &&
-                      file.name.length <= 180 &&
-                      Number.isSafeInteger(file.size) &&
-                      file.size >= 0 &&
-                      file.size <= 50 * 1024 * 1024,
-                  )
-                  .slice(0, 3)
-              : [],
+            files: Array.isArray(body.files) ? body.files.filter(validFileReference).slice(0, 3) : [],
             calls: 0,
           },
           batchId,
@@ -2256,7 +2253,7 @@ export function apply(ctx, config = {}) {
           return;
         }
         try {
-          if (readWorkMode(root, key) === 'assistant' && !acceptsInput(key, body.assistantSender))
+          if (readWorkMode(root, key) === 'assistant' && !acceptsInput(key, body.assistantSender, body.rosterGrant))
             throw Error('ASSISTANT_SENDER_DENIED');
           agent.followup(
             createUserMessage({
@@ -2303,12 +2300,15 @@ export function apply(ctx, config = {}) {
           const results = await boundedTask(
             () => extension.runtime.hooks('after-response', { text: output.text }, extensionTurn),
             { timeoutMs: 5000 },
-          );
+          ).catch(error => {
+            // The native turn already ended even if response formatting failed.
+            throw Object.assign(error, { admitted: true });
+          });
           for (const item of results)
             if (typeof item?.text === 'string' && /^(SILENT|RESPOND:)/.test(item.text))
               output.text = item.text.slice(0, 12000);
-          if (batchId && profiles[key].cache?.[batchId]) profiles[key].cache[batchId].output = output;
         }
+        if (batchId) cacheBatchOutput(key, batchId, output);
         retireSearchContext(agent.session);
       }
       if (!windowPolicy(key)) retireTurnContext(agent.session, createUserMessage);
@@ -2333,6 +2333,7 @@ export function apply(ctx, config = {}) {
       {
         conversationKey: key,
         assistantSender: owner.sender,
+        rosterGrant: owner.rosterGrant,
         assistantParentId: owner.taskId,
         batchId,
         message: 'DSH 原生定时任务',
@@ -2344,6 +2345,7 @@ export function apply(ctx, config = {}) {
       item = {
         taskId: native.job.id,
         assistantSender: owner.sender,
+        rosterGrant: owner.rosterGrant,
         startedAt: Date.now(),
         batchId,
         admitted: true,
@@ -2370,6 +2372,7 @@ export function apply(ctx, config = {}) {
         id: 'scheduled:' + native.job.id,
         key,
         sender: owner.sender,
+        rosterGrant: owner.rosterGrant,
         kind: output.error ? 'status' : 'result',
         text: output.error
           ? '定时任务 ' + native.job.id + ' 执行失败，请查看任务状态。'
@@ -2416,6 +2419,8 @@ export function apply(ctx, config = {}) {
       })),
     };
   }
+  const assistantTaskAllowed = (key, sender, rosterGrant) =>
+    readWorkMode(root, key) === 'assistant' && acceptsInput(key, sender, rosterGrant);
   let thinkingFeedback;
   const assistantTasks = new AssistantTasks({
     file: path.join(
@@ -2424,14 +2429,7 @@ export function apply(ctx, config = {}) {
       loadedAccount.id || loadedAccount.legacyId || 'legacy',
       internalGroupChat ? 'group-chat-tasks.json' : 'tasks.json',
     ),
-    allowed: (key, sender) =>
-      accountReady() &&
-      readWorkMode(root, key) === 'assistant' &&
-      assistantSenderAllowed(
-        JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat,
-        key,
-        sender,
-      ),
+    allowed: assistantTaskAllowed,
     execute: (body, signal) => {
       const controller = new AbortController();
       if (signal.aborted) controller.abort(signal.reason);
@@ -2462,11 +2460,7 @@ export function apply(ctx, config = {}) {
       recordUsage: row => history.putUsage(row),
     }),
     styleFor: job => profiles[job.key]?.persona ?? '',
-    isAllowed: job =>
-      !internalGroupChat &&
-      accountReady() &&
-      readWorkMode(root, job.key) === 'assistant' &&
-      acceptsInput(job.key, job.sender),
+    isAllowed: job => !internalGroupChat && assistantTaskAllowed(job.key, job.sender, job.request.rosterGrant),
   });
   const assistantNotifications = new AssistantNotifications(
     path.join(
@@ -2475,14 +2469,7 @@ export function apply(ctx, config = {}) {
       loadedAccount.id || loadedAccount.legacyId || 'legacy',
       internalGroupChat ? 'group-chat-notifications.json' : 'notifications.json',
     ),
-    (key, sender) =>
-      accountReady() &&
-      readWorkMode(root, key) === 'assistant' &&
-      assistantSenderAllowed(
-        JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat,
-        key,
-        sender,
-      ),
+    assistantTaskAllowed,
   );
   const assistantControl = createAssistantControl({
     ctx,
@@ -2603,7 +2590,7 @@ export function apply(ctx, config = {}) {
           'voice-input-v1',
           { id: body.id },
           { conversationKey: key, actorId: body.senderWxid ?? '', voiceIds: [body.id] },
-          { signal: controller.signal, timeoutMs: 33000 },
+          { signal: controller.signal, timeoutMs: VOICE_TRANSCRIPTION_TIMEOUT_MS },
         );
         return reply(
           200,
@@ -2891,7 +2878,9 @@ export function apply(ctx, config = {}) {
         if (profiles[key]?.workMode !== 'assistant') return reply(409, { error: 'not_assistant_mode' });
         if (
           body.localControl !== true &&
-          !assistantControlAllowed(w, key, body.senderWxid, item?.assistantSender, { running })
+          (!matchesConversationGrant(w, key, body.rosterGrant) ||
+            (item && !matchesConversationGrant(w, key, item.rosterGrant)) ||
+            !assistantControlAllowed(w, key, body.senderWxid, item?.assistantSender, { running }))
         )
           return reply(403, { error: 'assistant_sender_denied' });
         if (req.url.endsWith('/cancel') && running) {
@@ -2940,13 +2929,14 @@ export function apply(ctx, config = {}) {
       if (body.dshInstanceId && body.dshInstanceId !== instanceId)
         return reply(409, { error: 'plugin_restarted', detail: 'DSH_CONNECTION_CHANGED', admitted: false });
       if (
-        !KEY.test(key) ||
+        !validKey(key) ||
         (['/followup', '/assistant-chat'].includes(req.url) && (!message || message.length > 18000))
       )
         return reply(400, { error: 'invalid_request' });
       let output;
       if (req.url === '/assistant-chat') {
-        if (!chatInputAllowed(key, body.assistantSender)) throw taskFault('ASSISTANT_SENDER_DENIED', 403);
+        if (!chatInputAllowed(key, body.assistantSender, body.rosterGrant))
+          throw taskFault('ASSISTANT_SENDER_DENIED', 403);
         if (body.files?.length || body.assistantTaskId || body.assistantParentId)
           throw taskFault('ASSISTANT_ADMIN_REQUIRED', 403);
         groupChatRuntime ??= apply(ctx, { ...config, internalGroupChat: true });

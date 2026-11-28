@@ -5,6 +5,7 @@ from PIL import Image
 from wechat_sticker_collection import HEX, MAX_ENTRIES, MAX_FILE
 from wechat_sticker_labels import clean_label
 from wechat_sticker_send import native_gif_bytes
+from wechat_image_limits import inspect_image
 
 
 class ManagerError(Exception):
@@ -54,6 +55,7 @@ class StickerManager:
                         'manual': item.get('manual') is True,
                         'animated': item.get('animated', False),
                         'bytes': item['fields']['len'],
+                        'format': item.get('format', 'gif'),
                         'width': item['fields']['width'],
                         'height': item['fields']['height'],
                         'addedAt': item['receivedAt'],
@@ -81,7 +83,7 @@ class StickerManager:
                 raise ManagerError('STICKER_MANAGER_NOT_FOUND', 404)
             raw = self.pool.verified_bytes(digest, item)
         if animated:
-            mime = 'image/gif'
+            mime = 'image/' + item.get('format', 'gif')
         else:
             with Image.open(io.BytesIO(raw)) as image:
                 image.thumbnail((160, 160))
@@ -106,6 +108,10 @@ class StickerManager:
     def import_image(self, body):
         with self.pool.lock:
             self.check(body, self.pool.read())
+        skip_existing = body.get('skipExisting', False)
+        preserve = body.get('preserveStatic', False)
+        if not isinstance(skip_existing, bool) or not isinstance(preserve, bool):
+            raise ManagerError('STICKER_MANAGER_INVALID')
         if not self.pool.import_lock.acquire(blocking=False):
             raise ManagerError('STICKER_MANAGER_BUSY', 409)
         try:
@@ -120,21 +126,18 @@ class StickerManager:
             if not 0 < len(raw) <= MAX_FILE:
                 raise ManagerError('STICKER_MANAGER_TOO_LARGE', 413)
             try:
+                inspect_image(raw)
                 with Image.open(io.BytesIO(raw)) as image:
                     count = getattr(image, 'n_frames', 1)
-                    if (
-                        image.format not in ('GIF', 'PNG', 'JPEG', 'WEBP')
-                        or not 0 < image.width <= 4096
-                        or not 0 < image.height <= 4096
-                        or count > 64
-                        or count * image.width * image.height > 80_000_000
-                    ):
-                        raise ValueError()
                     width, height = image.size
+                    original_format = (
+                        image.format.lower() if preserve and count == 1 and image.format in ('PNG', 'JPEG') else None
+                    )
                     for index in range(count):
                         image.seek(index)
                         image.load()
-                raw = native_gif_bytes(raw)
+                if original_format is None:
+                    raw = native_gif_bytes(raw)
                 with Image.open(io.BytesIO(raw)) as image:
                     animated = getattr(image, 'n_frames', 1) > 1
             except Exception:
@@ -144,6 +147,8 @@ class StickerManager:
             with self.pool.lock:
                 state = self.pool.read()
                 self.check(body, state)
+                if skip_existing and state['entries'].get(digest, {}).get('manual') is True:
+                    return self.listing()
                 if digest not in state['entries'] and len(state['entries']) >= MAX_ENTRIES:
                     raise ManagerError('STICKER_MANAGER_FULL', 409)
                 old = state['entries'].get(
@@ -167,8 +172,10 @@ class StickerManager:
                     'name': name,
                     'manualLabel': label,
                 }
+                if original_format is not None:
+                    item['format'] = original_format
                 self.pool.safe(self.pool.folder).mkdir(parents=True, exist_ok=True)
-                file = self.pool.safe(self.pool.folder / (digest + '.gif'))
+                file = self.pool.asset_file(digest, item)
                 if file.exists() and file.read_bytes() != raw:
                     raise ManagerError('STICKER_MANAGER_INTEGRITY', 409)
                 temp = self.pool.safe(self.pool.folder / ('.manual-' + uuid.uuid4().hex + '.tmp'))
@@ -213,5 +220,5 @@ class StickerManager:
             state['review'] = None
             self.pool.write(state)
             if remove:
-                self.pool.safe(self.pool.folder / (digest + '.gif')).unlink(missing_ok=True)
+                self.pool.asset_file(digest, item).unlink(missing_ok=True)
         return self.listing()

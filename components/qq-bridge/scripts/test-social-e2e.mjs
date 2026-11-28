@@ -66,7 +66,7 @@ test('OneBot group batch reaches plugin and only RESPOND sends a OneBot action',
     platforms: {
       wechat: {
         enabled: true,
-        whitelist: { groups: ['123'], private: ['42'] },
+        whitelist: { groups: ['123@chatroom'], private: ['42'] },
         onebot: { server: { port, path: '/ws' } },
         wake_mode: 'hybrid',
         wake_words: ['@小助手'],
@@ -136,43 +136,49 @@ test('OneBot group batch reaches plugin and only RESPOND sends a OneBot action',
         JSON.stringify({
           post_type: 'message',
           message_type: 'group',
-          self_id: 99,
-          user_id: 42,
+          self_id: '99',
+          user_id: '42',
           group_id: groupId,
           group_name: '实验群',
           time: Date.now() / 1000,
-          sender: { user_id: 42, nickname: '张三' },
+          sender: { user_id: '42', nickname: '张三' },
           message: [{ type: 'text', data: { text: value } }],
         }),
       );
-    sendEvent(999, '不在白名单');
-    sendEvent(123, '今天训练怎么样');
-    sendEvent(123, '跑到 0.42');
+    sendEvent('999@chatroom', '不在白名单');
+    sendEvent('123@chatroom', '今天训练怎么样');
+    sendEvent('123@chatroom', '跑到 0.42');
     await waitFor(() => prompts.length === 1);
     assert.equal(actions.length, 0);
     assert.match(prompts[0].message, /今天训练怎么样/);
     assert.match(prompts[0].message, /跑到 0.42/);
     answer = 'RESPOND: 可以再跑一轮看看';
-    sendEvent(123, '@小助手 你怎么看');
+    sendEvent('123@chatroom', '@小助手 你怎么看');
     await waitFor(() => actions.length === 1);
     assert.equal(actions[0].action, 'send_group_msg');
-    assert.equal(actions[0].params.group_id, 123);
+    assert.equal(actions[0].params.group_id, '123@chatroom');
     assert.equal(actions[0].params.message[0].data.text, '可以再跑一轮看看');
     assert.equal(prompts.length, 2);
+    answer = 'RESPOND: [QUOTE:Q1] 引用你的问候';
     ws.send(
       JSON.stringify({
         post_type: 'message',
         message_type: 'private',
-        self_id: 99,
-        user_id: 42,
+        self_id: '99',
+        user_id: '42',
         time: Date.now() / 1000,
-        sender: { user_id: 42, nickname: '柔石激化' },
+        message_id: 'a'.repeat(64),
+        sender: { user_id: '42', nickname: '柔石激化' },
         message: [{ type: 'text', data: { text: '你好' } }],
       }),
     );
     await waitFor(() => actions.length === 2);
     assert.equal(actions[1].action, 'send_private_msg');
-    assert.equal(actions[1].params.user_id, 42);
+    assert.equal(actions[1].params.user_id, '42');
+    assert.deepEqual(actions[1].params.message, [
+      { type: 'reply', data: { id: 'a'.repeat(64) } },
+      { type: 'text', data: { text: '引用你的问候' } },
+    ]);
     assert.equal(prompts[2].conversationKey, 'wechat:private:42');
     assert.equal(fs.existsSync(config.message_buffer.path), true);
   } finally {

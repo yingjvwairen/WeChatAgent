@@ -15,13 +15,11 @@ import { SocialEngine, assistantChatRequest } from '../components/qq-bridge/src/
 import { DshPluginClient } from '../components/qq-bridge/src/dsh/plugin-client.js';
 import { HistoryStore } from '../packages/dsh-social-bridge-plugin/history-store.mjs';
 import { scopeHistory } from '../packages/dsh-social-bridge-plugin/work-modes.mjs';
-const key = 'wechat:group:456',
+const key = 'wechat:group:456@chatroom',
   admin = 'wxid_admin',
   member = 'wxid_member';
-const id = value =>
-  String(Number((crypto.createHash('sha256').update(value).digest().readBigUInt64BE(0) % 2147483647n) + 1n));
 const settings = () => ({
-  whitelist: { private: ['123'], groups: ['456'] },
+  whitelist: { private: ['123'], groups: ['456@chatroom'] },
   assistant: { administrators: [admin], adminOnlyGroups: { [key]: false } },
 });
 test('an admin may explicitly choose read-only group chat without changing natural task commands', () => {
@@ -51,8 +49,8 @@ test('an admin may explicitly choose read-only group chat without changing natur
 const msg = (text = '助手 你好') => ({
   platform: 'wechat',
   kind: 'group',
-  conversation_id: '456',
-  sender_id: id(member),
+  conversation_id: '456@chatroom',
+  sender_id: member,
   sender_wxid: member,
   sender_name: '管理员',
   message_id: crypto.randomUUID(),
@@ -111,7 +109,7 @@ test('a member can chat without an admin list but cannot execute or access priva
   assert(assistantGroupChatAllowed(w, key, ''));
   assert(!assistantSenderAllowed(w, key, member));
   assert(!assistantGroupChatAllowed(w, 'wechat:private:123', admin));
-  assert(!assistantGroupChatAllowed(w, 'wechat:group:999', member));
+  assert(!assistantGroupChatAllowed(w, 'wechat:group:999@chatroom', member));
 });
 test('member chat cannot invoke task controls or hand files or searches to the model task gateway', async t => {
   const dir = root(t),
@@ -212,7 +210,7 @@ test('ordinary group members can share one bounded chat batch without merging ad
   });
   cleanups.get(t).push(() => chat.stop());
   chat.receive(msg('助手 第一位的聊天'));
-  chat.receive({ ...msg('助手 第二位的聊天'), sender_id: id('wxid_second'), sender_wxid: 'wxid_second' });
+  chat.receive({ ...msg('助手 第二位的聊天'), sender_id: 'wxid_second', sender_wxid: 'wxid_second' });
   await until(() => sent.length === 1 && !chat.running.size);
   assert.equal(calls.length, 1);
   assert(calls[0].prompt.includes('第一位'));

@@ -1,13 +1,7 @@
 import { validateAssistantSettings } from './assistant-policy.mjs';
 import { validateReplyLayout } from './reply-layout-policy.mjs';
-const KEY = /^wechat:(private|group):[1-9]\d{0,15}$/;
-export const validChatKey = value =>
-  typeof value === 'string' && KEY.test(value) && Number.isSafeInteger(Number(value.split(':')[2]));
-export const allowedConversation = (wechat, key) =>
-  validChatKey(key) &&
-  (wechat?.whitelist?.[key.split(':')[1] === 'group' ? 'groups' : 'private'] ?? []).some(
-    id => String(id) === key.split(':')[2],
-  );
+import { validChatKey, allowedConversation } from '../wechat-identity.mjs';
+export { validChatKey, allowedConversation, conversationGrant, reconcileRosterGrants } from '../wechat-identity.mjs';
 const names = (value, tool = false) =>
   Array.isArray(value) &&
   value.length <= 50 &&

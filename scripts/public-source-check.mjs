@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { SOURCE_PLUGIN_ZIPS, verifySourcePluginZip, assertSourceHostCoverage } from './source-release-policy.mjs';
 import { assertPluginHost } from './plugin-host-check.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-await assertPluginHost(root);
+const { contract: pluginHost } = await assertPluginHost(root);
 const git = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], {
   cwd: root,
   encoding: 'utf8',
@@ -65,6 +65,7 @@ console.log(
       findings,
       ...(process.argv.includes('--files')
         ? {
+            pluginHost,
             files: files
               .filter(name => fs.existsSync(path.join(root, name)) && fs.lstatSync(path.join(root, name)).isFile())
               .sort(),

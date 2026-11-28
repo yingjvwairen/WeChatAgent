@@ -138,9 +138,9 @@ test('assistant conclusions and explanations become two real adapter sends with 
 
 test('group-member chat uses the same message boundary without acquiring task execution capability', async t => {
   const f = fixture(t, { chatOnly: true }),
-    group = { ...message, kind: 'group', conversation_id: '456' };
+    group = { ...message, kind: 'group', conversation_id: '456@chatroom' };
   f.engine.receive(group);
-  await until(() => f.engine.buffer.unread('wechat:group:456').length === 0);
+  await until(() => f.engine.buffer.unread('wechat:group:456@chatroom').length === 0);
   assert.deepEqual(
     f.sent.map(item => item.text),
     ['已经处理好了。', '补充说明在这里。'],

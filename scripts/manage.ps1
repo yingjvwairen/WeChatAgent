@@ -1,4 +1,4 @@
-param([ValidateSet('start','stop','restart','status','prepare')][string]$Action = 'start')
+param([ValidateSet('start','stop','restart','status','prepare','check-desktop-stopped')][string]$Action = 'start')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $stateDir = Join-Path $root 'state'
@@ -16,6 +16,8 @@ function Test-Port([int]$Port) {
 }
 function Owned-Process($Item,[switch]$AllowStale) {
     if (-not $Item) { return $null }
+    $processId = 0
+    if (-not [int]::TryParse([string]$Item.pid,[ref]$processId) -or $processId -le 0) { throw 'Invalid recorded process ID.' }
     $markerRoot = [IO.Path]::GetFullPath($root).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
     if (-not $Item.marker -or -not [IO.Path]::IsPathRooted([string]$Item.marker)) { throw 'Cannot verify recorded process marker; refusing to stop it.' }
     $markerInRoot = [IO.Path]::GetFullPath([string]$Item.marker).StartsWith($markerRoot,[StringComparison]::OrdinalIgnoreCase)
@@ -23,14 +25,25 @@ function Owned-Process($Item,[switch]$AllowStale) {
         if ($AllowStale) { Write-Host 'Discarded a foreign installation process record; unrelated process was not stopped.'; return $null }
         throw 'Recorded process belongs to another installation; refusing to stop or reuse it.'
     }
-    $process = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $Item.pid)
+    $process = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $processId)
     if (-not $process) { return $null }
     if (-not $process.ExecutablePath -or -not $process.CommandLine) { throw 'Cannot verify recorded process identity; refusing to stop it.' }
     if ($process.ExecutablePath -ne $Item.exe -or $process.CommandLine.IndexOf($Item.marker,[StringComparison]::OrdinalIgnoreCase) -lt 0) {
         if ($AllowStale) { Write-Host 'Discarded a stale service process record; unrelated process was not stopped.'; return $null }
         throw 'Recorded PID no longer belongs to WeChatAgent; refusing to stop it.'
     }
+    if ($Item.createdUtcTicks -and (Get-Process -Id $processId -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString() -ne [string]$Item.createdUtcTicks) {
+        if ($AllowStale) { return $null }
+        throw 'Recorded process instance was replaced; refusing to stop it.'
+    }
     return $process
+}
+if ($Action -eq 'check-desktop-stopped') {
+    foreach ($name in @('adapter','bridge')) {
+        if (Owned-Process $script:record[$name] -AllowStale) { Write-Output 'DESKTOP_RUNNING'; return }
+    }
+    Write-Output 'DESKTOP_STOPPED'
+    return
 }
 function Stop-Services {
     $stopErrors = [System.Collections.Generic.List[string]]::new()
@@ -47,7 +60,19 @@ function Stop-Services {
             $item = $script:record[$name]
             if (Owned-Process $item -AllowStale) {
                 $stoppedGracefully = $false
-                if ($name -eq 'weflow') {
+                if ($name -eq 'adapter') {
+                    if (-not $settings -or -not $settings.ports.adapter) { throw 'DESKTOP_SHUTDOWN_CONFIG_REQUIRED' }
+                    $endpoint = 'http://127.0.0.1:' + [int]$settings.ports.adapter
+                    $health = Invoke-RestMethod ($endpoint + '/status') -TimeoutSec 3
+                    if ($health.pid -ne $item.pid -or $health.project -ne 'WeChatAgent' -or $health.backend -ne 'wechat-ui' -or
+                        [IO.Path]::GetFullPath([string]$health.projectRoot).TrimEnd('\','/') -ne [IO.Path]::GetFullPath($root).TrimEnd('\','/')) { throw 'DESKTOP_SHUTDOWN_OWNER_MISMATCH' }
+                    $token = (Get-Content -LiteralPath (Join-Path $stateDir 'desktop\control.token') -Raw -Encoding UTF8).Trim()
+                    $shutdown = Invoke-RestMethod ($endpoint + '/desktop/shutdown') -Method Post -Headers @{Authorization=('Bearer ' + $token)} -ContentType 'application/json' -Body '{}' -TimeoutSec 35
+                    if ($shutdown.ok -ne $true -or $shutdown.accepted -ne $true) { throw 'DESKTOP_SHUTDOWN_NOT_ACCEPTED' }
+                    try { Wait-Process -Id $item.pid -Timeout 30 -ErrorAction Stop }
+                    catch { if (Owned-Process $item -AllowStale) { throw 'DESKTOP_SHUTDOWN_UNCONFIRMED' } }
+                    $stoppedGracefully = $true
+                } elseif ($name -eq 'weflow') {
                     try {
                         $api = Get-Content (Join-Path $stateDir 'wechat-io-config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
                         $null = Invoke-RestMethod ($api.reader_base_url + '/api/v1/wechatagent/shutdown') -Method Post -Headers @{Authorization='Bearer '+$api.reader_token} -TimeoutSec 3
@@ -67,6 +92,9 @@ function Stop-Services {
           } catch {
             $stopErrors.Add($name)
             Write-Output ($name + ' could not be stopped; its ownership record was retained.')
+            # Recording/focus cleanup must finish before its Reader or bridge
+            # is removed. A failed graceful stop never falls through to kill.
+            if ($name -eq 'adapter') { break }
           }
         }
     }
@@ -100,7 +128,7 @@ function Test-ServiceReady([string]$Name,[int]$Port,[int]$ExpectedProcessId) {
     if($Name -eq 'adapter'){
         try{$health=Invoke-RestMethod -Uri ('http://127.0.0.1:'+$Port+'/status') -TimeoutSec 1}catch{return $false}
         $healthPid=0
-        if(-not [int]::TryParse([string]$health.pid,[ref]$healthPid) -or $health.project -ne 'WeChatAgent' -or $health.component -ne 'adapter' -or $health.statusVersion -ne 1 -or $health.backend -notin @('wechat-hook','wechat-input','wechat-helper') -or ($script:expectedSender -and $health.backend -ne $script:expectedSender) -or $healthPid -ne $ExpectedProcessId -or $health.projectRoot -isnot [string]){throw ('ADAPTER_IDENTITY_MISMATCH port='+$Port+' expectedPid='+$ExpectedProcessId)}
+        if(-not [int]::TryParse([string]$health.pid,[ref]$healthPid) -or $health.project -ne 'WeChatAgent' -or $health.component -ne 'adapter' -or $health.statusVersion -ne 1 -or $health.backend -ne 'wechat-ui' -or ($script:expectedSender -and $health.backend -ne $script:expectedSender) -or $healthPid -ne $ExpectedProcessId -or $health.projectRoot -isnot [string]){throw ('ADAPTER_IDENTITY_MISMATCH port='+$Port+' expectedPid='+$ExpectedProcessId)}
         $sameRoot=$false;try{$sameRoot=[IO.Path]::GetFullPath($health.projectRoot).TrimEnd('\','/') -eq [IO.Path]::GetFullPath($root).TrimEnd('\','/')}catch{}
         if(-not $sameRoot){throw ('ADAPTER_IDENTITY_MISMATCH port='+$Port+' expectedPid='+$ExpectedProcessId)}
         return $health.ready -eq $true
@@ -121,7 +149,7 @@ function Start-ServiceProcess([string]$Name,[string]$Exe,[string]$Arguments,[str
         Assert-PortBindable $Name $Port
         $style = if ($Visible) { 'Normal' } else { 'Hidden' }
         $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Directory -WindowStyle $style -PassThru -RedirectStandardOutput (Join-Path $stateDir ('logs\'+$Name+'.stdout.log')) -RedirectStandardError (Join-Path $stateDir ('logs\'+$Name+'.stderr.log'))
-        $script:record[$Name] = @{pid=$process.Id;exe=$Exe;marker=$Marker}; Save-Record
+        $script:record[$Name] = @{pid=$process.Id;exe=$Exe;marker=$Marker;createdUtcTicks=$process.StartTime.ToUniversalTime().Ticks.ToString()}; Save-Record
     }
     $watch=[Diagnostics.Stopwatch]::StartNew()
     do {
@@ -139,53 +167,15 @@ function Start-ServiceProcess([string]$Name,[string]$Exe,[string]$Arguments,[str
     throw ('SERVICE_START_TIMEOUT service='+$Name+' port='+$Port+'. Finish its setup or restart this instance before retrying.')
 }
 function Show-Status($Config) {
-    $hookSender = $Config.runtime.sender -eq 'wechat-hook'
-    $inputSender = $Config.runtime.sender -eq 'wechat-input'
-    $helperSender = $Config.runtime.sender -eq 'wechat-helper'
-    Write-Output ($(if ($inputSender) { 'Sender: wechat-input (foreground keyboard, no OCR)' } elseif ($helperSender) { 'Sender: wechat-helper (Helper text and voice, experimental)' } else { 'Sender: wechat-hook (native HTTP)' }))
+    Write-Output ('Sender: wechat-ui / '+$Config.input.controlMode)
     foreach ($property in $Config.ports.PSObject.Properties) { Write-Output ($property.Name + ': ' + (Test-Port ([int]$property.Value))) }
-    $wechatRunning = [bool](Get-Process Weixin,WeChat -ErrorAction SilentlyContinue)
-    Write-Output ('WeChat desktop running: ' + $wechatRunning)
-    if (-not $wechatRunning) { Write-Output 'Open desktop WeChat and log in to receive new messages.' }
-    $databaseReady = $false
-    $databaseError = ''
-    if (Test-Port ([int]$Config.ports.weflow)) {
-        try {
-            $api = Get-Content (Join-Path $stateDir 'wechat-io-config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-            $result = Invoke-RestMethod ($api.reader_base_url + '/api/v1/sessions?limit=1') -Headers @{Authorization='Bearer '+$api.reader_token} -TimeoutSec 3
-            $databaseReady = $result.success -ne $false
-        } catch {
-            $databaseError = 'Account/API verification failed; see state/logs/sync.stderr.log.'
-            if ($_.ErrorDetails.Message -match '读取组件已过期|expired') { $databaseError = 'Native database component expired.' }
-        }
-    }
-    Write-Output ('Database ready: ' + $databaseReady)
-    if ($databaseReady -and (-not $Config.runtime.weflowMode -or $Config.runtime.weflowMode -eq 'nt')) {
-        $readerStatus = Invoke-RestMethod ($api.reader_base_url + '/api/v1/reader/status') -Headers @{Authorization='Bearer '+$api.reader_token} -TimeoutSec 3
-        Write-Output ('Reader polling healthy: ' + (-not [bool]$readerStatus.lastError))
-    }
-    if ($databaseError) { Write-Output $databaseError }
     if (Test-Port ([int]$Config.ports.adapter)) {
-        $status = Invoke-RestMethod ('http://127.0.0.1:'+$Config.ports.adapter+'/status') -TimeoutSec 3
-        Write-Output ('OneBot connected: '+$status.ob_connected); Write-Output ('Reader connected: '+$status.reader_connected)
-        if ($hookSender) {
-            Write-Output ('Hook connected: '+$status.hook_connected)
-            Write-Output ('Hook account verified: '+$status.hook_account_verified)
-            Write-Output ('Hook version: '+$status.version)
-            if ($status.last_error) { Write-Output ('Hook last error: '+$status.last_error) }
-        }
-        if ($helperSender) {
-            Write-Output ('Helper connected: '+$status.sender_connected)
-            Write-Output ('Helper text send: '+$status.native_text_send)
-            Write-Output ('Helper voice send: '+$status.native_voice_send)
-            if ($status.last_error) { Write-Output ('Helper last error: '+$status.last_error) }
-        }
-        if ($inputSender) {
-            Write-Output ('Input sender connected: '+$status.sender_connected)
-            Write-Output ('Input account verified: '+$status.sender_account_verified)
-            Write-Output ('Input paused: '+$status.paused)
-            if ($status.last_error) { Write-Output ('Input last error: '+$status.last_error) }
-        }
+        $status=Invoke-RestMethod ('http://127.0.0.1:'+$Config.ports.adapter+'/status') -TimeoutSec 3
+        Write-Output ('Reader connected: '+$status.reader_connected)
+        Write-Output ('Desktop sender ready: '+$status.sender_connected)
+        Write-Output ('Account verified: '+$status.sender_account_verified)
+        Write-Output ('Paused: '+$status.paused)
+        if ($status.last_error) { Write-Output ('Last error: '+$status.last_error) }
     }
     Write-Output ('Logs: '+(Join-Path $stateDir 'logs'))
 }
@@ -195,61 +185,27 @@ $node = (Get-Command node -ErrorAction Stop).Source
 if ($LASTEXITCODE -ne 0) { throw 'Invalid project configuration.' }
 $config = Get-Content (Join-Path $root 'config\wechatagent.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $script:expectedSender = $config.runtime.sender
-$hookSender = $config.runtime.sender -eq 'wechat-hook'
-$inputSender = $config.runtime.sender -eq 'wechat-input'
-$helperSender = $config.runtime.sender -eq 'wechat-helper'
 if ($Action -eq 'prepare') { exit 0 }
 if ($Action -eq 'status') { Show-Status $config; exit 0 }
 if ($Action -eq 'restart') { Stop-Services }
 $python = (Get-Command $config.runtime.python -ErrorAction Stop).Source
-if ($hookSender) {
-    # Default client protection, also for a client opened outside WeChatAgent or
-    # unlocked earlier. Idempotent; never blocks starting the services.
-    try { & (Join-Path $PSScriptRoot 'pin-hook-client.ps1') }
-    catch {
-        $reason = $_.Exception.Message
-        if ($reason -like 'CLIENT_PIN_SCOPE_REQUIRED*') { Write-Output 'Client protection skipped: the selected WeChat is not an independent client below state/hook.' }
-        else { Write-Warning ('Client protection not applied: '+$reason) }
-    }
-}
-$weflowRoot = Join-Path $root 'components\WeFlowComplete'
-$electron = Join-Path $weflowRoot 'node_modules\electron\dist\electron.exe'
-$externalWeFlow = $config.runtime.weflowMode -eq 'existing'
-$ntReader = -not $config.runtime.weflowMode -or $config.runtime.weflowMode -eq 'nt'
-if (-not $externalWeFlow -and -not $ntReader -and (-not (Test-Path -LiteralPath $electron) -or -not (Test-Path -LiteralPath (Join-Path $weflowRoot 'dist\index.html')))) { throw 'Run npm run setup to install and build WeFlow.' }
+$ntReader = $true
 $names = @('ELECTRON_RUN_AS_NODE','WEFLOW_CONFIG_CWD','WEFLOW_USER_DATA_PATH','AUTO_UPDATE_ENABLED','SOCIAL_DSH_TOKEN','PYTHONUTF8','PYTHONUNBUFFERED','WECHATAGENT_LOG_DIR','WECHATAGENT_STATE_DIR')
 $previous = @{}; foreach ($name in $names) { $previous[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 try {
     $env:ELECTRON_RUN_AS_NODE = $null
-    $env:WEFLOW_CONFIG_CWD = Join-Path $weflowRoot '.local-state'; $env:WEFLOW_USER_DATA_PATH = $null
+    $env:WEFLOW_CONFIG_CWD = $null; $env:WEFLOW_USER_DATA_PATH = $null
     $env:AUTO_UPDATE_ENABLED = '0'
     $env:PYTHONUTF8='1'; $env:PYTHONUNBUFFERED='1'
-    if ($ntReader) {
-        $readerEntry = Join-Path $PSScriptRoot 'reader-api.py'
-        Start-ServiceProcess 'reader' $python ('"'+$readerEntry+'"') $root $readerEntry ([int]$config.ports.weflow) $false
-    } elseif ($externalWeFlow) {
-        if (-not (Test-Port ([int]$config.ports.weflow))) { throw 'Open your existing WeFlow and enable its API before starting WeChatAgent.' }
-        Write-Output 'Using existing WeFlow API; its process and encrypted configuration are not managed here.'
-    } else {
-        Start-ServiceProcess 'weflow' $electron ('"'+$weflowRoot+'"') $weflowRoot $weflowRoot ([int]$config.ports.weflow) $true
-    }
+    $readerEntry = Join-Path $PSScriptRoot 'reader-api.py'
+    Start-ServiceProcess 'reader' $python ('"'+$readerEntry+'"') $root $readerEntry ([int]$config.ports.weflow) $false
     $sync = Start-Process -FilePath $node -ArgumentList ('"'+(Join-Path $PSScriptRoot 'sync-weflow.cjs')+'"') -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput (Join-Path $stateDir 'logs\sync.stdout.log') -RedirectStandardError (Join-Path $stateDir 'logs\sync.stderr.log')
     if ($sync.ExitCode -ne 0) {
         $detail = (Get-Content (Join-Path $stateDir 'logs\sync.stderr.log') -Raw).Trim()
         throw ('WeFlow account/API verification failed: ' + $detail + '. Open WeFlow settings; details: state/logs/sync.stderr.log')
     }
-    if ($helperSender) {
-        & $node (Join-Path $PSScriptRoot 'hook-onebot.mjs') --check
-        if ($LASTEXITCODE -ne 0) { throw 'HELPER_SENDER_NOT_READY: Start Helper with the wechatagent_voice plugin (token_file state/helper-voice.token), connect the selected WeChat 4.2.0.12 account, then start again. Helper must report both text and voice sending. See the error above.' }
-    }
-    if ($inputSender) {
-        & $node (Join-Path $PSScriptRoot 'hook-onebot.mjs') --check
-        if ($LASTEXITCODE -ne 0) { throw 'INPUT_SENDER_NOT_READY: Install the input sender dependencies, open the selected clean WeChat (not the Hook client), log in and keep its main window open (minimized is fine). See the error above.' }
-    }
-    if ($hookSender) {
-        & $node (Join-Path $PSScriptRoot 'hook-onebot.mjs') --check
-        if ($LASTEXITCODE -ne 0) { throw 'WeChat-Hook is not ready. Use Open WeChat in WeChatAgent, finish login, then start again. Check the error above and state/logs/hook-init.log for native initialization details.' }
-    }
+    & $node (Join-Path $PSScriptRoot 'wechat-onebot.mjs') --check
+    if ($LASTEXITCODE -ne 0) { throw 'DESKTOP_SENDER_NOT_READY: Prepare desktop components and use the already running selected WeChat account.' }
     $env:SOCIAL_DSH_TOKEN = (Get-Content (Join-Path $stateDir 'social-dsh-token.txt') -Raw).Trim()
     $dshUrl = 'http://127.0.0.1:'+$config.ports.dshPlugin+'/health'
     if (-not (Test-Port ([int]$config.ports.dshPlugin))) {
@@ -272,7 +228,7 @@ try {
     Start-ServiceProcess 'bridge' $node ('"'+$bridgeEntry+'" "'+(Join-Path $stateDir 'bridge-config.json')+'"') (Join-Path $root 'components\qq-bridge') $bridgeEntry ([int]$config.ports.onebot) $false
     $env:PYTHONUTF8='1'; $env:PYTHONUNBUFFERED='1'
     $env:WECHATAGENT_LOG_DIR=$null; $env:WECHATAGENT_STATE_DIR=$null
-    $adapterEntry = Join-Path $PSScriptRoot 'hook-onebot.mjs'
+    $adapterEntry = Join-Path $PSScriptRoot 'wechat-onebot.mjs'
     Start-ServiceProcess 'adapter' $node ('"'+$adapterEntry+'"') $root $adapterEntry ([int]$config.ports.adapter) $false
     for($i=0;$i -lt 20;$i++) {
         $status=Invoke-RestMethod ('http://127.0.0.1:'+$config.ports.adapter+'/status') -TimeoutSec 3

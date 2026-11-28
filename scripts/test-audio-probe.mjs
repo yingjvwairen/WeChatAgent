@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { secondaryPcAudioPreflight } from './secondary-pc-audio-preflight.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const framework = path.join(process.env.WINDIR ?? 'C:/Windows', 'Microsoft.NET/Framework64/v4.0.30319');
@@ -16,7 +17,15 @@ test(
     skip: !available && 'Windows .NET Framework x64 compiler is required',
     timeout: 30000,
   },
-  () => {
+  async t => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cable-parent-close-'));
+    const outputDirectory = path.join(directory, 'state/ui-host');
+    const executable = path.join(outputDirectory, 'AudioRouteProbe.exe');
+    t.after(() => {
+      assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+      assert.ok(path.basename(directory).startsWith('cable-parent-close-'));
+      fs.rmSync(directory, { recursive: true, force: true });
+    });
     const result = spawnSync(
       'powershell.exe',
       [
@@ -27,6 +36,8 @@ test(
         '-File',
         path.join(root, 'scripts/build-audio-probe.ps1'),
         '-SelfTest',
+        '-OutputDirectory',
+        outputDirectory,
       ],
       {
         cwd: root,
@@ -46,7 +57,7 @@ test(
     assert.equal(parsed.audioStarted, false);
     assert.equal(parsed.devicesAccessed, false);
     assert.equal(parsed.recordingSaved, false);
-    const invalid = spawnSync(path.join(root, 'state/audio-probe/AudioRouteProbe.exe'), ['--probe'], {
+    const invalid = spawnSync(executable, ['--probe'], {
       cwd: root,
       encoding: 'utf8',
       windowsHide: true,
@@ -59,7 +70,7 @@ test(
       audioStarted: false,
       recordingSaved: false,
     });
-    const missingRender = spawnSync(path.join(root, 'state/audio-probe/AudioRouteProbe.exe'), ['--play-test'], {
+    const missingRender = spawnSync(executable, ['--play-test'], {
       cwd: root,
       encoding: 'utf8',
       windowsHide: true,
@@ -73,16 +84,12 @@ test(
       recordingSaved: false,
     });
     for (const pid of ['0', '-1', '+1', ' 1', '2147483648']) {
-      const invalidPid = spawnSync(
-        path.join(root, 'state/audio-probe/AudioRouteProbe.exe'),
-        ['--capture-sessions', '--pid', pid],
-        {
-          cwd: root,
-          encoding: 'utf8',
-          windowsHide: true,
-          timeout: 10000,
-        },
-      );
+      const invalidPid = spawnSync(executable, ['--capture-sessions', '--pid', pid], {
+        cwd: root,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 10000,
+      });
       assert.equal(invalidPid.status, 2);
       assert.deepEqual(JSON.parse(invalidPid.stdout), {
         ok: false,
@@ -91,7 +98,24 @@ test(
         recordingSaved: false,
       });
     }
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cable-parent-close-'));
+    const preflight = await secondaryPcAudioPreflight({
+      root: directory,
+      executeImpl: async (file, args) => {
+        assert.equal(file, executable);
+        assert.deepEqual(args, ['--list']);
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            mode: 'list',
+            devices: [],
+            audioStarted: false,
+            recordingSaved: false,
+            defaultsUsedForAudio: false,
+          }),
+        };
+      },
+    });
+    assert.equal(preflight.ok, true);
     const file = path.join(directory, 'fixture.wav');
     try {
       const audio = Buffer.alloc(60);
@@ -108,17 +132,13 @@ test(
       audio.write('data', 36);
       audio.writeUInt32LE(16, 40);
       fs.writeFileSync(file, audio);
-      const closedParent = spawnSync(
-        path.join(root, 'state/audio-probe/AudioRouteProbe.exe'),
-        ['--play-wav', '--render-id', 'fixture-never-opened', '--wav', file],
-        {
-          cwd: root,
-          encoding: 'utf8',
-          windowsHide: true,
-          input: '',
-          timeout: 10000,
-        },
-      );
+      const closedParent = spawnSync(executable, ['--play-wav', '--render-id', 'fixture-never-opened', '--wav', file], {
+        cwd: root,
+        encoding: 'utf8',
+        windowsHide: true,
+        input: '',
+        timeout: 10000,
+      });
       assert.equal(closedParent.status, 2);
       assert.deepEqual(JSON.parse(closedParent.stdout), {
         ok: false,
@@ -127,10 +147,7 @@ test(
         recordingSaved: false,
       });
     } finally {
-      assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
-      assert.ok(path.basename(directory).startsWith('cable-parent-close-'));
       if (fs.existsSync(file)) fs.unlinkSync(file);
-      fs.rmdirSync(directory);
     }
   },
 );

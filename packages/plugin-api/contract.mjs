@@ -155,6 +155,8 @@ export function hostCompatibility(item, live) {
 
 // Kept in one place so prepare/build checks cannot omit a new runtime module.
 export const PLUGIN_HOST_FILES = Object.freeze([
+  'packages/wechat-identity.mjs',
+  'packages/wechat-file-reference.mjs',
   'packages/plugin-api/contract.mjs',
   'packages/plugin-api/catalog.mjs',
   'packages/plugin-api/index.mjs',
@@ -182,7 +184,13 @@ export const VOICE_HOST_FILES = Object.freeze([
   'scripts/wechat_voice_input.py',
   'scripts/voice-requirements.txt',
   'scripts/reader-api.py',
-  'scripts/hook-onebot.mjs',
+  'scripts/reader_http.py',
+  'scripts/reader_payload.py',
+  'scripts/reader_poll.py',
+  'scripts/reader_message_binding.py',
+  'scripts/wechat-onebot.mjs',
+  'scripts/onebot-events.mjs',
+  'scripts/onebot-actions.mjs',
   'scripts/reader-account-state.mjs',
   'components/qq-bridge/src/core/voice-ingress.js',
   'components/qq-bridge/src/onebot/normalize.js',

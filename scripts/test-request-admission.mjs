@@ -103,7 +103,9 @@ test('long-persona requests omit duplicate content, fit legacy 64 KiB transport 
       historyExcludeIds: Array.from({ length: 17 }, (_, index) => String(index + 1)),
     };
   f.save(persona);
-  assert(Buffer.byteLength(JSON.stringify({ ...metadata, conversationKey: 'wechat:group:123', message })) > 65536);
+  assert(
+    Buffer.byteLength(JSON.stringify({ ...metadata, conversationKey: 'wechat:group:123@chatroom', message })) > 65536,
+  );
   let calls = 0;
   const server = http.createServer(async (req, res) => {
     calls++;
@@ -129,7 +131,7 @@ test('long-persona requests omit duplicate content, fit legacy 64 KiB transport 
     server.close();
   });
   const client = new DshPluginClient({ url: 'http://127.0.0.1:' + server.address().port, token: 'fixture' });
-  assert.equal(await client.followup('wechat:group:123', message, metadata), 'RESPOND: 全部收到');
+  assert.equal(await client.followup('wechat:group:123@chatroom', message, metadata), 'RESPOND: 全部收到');
   assert.equal(calls, 1);
   assert.equal(metadata.persona, persona);
 });

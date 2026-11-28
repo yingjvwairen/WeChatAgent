@@ -1,18 +1,24 @@
 {
-  "version": 1,
+  "version": 2,
   "runtime": {
     "python": "python",
     "dshDesktop": "",
     "weflowMode": "nt",
-    "sender": "wechat-hook"
+    "sender": "wechat-ui"
   },
-  "hook": {
-    "baseUrl": "http://127.0.0.1:30001",
-    "expectedVersion": "4.2.0.12",
-    "wechatExecutable": "state/hook/wechat-4.2.0.12/Weixin.exe",
-    "requestTimeoutMs": 5000,
+  "input": {
+    "wechatExecutable": "",
+    "python": "",
+    "sendKey": "enter",
+    "operationTimeoutMs": 20000,
+    "idleMs": 2000,
+    "controlMode": "ocr",
+    "typeText": false,
+    "paused": false,
+    "voiceSend": false,
     "receiptTimeoutMs": 18000,
-    "maxConcurrentSends": 4
+    "offscreen": false,
+    "allowClipboardReplacement": false
   },
   "ports": {
     "weflow": 5031,

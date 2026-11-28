@@ -1,3 +1,5 @@
+import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
+
 // Shared shape validation only. Adaptive geometry is a search boundary for
 // bundled native templates, never a learned button or permission to click.
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -71,7 +73,7 @@ export function validateVoiceRecordingLayout({
         hasFingerprint ? ['version', 'executableVersion', 'conversationFingerprint'] : ['version', 'executableVersion'],
       ) ||
       plan.version !== 1 ||
-      plan.executableVersion !== '4.2.0.53' ||
+      plan.executableVersion !== DESKTOP_WECHAT_VERSION ||
       (!allowSameFocus && !hasFingerprint) ||
       (hasFingerprint && !validVoiceConversationFingerprint(plan.conversationFingerprint))
     )
@@ -85,7 +87,7 @@ export function validateVoiceRecordingLayout({
       !exact(ui, ['focusHwnd', 'adaptive']) ||
       !exact(adaptive, ['version', 'executableVersion', 'toolbarRect']) ||
       adaptive.version !== 1 ||
-      adaptive.executableVersion !== '4.2.0.53' ||
+      adaptive.executableVersion !== DESKTOP_WECHAT_VERSION ||
       !Number.isSafeInteger(dpi) ||
       dpi < 96 ||
       dpi > 240 ||

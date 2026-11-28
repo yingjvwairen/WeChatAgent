@@ -18,9 +18,7 @@ export function createDshAccessUI({ api, modal, closeModal, escapeHtml: esc, ico
   async function page() {
     let catalog;
     try {
-      catalog = await api(
-        '/api/dsh-catalog' + (typeof key === 'string' ? '?conversationKey=' + encodeURIComponent(key) : ''),
-      );
+      catalog = await api('/api/dsh-catalog');
     } catch {}
     const assigned = keys().filter(key => {
       const a = state.config.wechat.dshAccess?.chats?.[key];

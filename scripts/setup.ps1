@@ -1,4 +1,4 @@
-param([string]$PythonPath = '', [switch]$IncludeQqDependencies, [switch]$BuildOriginalWeFlow)
+param([string]$PythonPath = '', [switch]$IncludeQqDependencies, [switch]$SkipOcrModelDownload)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $node = (Get-Command node -ErrorAction Stop).Source
@@ -17,11 +17,13 @@ function Install-Npm([string]$Directory,[bool]$Legacy) {
     } finally { Pop-Location }
 }
 Install-Npm (Join-Path $root 'packages\dsh-social-bridge-plugin') $false
+& $node (Join-Path $PSScriptRoot 'prepare-reader-key.mjs') --download
+if ($LASTEXITCODE -ne 0) { throw 'Reader setup component preparation failed.' }
 & $python -m pip install --only-binary=:all: -r (Join-Path $PSScriptRoot 'reader-requirements.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Independent reader dependency installation failed.' }
-if ($BuildOriginalWeFlow) { throw 'The public source does not include historical WeFlow Desktop. Use the independent desktop build dependencies.' }
+& (Join-Path $PSScriptRoot 'setup-desktop.ps1') -PythonPath $python -SkipModelDownload:$SkipOcrModelDownload
 if ($IncludeQqDependencies) { Install-Npm (Join-Path $root 'components\qq-bridge') $false }
 & $python -m pip check
 if ($LASTEXITCODE -ne 0) { throw 'Python dependency conflicts detected.' }
 Write-Output ('Install the local plugin in DSH Desktop: '+(Join-Path $root 'packages\dsh-social-bridge-plugin'))
-Write-Output 'Dependencies installed. For WeChat-Hook, build the native component and prepare the matching client as described in docs/WECHAT_HOOK.md. Then start WeChatAgent.cmd.'
+Write-Output 'Dependencies installed. Select the supported WeChat installation and DSH in the desktop console, then configure the reader and reply targets.'

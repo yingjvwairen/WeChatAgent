@@ -61,7 +61,7 @@ test('cold-wake selection applies only to idle group wakes and can be disabled l
     })),
     p = { ...policy, recentChars: 4000, coldWakeMinutes: 30 };
   const options = {
-    key: 'wechat:group:123',
+    key: 'wechat:group:123@chatroom',
     hint: { policy: COLD_WAKE_POLICY, direct: true, at: 2811, relation: 'independent' },
     now: 3000,
   };
@@ -104,7 +104,7 @@ test('cold-wake input drops only the host previous-reply echo and preserves the 
   };
   for (const delivery_status of ['confirmed', 'unconfirmed']) {
     const prompt = buildSocialPrompt({
-      key: 'wechat:group:123',
+      key: 'wechat:group:123@chatroom',
       rows: [current],
       direct: true,
       previousReply: { text: '不相关旧回复', delivery_status },
@@ -150,7 +150,7 @@ test('cold-wake hints travel with real group wake batches without adding classif
     engine.receive({
       platform: 'wechat',
       kind,
-      conversation_id: '123',
+      conversation_id: kind === 'group' ? '123@chatroom' : '123',
       sender_id: '42',
       sender_name: '群友',
       self_id: '99',

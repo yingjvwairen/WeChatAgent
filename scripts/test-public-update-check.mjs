@@ -1,9 +1,12 @@
+import { desktopManifest, seedDesktopPayloads } from './test-fixtures/desktop-deployment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import deployment from '../apps/console-desktop/deployment.cjs';
 import { createUpdateChecker, compareVersions } from './update-check.mjs';
+import { deploymentVerification } from './release-verification.mjs';
 const prefix = 'https://github.com/sourcepro5/WeChatAgent/releases/download/';
 const release = (version, extra = []) => ({
   tag_name: 'v' + version,
@@ -92,6 +95,81 @@ test('same-version rebuilt release is offered only for a different newer build',
     assert.equal(result.status, available ? 'available' : 'up_to_date');
     assert.equal(result.sameVersionBuild, available);
   }
+});
+
+test('release verification producer preserves the metadata consumed by same-version updates', async t => {
+  const local = { version: '0.4.5', buildId: '1111111111111111', builtAt: '2026-11-20T01:00:00Z' };
+  const name = 'VERIFICATION-0.4.5.json';
+  const manifest = {
+    version: '0.4.5',
+    buildId: '2222222222222222',
+    builtAt: '2026-11-20T02:00:00Z',
+    runtimeRevision: 'abcdef123456',
+    files: ['example.mjs'],
+    nativeHashes: {},
+  };
+  const report = { version: manifest.version, ...deploymentVerification(manifest), checkedAt: '2026-11-21T00:00:00Z' };
+  assert.equal(report.builtAt, manifest.builtAt);
+  assert.equal(report.runtimeRevision, manifest.runtimeRevision);
+  const f = fixture(t, local, [
+    release('0.4.5', [{ name, state: 'uploaded', browser_download_url: prefix + 'v0.4.5/' + name }]),
+    report,
+  ]);
+  assert.equal((await f.checker.check()).status, 'available');
+  assert.throws(() => deploymentVerification({ ...manifest, builtAt: undefined }), /BUILD_IDENTITY/);
+});
+test('installed console compares its deployed build with the versioned release verification asset', async t => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-installed-update-'));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const resources = path.join(temp, 'resources');
+  const template = path.join(resources, 'project');
+  fs.mkdirSync(path.join(template, 'config'), { recursive: true });
+  for (const name of [
+    'runtime/python/python.exe',
+    'runtime/node.exe',
+    'vendor/wechat/Weixin.exe',
+    'vendor/hook/version.dll',
+    'vendor/hook/build.json',
+  ]) {
+    const file = path.join(resources, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, name.endsWith('.json') ? '{}' : 'fixture');
+  }
+  fs.writeFileSync(
+    path.join(template, 'config/wechatagent.example.json'),
+    JSON.stringify({ runtime: { sender: 'wechat-ui' } }),
+  );
+  const version = '0.4.5';
+  const local = { version, buildId: '1111111111111111', builtAt: '2026-11-15T14:00:00Z' };
+  fs.writeFileSync(path.join(template, 'package.json'), JSON.stringify({ version }));
+  fs.writeFileSync(
+    path.join(template, 'deployment.json'),
+    JSON.stringify(desktopManifest({ ...local, files: ['config/wechatagent.example.json', 'package.json'] })),
+  );
+  seedDesktopPayloads((relative, value) => {
+    const file = path.join(resources, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, value);
+  });
+  const { root } = await deployment.bootstrapDeployment(resources, path.join(temp, 'data'));
+  const name = 'VERIFICATION-0.4.5.json';
+  const reportUrl = prefix + 'v0.4.5/' + name;
+  const releaseData = release(version, [{ name, state: 'uploaded', browser_download_url: reportUrl }]);
+  const requests = [];
+  const checker = createUpdateChecker({
+    root,
+    fetchImpl: async url => {
+      requests.push(url);
+      return Response.json(
+        url === reportUrl ? { version, buildId: '2222222222222222', builtAt: '2026-11-15T15:00:00Z' } : releaseData,
+      );
+    },
+  });
+  const result = await checker.check();
+  assert.equal(result.sameVersionBuild, true);
+  assert.equal(result.status, 'available');
+  assert.equal(result.downloadUrl, releaseData.assets[0].browser_download_url);
+  assert.deepEqual(requests, ['https://api.github.com/repos/sourcepro5/WeChatAgent/releases/latest', reportUrl]);
 });
 test('network and malformed release failures stay isolated from startup', async t => {
   for (const response of [

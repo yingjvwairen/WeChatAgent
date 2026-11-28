@@ -84,31 +84,26 @@ export function createProcessRecovery({
     for (const map of [scans, confirmations])
       for (const [id, value] of map) if (value.expiresAt <= now()) map.delete(id);
   };
-  const request = (config, healthyPorts, includeMatchingWeChat, matchingWeChatOnly) => ({
-    root,
-    ports: matchingWeChatOnly
-      ? []
-      : [...Object.values(config.ports), Number(new URL(config.hook.baseUrl).port || 80)].filter(
-          port => !healthyPorts.includes(port),
-        ),
-    wechatExecutable: path.resolve(root, config.hook.wechatExecutable),
-    protectedPids: [process.pid],
-    includeMatchingWeChat,
-    matchingWeChatOnly,
-  });
   return {
-    async scan(
-      config,
-      revision,
-      { healthyPorts = [], includeMatchingWeChat = false, matchingWeChatOnly = false } = {},
-    ) {
+    async scan(config, revision, { healthyPorts = [], purpose = 'ports' } = {}) {
       prune();
-      const input = request(config, healthyPorts, includeMatchingWeChat, matchingWeChatOnly),
-        result = await probe(input);
+      const restart = purpose === 'wechat-restart';
+      if (!restart && purpose !== 'ports') throw failure('未知的进程检查用途。');
+      const executable = config.input.wechatExecutable;
+      if (restart && (!executable || path.basename(executable).toLowerCase() !== 'weixin.exe'))
+        throw failure('请先在连接设置中选择微信程序。');
+      const input = {
+        root,
+        ports: restart ? [] : Object.values(config.ports).filter(port => !healthyPorts.includes(port)),
+        wechatExecutable: executable ? path.resolve(root, executable) : '',
+        protectedPids: [process.pid],
+        matchingWeChatOnly: restart,
+      };
+      const result = await probe(input);
       const items = (Array.isArray(result) ? result : (result.items ?? []))
         .filter(
           item =>
-            !matchingWeChatOnly || path.resolve(item.path ?? '').toLowerCase() === input.wechatExecutable.toLowerCase(),
+            !restart || (item.path && path.resolve(item.path).toLowerCase() === input.wechatExecutable.toLowerCase()),
         )
         .slice(0, 32)
         .map(item => ({ ...item, id: crypto.randomUUID() }));
@@ -116,7 +111,7 @@ export function createProcessRecovery({
         scan = { revision, input, items, expiresAt: now() + ttlMs };
       scans.set(id, scan);
       while (scans.size > 4) scans.delete(scans.keys().next().value);
-      return { scanId: id, expiresAt: scan.expiresAt, items: items.map(publicItem) };
+      return { scanId: id, purpose, revision, expiresAt: scan.expiresAt, items: items.map(publicItem) };
     },
     async prepare(scanId, ids, revision) {
       prune();

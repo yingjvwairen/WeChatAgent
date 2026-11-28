@@ -16,7 +16,7 @@ function fixture(
   });
   const config = {
     wechat: {
-      whitelist: { private: ['123'], groups: ['456'] },
+      whitelist: { private: ['123'], groups: ['456@chatroom'] },
       search: { enabled: true },
       memeLibrary: { enabled: true },
     },

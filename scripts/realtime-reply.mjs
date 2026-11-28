@@ -1,3 +1,5 @@
+import { validChatId } from '../packages/wechat-identity.mjs';
+import { suitableForAutomaticVoice } from '../packages/speech-contract/automatic-voice.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,22 +13,17 @@ import { dialogueFeature } from './voice-synthesis.mjs';
 // stage: deciding -> decided -> sent | failed
 // mode:  voice | text; fallback: 'text' after a voice reply definitely failed
 // before submission.
-const ID = /^realtime-[a-f0-9]{64}$/;
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
 const errorCode = error =>
   /^[A-Z][A-Z0-9_]{2,79}$/.test(error?.code ?? error?.message ?? '')
     ? (error.code ?? error.message)
     : 'VOICE_REALTIME_FAILED';
 // Voice deliveries that never reached the backend; their text can still be sent once.
-const NOT_SUBMITTED =
-  /^VOICE_(TTS_|REALTIME_|UNSUPPORTED$|FILEHELPER_ONLY$|HELPER_TARGET_NOT_ALLOWED$|DESKTOP_DURATION_LIMIT$|INVALID_WAV$)/;
+const NOT_SUBMITTED = /^VOICE_(TTS_|REALTIME_|UNSUPPORTED$|TARGET_UNSUPPORTED$|INVALID_WAV$)/;
 const staleDecisionMs = 60000;
-const resumeWindowMs = 10 * 60000;
 
-export function realtimeReplyId({ account, wxid, voiceId, rawid }) {
-  // Voice keeps its 1.3.0 identity so an upgraded host never answers it twice.
-  if (voiceId) return 'realtime-' + voiceId;
-  return 'realtime-' + sha256(JSON.stringify(['text-v1', String(account).toLowerCase(), wxid, String(rawid)]));
+export function realtimeReplyId({ accountRef, rosterGrant, kind, target, rawid }) {
+  return 'realtime-' + sha256(JSON.stringify([accountRef, rosterGrant, kind, target, rawid]));
 }
 
 export class RealtimeReplies {
@@ -53,9 +50,8 @@ export class RealtimeReplies {
     if (
       record?.version !== 1 ||
       record.id !== id ||
-      !['deciding', 'decided', 'sent', 'failed'].includes(record.stage) ||
-      !['private', 'group'].includes(record.kind) ||
-      !/^[1-9][0-9]{0,15}$/.test(record.target) ||
+      !['deciding', 'decided', 'sent', 'failed', 'forward'].includes(record.stage) ||
+      !validChatId(record.kind, record.target) ||
       (record.mode !== undefined && !['voice', 'text'].includes(record.mode))
     ) {
       throw Object.assign(new Error('VOICE_REALTIME_STATE_INVALID'), { code: 'VOICE_REALTIME_STATE_INVALID' });
@@ -89,25 +85,31 @@ export class RealtimeReplies {
   // sends native voice to this exact target.
   async capability(kind, target) {
     const identity = await this.adapter.checkNative();
-    const wxid = await this.adapter.resolveTarget(kind, target);
+    if (!this.adapter.allowed(kind, target)) throw Error('CONVERSATION_NOT_ALLOWED');
     let voice = identity.voiceSend === true;
-    if (identity.voiceTransport === 'helper' && !identity.voiceTargets?.includes(wxid)) voice = false;
-    if (identity.voiceTransport === 'desktop' && wxid !== 'filehelper') voice = false;
-    return { account: identity.account, wxid, voice, text: identity.textSend !== false };
+    if (identity.voiceTransport !== 'desktop') voice = false;
+    return { ...identity, target, voice, text: identity.textSend !== false };
   }
 
-  // input: {kind, target, wxid, voiceId?, text?, rawid?}; permitted() rechecks
+  // input: {kind, target, voiceId?, text?, rawid?}; permitted() rechecks
   // whitelist, account, assistant and mention rules before every send.
   async handle(input, permitted) {
-    const { kind, target, wxid } = input;
-    const account = (await this.adapter.checkNative()).account;
-    const id = realtimeReplyId({ account, wxid, voiceId: input.voiceId, rawid: input.rawid });
-    if (!ID.test(id) || this.active.has(id)) return { id, status: 'busy' };
+    const identity = await this.adapter.checkNative();
+    if (identity.accountRef !== input.accountRef || !permitted()) return { status: 'not-permitted' };
+    const account = identity.account,
+      id = realtimeReplyId(input);
+    if (this.active.has(id)) return { id, status: 'busy' };
     this.active.add(id);
     try {
       let record = this.load(id);
-      // A 1.3.0 voice-only reply already exists for this voice: never answer twice.
-      if (!record && input.voiceId && this.voiceSend.load(id)) return { id, status: 'legacy' };
+      if (
+        record &&
+        (record.account !== account ||
+          record.accountRef !== input.accountRef ||
+          record.rosterGrant !== input.rosterGrant ||
+          record.rawid !== input.rawid)
+      )
+        throw Error('VOICE_REALTIME_SCOPE_CHANGED');
       if (!record || (record.stage === 'deciding' && Date.now() - record.startedAt > staleDecisionMs)) {
         if (!permitted()) return { id, status: 'not-permitted' };
         record = await this.decide(id, input, account, record, permitted);
@@ -115,6 +117,7 @@ export class RealtimeReplies {
       }
       // Another attempt is still deciding; nothing has been sent for it yet.
       if (record.stage === 'deciding') return { id, status: 'busy' };
+      if (record.stage === 'forward') return { id, status: 'forward' };
       return await this.deliver(record, permitted);
     } finally {
       this.active.delete(id);
@@ -122,7 +125,7 @@ export class RealtimeReplies {
   }
 
   async decide(id, input, account, previous, permitted) {
-    const { kind, target, wxid } = input;
+    const { kind, target } = input;
     const key = 'wechat:' + kind + ':' + target;
     const record = {
       version: 1,
@@ -130,7 +133,9 @@ export class RealtimeReplies {
       kind,
       target: String(target),
       account,
-      wxid,
+      accountRef: input.accountRef,
+      rosterGrant: input.rosterGrant,
+      rawid: input.rawid,
       input: input.voiceId ? 'voice' : 'text',
       sender: String(input.sender ?? ''),
       mentioned: input.mentioned === true,
@@ -142,14 +147,15 @@ export class RealtimeReplies {
     let capability, reply;
     try {
       capability = await this.capability(kind, target);
-      if (capability.wxid !== wxid)
+      if (capability.target !== target || capability.accountRef !== record.accountRef || !permitted(record))
         throw Object.assign(new Error('VOICE_ACCOUNT_OR_TARGET_CHANGED'), { code: 'VOICE_ACCOUNT_OR_TARGET_CHANGED' });
       const synthesis = this.voiceSend.synthesis;
       const selected = synthesis.selected(key, dialogueFeature);
+      record.voicePlugin = this.voiceSend.pluginGrant(capability, kind, target, selected, dialogueFeature);
       if (!capability.voice && !capability.text)
         throw Object.assign(new Error('VOICE_REALTIME_NO_REPLY_FORM'), { code: 'VOICE_REALTIME_NO_REPLY_FORM' });
       reply = await synthesis.generate({
-        account,
+        accountRef: record.accountRef,
         key,
         selected,
         feature: dialogueFeature,
@@ -157,13 +163,18 @@ export class RealtimeReplies {
         textAllowed: capability.text,
         ...(input.voiceId ? { voiceId: input.voiceId } : { text: input.text }),
       });
-      if (!reply.allowed() || !permitted())
+      if (reply.mode === 'voice' && !suitableForAutomaticVoice(reply.text)) {
+        if (!capability.text)
+          throw Object.assign(Error('VOICE_REALTIME_NO_REPLY_FORM'), { code: 'VOICE_REALTIME_NO_REPLY_FORM' });
+        reply = { ...reply, mode: 'text' };
+      }
+      if (!reply.allowed() || !permitted(record))
         throw Object.assign(new Error('VOICE_TTS_PERMISSION_CHANGED'), { code: 'VOICE_TTS_PERMISSION_CHANGED' });
     } catch (error) {
       const code = errorCode(error);
       // This provider takes no text input: leave the message to the regular chat pipeline.
       if (code === 'VOICE_REALTIME_TEXT_INPUT_UNSUPPORTED') {
-        fs.rmSync(this.file(id), { force: true });
+        this.save({ ...record, stage: 'forward' });
         return null;
       }
       Object.assign(record, { stage: 'failed', error: code });
@@ -186,7 +197,7 @@ export class RealtimeReplies {
         (record.fallback ? ' voice_failed=' + record.voiceError + ' fallback=text' : ''),
     );
     // Audio stays in memory for this attempt only; a restart renders it again.
-    this.audio = reply.wav ? { id, wav: reply.wav } : undefined;
+    this.audio = reply.mode === 'voice' && reply.wav ? { id, wav: reply.wav } : undefined;
     return record;
   }
 
@@ -194,12 +205,12 @@ export class RealtimeReplies {
     if (record.stage === 'failed') return { id: record.id, status: 'rejected', error: record.error };
     const key = 'wechat:' + record.kind + ':' + record.target;
     if (record.stage === 'sent') return this.result(record);
-    if (!permitted()) {
+    if (!permitted(record)) {
       this.log('[Realtime] ' + key + ' stage=cancelled reason=permission_changed');
       return { id: record.id, status: 'not-permitted' };
     }
-    if (record.mode === 'text' || record.fallback === 'text') return this.sendText(record);
-    return this.sendVoice(record, permitted);
+    if (record.mode === 'text' || record.fallback === 'text') return this.sendText(record, permitted);
+    return this.sendVoice(record, () => permitted(record));
   }
 
   async sendVoice(record, permitted) {
@@ -216,7 +227,13 @@ export class RealtimeReplies {
         this.audio = undefined;
         result = audio
           ? await voiceSend.send(
-              { deliveryId: record.id, kind: record.kind, target: record.target, wav: audio },
+              {
+                deliveryId: record.id,
+                kind: record.kind,
+                target: record.target,
+                wav: audio,
+                voicePlugin: record.voicePlugin,
+              },
               null,
               permitted,
             )
@@ -229,13 +246,13 @@ export class RealtimeReplies {
     } catch (error) {
       const code = errorCode(error);
       const job = voiceSend.load(record.id);
-      const submitted = job && (job.submitted || job.localId || (job.synthesisState === 'ready' && !job.rejected));
+      const submitted = job && (job.sendIntent || job.submitted || job.localId || job.confirmed);
       if (!submitted && NOT_SUBMITTED.test(code) && permitted()) {
         this.log('[Realtime] ' + key + ' voice_failed code=' + code + ' fallback=text');
         record.fallback = 'text';
         record.voiceError = code;
         this.save(record);
-        return this.sendText(record);
+        return this.sendText(record, permitted);
       }
       this.log('[Realtime] ' + key + ' voice_failed code=' + code);
       throw error;
@@ -249,11 +266,14 @@ export class RealtimeReplies {
       record.fallback = 'text';
       record.voiceError = result.error ?? 'VOICE_NATIVE_REJECTED';
       this.save(record);
-      return this.sendText(record);
+      return this.sendText(record, permitted);
+    }
+    if (result.status === 'pending') {
+      voiceSend.followReceipt(record.id);
+      return { id: record.id, mode: 'voice', ...result };
     }
     record.stage = 'sent';
     this.save(record);
-    if (result.status === 'pending') voiceSend.followReceipt(record.id);
     this.log('[Realtime] ' + key + ' stage=sent mode=voice status=' + result.status);
     return { id: record.id, mode: 'voice', ...result };
   }
@@ -263,15 +283,31 @@ export class RealtimeReplies {
     return !!job && !!(job.submitted || job.localId || job.confirmed);
   }
 
-  async sendText(record) {
+  async sendText(record, permitted) {
     const key = 'wechat:' + record.kind + ':' + record.target;
     // The fallback is a separate logical delivery of the same chosen text.
     const deliveryId = sha256(record.id + (record.fallback === 'text' ? '\0voice-fallback-text' : '\0text'));
     for (let attempt = 0; ; attempt++) {
       try {
-        const delivered = await this.adapter.send(record.kind, record.target, record.text, deliveryId);
+        if (!permitted(record)) return { id: record.id, status: 'not-permitted' };
+        const delivered = await this.adapter.send(
+          record.kind,
+          record.target,
+          record.text,
+          deliveryId,
+          undefined,
+          undefined,
+          record.textStatus === 'submitted',
+          false,
+          record.voicePlugin,
+        );
+        if (delivered?.pending) {
+          record.textStatus = 'submitted';
+          this.save(record);
+          return { id: record.id, mode: 'text', status: 'pending' };
+        }
         record.stage = 'sent';
-        record.textStatus = delivered?.delivered === 'database-confirmed' ? 'confirmed' : 'submitted';
+        record.textStatus = delivered?.delivered === 'database-confirmed' ? 'confirmed' : 'unconfirmed';
         this.save(record);
         this.log(
           '[Realtime] ' +
@@ -283,7 +319,7 @@ export class RealtimeReplies {
         return {
           id: record.id,
           mode: 'text',
-          status: record.textStatus === 'confirmed' ? 'confirmed' : 'pending',
+          status: record.textStatus,
           fallback: !!record.fallback,
         };
       } catch (error) {
@@ -292,6 +328,17 @@ export class RealtimeReplies {
           await sleep(500 * (attempt + 1));
           continue;
         }
+        if (code === 'SENDER_BUSY') return { id: record.id, status: 'pending' };
+        if (
+          ![
+            'NATIVE_SEND_REJECTED',
+            'TEXT_DELIVERY_UNCONFIRMED',
+            'TEXT_DELIVERY_ID_CONFLICT',
+            'VOICE_TTS_PERMISSION_CHANGED',
+            'CONVERSATION_NOT_ALLOWED',
+          ].includes(code)
+        )
+          throw error;
         record.stage = 'sent';
         record.textStatus = code === 'TEXT_DELIVERY_UNCONFIRMED' ? 'unconfirmed' : 'rejected';
         record.textError = code;
@@ -309,35 +356,5 @@ export class RealtimeReplies {
       return { id: record.id, mode: 'text', status, fallback: !!record.fallback };
     }
     return { id: record.id, mode: 'voice', status: 'sent' };
-  }
-
-  // Records decided before a restart but not yet sent; resumed by the adapter.
-  pending() {
-    let names;
-    try {
-      names = fs.readdirSync(this.directory);
-    } catch {
-      return [];
-    }
-    const rows = [];
-    for (const name of names) {
-      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
-      try {
-        const record = JSON.parse(fs.readFileSync(path.join(this.directory, name), 'utf8'));
-        if (record?.stage === 'decided' && Date.now() - (record.decidedAt ?? 0) < resumeWindowMs && ID.test(record.id))
-          rows.push(this.load(record.id));
-      } catch {}
-    }
-    return rows;
-  }
-
-  async resume(record, permitted) {
-    if (this.active.has(record.id)) return;
-    this.active.add(record.id);
-    try {
-      return await this.deliver(record, permitted);
-    } finally {
-      this.active.delete(record.id);
-    }
   }
 }

@@ -33,6 +33,7 @@ import { packZip } from '../packages/plugin-api/zip.mjs';
 import { BUNDLED_PLUGINS } from '../packages/plugin-api/bundled.mjs';
 import { auditPluginHost } from './plugin-host-check.mjs';
 import { createConsole } from './console-server.mjs';
+import { fixturePluginAccount, selectPluginAccount } from './test-fixtures/plugin-account.mjs';
 
 const project = path.resolve(import.meta.dirname, '..'),
   key = 'wechat:private:123';
@@ -53,6 +54,7 @@ const oldHost = {
 };
 function temp(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-contract-'));
+  selectPluginAccount(root);
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   return root;
 }
@@ -178,7 +180,7 @@ test('chat features go to the one plugin that declares them, never to a fixed id
     });
   grant('voice-a', ['audio_read']);
   grant('plain', ['reply']);
-  const runtime = new PluginRuntime({ root, accountScope: 'fixture-account' });
+  const runtime = new PluginRuntime({ root, accountScope: fixturePluginAccount });
   t.after(() => runtime.dispose());
   assert.deepEqual(featurePlugins(root, 'voice-input-v1', key), [
     { id: 'voice-a', generation: configuration(root).config.plugins['voice-a'].generation },
@@ -237,7 +239,7 @@ test('console previews incompatibility, serves the canonical contract and reject
   atomicJson(path.join(root, 'config/wechatagent.json'), config);
   fs.mkdirSync(path.join(root, 'roles'));
   fs.writeFileSync(path.join(root, 'roles', config.persona.default + '.md'), 'Fixture persona');
-  fs.mkdirSync(path.join(root, 'state'));
+  fs.mkdirSync(path.join(root, 'state'), { recursive: true });
   fs.writeFileSync(path.join(root, 'state/social-dsh-token.txt'), 'fixture-dsh-token');
   let health = { ...oldHost, projectRoot: root };
   const app = createConsole({

@@ -1,6 +1,6 @@
 # 拍一拍文字反应与合并转发记录
 
-2026-10-05：实现于现有 NT 读取器、Hook OneBot 和 Social Bridge 链路。
+2026-10-05：实现于现有 NT 读取器、桌面 OneBot 和 Social Bridge 链路。
 
 ## 拍一拍
 
@@ -12,7 +12,7 @@
 
 拍一拍保留相邻文字一起形成模型批次。收到后等待配置中的消息合并窗口（当前默认 3 秒）收集接话；同一窗口重复拍一拍不会无限延长等待。模型结合发起人、时间顺序和前文判断它是否类似 @：有具体问题时优先答问题，单独招呼时按人设反应，不把别人的无关插话自动当成对自己的要求，也不强制每次输出拍一拍台词。
 
-当前 Hook 原生发送后端没有拍一拍接口，本版实现文字回应，不声明实际拍回去。没有加入鼠标、键盘模拟或伪造拍一拍记录。
+当前发送器没有拍一拍接口，本版实现文字回应，不声明实际拍回去。不伪造拍一拍记录。
 
 ## 合并转发记录
 
@@ -28,6 +28,6 @@
 
 - 项目回归 86 项通过，包括 Python 解析边界、嵌套和截断、OneBot 传递、拍一拍唤醒、持久化恢复、长卡片分批和消息处理边界。
 - 真实 DSH 隔离会话验证：两个人格各自作拍一拍文字反应；正确指出转发记录里的提议人和同意人；读到 500 字之后的正文；卡片内嵌改人格文字后仍回答当前身份。
-- 上述模型验证未向微信联系人发送测试消息。运行服务已重启加载，读取、OneBot 和 Hook 状态另行检查；真实微信新卡片与新拍一拍的端到端收发仍以实际收到的消息为准。
+- 上述模型验证未向微信联系人发送测试消息。运行服务已重启加载，读取、OneBot 和桌面发送状态另行检查；真实微信新卡片与新拍一拍的端到端收发仍以实际收到的消息为准。
 
-主要代码：`scripts/wechat_forwarded.py`、`scripts/reader-api.py`、`scripts/hook-onebot.mjs`、`components/qq-bridge/src/core/wechat-events.js`、`components/qq-bridge/src/core/social-engine.js`。
+主要代码：`scripts/wechat_forwarded.py`、`scripts/reader-api.py`、`scripts/wechat-onebot.mjs`、`components/qq-bridge/src/core/wechat-events.js`、`components/qq-bridge/src/core/social-engine.js`。

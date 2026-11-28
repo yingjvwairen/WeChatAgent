@@ -1,3 +1,4 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -460,7 +461,7 @@ export class AssistantFeedback {
     if (
       typeof send !== 'function' ||
       !/^T[a-f0-9]{16}$/.test(job?.id ?? '') ||
-      !/^wechat:(private|group):\d+$/.test(job.conversationKey ?? '') ||
+      !validChatKey(job.conversationKey ?? '') ||
       this.inFlight.has(job.id)
     )
       return false;

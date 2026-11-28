@@ -59,9 +59,7 @@ def register_quoted_original(reader, talker, ref):
         ref_id = reader.register_image(talker, {**source, 'image': {**record, 'localType': kind}})
         return {'id': ref_id, 'kind': 'sticker' if kind == 47 else 'image'} if ref_id else None
     if kind == 34:
-        info = voice_info(row.get('fullText'))
-        if not info:
-            return None
+        info = voice_info(row.get('fullText')) or {}
         key = 'wechat:' + ('group:' if talker.endswith('@chatroom') else 'private:') + talker
         voice = reader.voices.remember(talker, {**source, 'voice': {**record, **info}}, key)
         return {'kind': 'voice', **voice} if voice else None
@@ -73,5 +71,6 @@ def register_quoted_original(reader, talker, ref):
     return {
         'kind': 'video',
         'frames': source['videoFrames'],
+        **({'playback': source['videoPlayback']} if 'videoPlayback' in source else {}),
         **({'voice': source['voice']} if 'voice' in source else {}),
     }

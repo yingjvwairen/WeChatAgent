@@ -2,6 +2,7 @@ import { configuration, updatePlugin, packageFiles } from '../packages/plugin-ap
 import { packZip } from '../packages/plugin-api/zip.mjs';
 import { PluginInstaller } from '../packages/plugin-api/installer.mjs';
 import test from 'node:test';
+import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -41,7 +42,7 @@ test('fish notebook uses tool-free persona utilities and discloses only on the t
   );
   const settings = {
     wechat: {
-      whitelist: { private: ['123'], groups: [] },
+      whitelist: { private: ['wxid_fixture'], groups: [] },
       fishNotebook: { enabled: true, writeTime: '23:59', chats: {} },
     },
   };
@@ -114,7 +115,7 @@ test('memory inspection projects native summaries without creating, resuming or 
   const f = await fixture(t),
     file = path.join(f.dir, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] } } }));
+  fs.writeFileSync(file, JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture'], groups: [] } } }));
   const r = await f.start();
   assert.deepEqual((await r.request('/memory/native?conversationKey=' + encodeURIComponent(key))).summaries, []);
   assert.equal(r.calls.create.length, 0);
@@ -148,7 +149,7 @@ test('native prompts honour a frozen zero layout and refresh the next turn from 
     file = path.join(f.dir, 'config/wechatagent.json'),
     config = {
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
         workModes: { [key]: 'assistant' },
         assistant: { administrators: ['wxid_fixture'] },
         replyLayout: { maxMessages: 2 },
@@ -194,7 +195,7 @@ test('a native scheduled result keeps its reminder text and leaves the queue onl
   const f = await fixture(t),
     file = path.join(f.dir, 'config/wechatagent.json'),
     w = {
-      whitelist: { private: ['123'], groups: [] },
+      whitelist: { private: ['wxid_fixture'], groups: [] },
       workModes: { [key]: 'assistant' },
       assistant: { administrators: ['wxid_fixture'] },
     };
@@ -283,7 +284,7 @@ test('a silent thinking assistant delivers feedback through real task polling be
     file,
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
         workModes: { [key]: 'assistant' },
         assistant: { administrators: ['wxid_fixture'] },
       },
@@ -390,7 +391,7 @@ test('assistant native tool messages expose only explicit public AI feedback and
     file,
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
         workModes: { [key]: 'assistant' },
         assistant: { administrators: ['wxid_fixture'] },
       },
@@ -492,11 +493,11 @@ test('assistant native tool messages expose only explicit public AI feedback and
 
 test('group members chat in an isolated tool-free session while admin task sessions remain unchanged', async t => {
   const f = await fixture(t),
-    group = 'wechat:group:456',
+    group = 'wechat:group:456@chatroom',
     file = path.join(f.dir, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const w = {
-    whitelist: { private: ['123'], groups: ['456'] },
+    whitelist: { private: ['wxid_fixture'], groups: ['456@chatroom'] },
     history: { enabled: true, mode: 'window', windowStrategy: 'append', recentMessages: 8, recentChars: 4000 },
     workModes: { [group]: 'assistant' },
     assistant: { administrators: ['wxid_admin'], adminOnlyGroups: { [group]: false } },
@@ -579,14 +580,14 @@ test('group members chat in an isolated tool-free session while admin task sessi
 
 test('member native chat completes while an admin task remains active and cannot cancel that task', async t => {
   const f = await fixture(t),
-    group = 'wechat:group:456',
+    group = 'wechat:group:456@chatroom',
     file = path.join(f.dir, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(
     file,
     JSON.stringify({
       wechat: {
-        whitelist: { private: [], groups: ['456'] },
+        whitelist: { private: [], groups: ['456@chatroom'] },
         workModes: { [group]: 'assistant' },
         assistant: { administrators: ['wxid_admin'] },
       },
@@ -629,14 +630,14 @@ test('member native chat completes while an admin task remains active and cannot
 
 test('member chat without configured admins stays tool-free and rejects private, removed and file scopes', async t => {
   const f = await fixture(t),
-    group = 'wechat:group:456',
+    group = 'wechat:group:456@chatroom',
     file = path.join(f.dir, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(
     file,
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: ['456'] },
+        whitelist: { private: ['wxid_fixture'], groups: ['456@chatroom'] },
         workModes: { [group]: 'assistant', [key]: 'assistant' },
         assistant: { administrators: [] },
       },
@@ -646,7 +647,7 @@ test('member chat without configured admins stays tool-free and rejects private,
   await r.request('/assistant-chat', { ...info, assistantSender: 'wxid_member', message: '私聊不开放' }, 403);
   await r.request(
     '/assistant-chat',
-    { ...info, conversationKey: 'wechat:group:999', assistantSender: 'wxid_member', message: '不在范围' },
+    { ...info, conversationKey: 'wechat:group:999@chatroom', assistantSender: 'wxid_member', message: '不在范围' },
     403,
   );
   assert.equal(r.calls.create.length, 0);
@@ -703,7 +704,7 @@ test('bounded chat sessions carry recent raw records, omit old reasoning, preser
     kind: 'private',
     conversation_id: '123',
     message_id: String(i),
-    sender_id: '123',
+    sender_id: 'wxid_fixture',
     sender_name: '好友',
     text: i === 0 ? '去年苏州约过桂花面' : '原始近况 ' + i,
     timestamp: Date.now() / 1000 - 300 + i,
@@ -823,7 +824,7 @@ test('native admission omits confirmed duplicate echoes but keeps context after 
   const prompt = status =>
     buildPrivatePrompt({
       key,
-      rows: [{ sender_id: '123', text: '继续刚才的话题', timestamp: 0 }],
+      rows: [{ sender_id: 'wxid_fixture', text: '继续刚才的话题', timestamp: 0 }],
       previousReply: { text: '上一轮实际回复', delivery_status: status },
     });
   await r.request('/followup', { ...info, message: prompt('confirmed') });
@@ -871,7 +872,7 @@ test('a rule-only upgrade retires the old bootstrap without claiming the persona
 
 test('member memory tools use authenticated batch identities and persist a group-scoped JSON profile', async t => {
   const f = await fixture(t),
-    key = 'wechat:group:123',
+    key = 'wechat:group:123@chatroom',
     member = 'a'.repeat(64),
     account = 'b'.repeat(64);
   let writes = 0;
@@ -883,7 +884,9 @@ test('member memory tools use authenticated batch identities and persist a group
   );
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
-    JSON.stringify({ wechat: { whitelist: { groups: ['123'], private: [] }, memberMemory: { enabled: true } } }),
+    JSON.stringify({
+      wechat: { whitelist: { groups: ['123@chatroom'], private: [] }, memberMemory: { enabled: true } },
+    }),
   );
   const observations = [1, 2, 3].map(n => ({
     memberId: member,
@@ -916,14 +919,79 @@ test('member memory tools use authenticated batch identities and persist a group
   await runtime.request('/followup', body);
   assert.equal((await runtime.request('/followup', body)).cached, true);
   assert.equal(writes, 1);
-  const saved = JSON.parse(fs.readFileSync(path.join(f.dir, 'state/member-memory', account, '123.json'), 'utf8'));
+  const saved = JSON.parse(
+    fs.readFileSync(
+      path.join(f.dir, 'state/member-memory', account, crypto.createHash('sha256').update(key).digest('hex') + '.json'),
+      'utf8',
+    ),
+  );
   assert.equal(saved.members[member].tags[0].evidence.length, 3);
   assert.equal(saved.conversationKey, key);
 });
 
+test('native history quote references survive authenticated client transport and cached turn replay', async t => {
+  const f = await fixture(t),
+    eventId = 'a'.repeat(64);
+  fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
+  fs.writeFileSync(
+    path.join(f.dir, 'config/wechatagent.json'),
+    JSON.stringify({
+      wechat: {
+        whitelist: { private: ['wxid_fixture'], groups: [] },
+        history: { enabled: true, mode: 'window' },
+      },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(f.dir, 'state/social-messages.json'),
+    JSON.stringify({
+      version: 1,
+      chats: {
+        [key]: [
+          {
+            id: 'historical-fixture',
+            platform: 'wechat',
+            kind: 'private',
+            conversation_id: '123',
+            sender_id: '456',
+            message_id: eventId,
+            timestamp: Math.floor(Date.now() / 1000) - 600,
+            text: '周六去桂花面馆',
+            outgoing: false,
+          },
+        ],
+      },
+    }),
+  );
+  let lookups = 0,
+    label;
+  const options = {
+    beforeAssistant: async agent => {
+      lookups++;
+      const result = JSON.parse(
+        (await agent.registeredTools.get('wechat_history_search').execute({ query: '桂花面馆' })).content,
+      );
+      label = result.matches.find(row => row.quoteRef)?.quoteRef;
+      assert.match(label, /^H\d+$/);
+      assert(!JSON.stringify(result).includes(eventId));
+      options.assistantMessages = [[{ type: 'text', text: `RESPOND: [QUOTE:${label}] 还记得，周六见。` }]];
+    },
+  };
+  const runtime = await f.start(options);
+  const plugin = new DshPluginClient({ url: runtime.url, token: 'fixture-native-token' });
+  const metadata = { batchId: 'b'.repeat(64), allowHistoryQuote: true };
+  const output = await plugin.followup(key, '上次约的面馆还记得吗', metadata);
+  assert.equal(output, `RESPOND: [QUOTE:${label}] 还记得，周六见。`);
+  assert.deepEqual(metadata.historyQuoteRefs, { [label]: eventId });
+  const repeated = { batchId: 'b'.repeat(64), allowHistoryQuote: true };
+  assert.equal(await plugin.followup(key, '上次约的面馆还记得吗', repeated), output);
+  assert.deepEqual(repeated.historyQuoteRefs, metadata.historyQuoteRefs);
+  assert.equal(lookups, 1);
+});
+
 test('native meme tools return only the current chat resource as authenticated RPC metadata and cache it with the reply', async t => {
   const f = await fixture(t),
-    key = 'wechat:private:123',
+    key = 'wechat:private:wxid_fixture',
     id = 'a'.repeat(64),
     image = Buffer.from('GIF89a-fixture');
   let selections = 0;
@@ -932,7 +1000,7 @@ test('native meme tools return only the current chat resource as authenticated R
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
         stickers: { enabled: true },
         memeLibrary: { enabled: true },
       },
@@ -996,7 +1064,10 @@ test('voice input routes the installed API plugin through bound audio without cr
     account = 'c'.repeat(64);
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   const config = {
-    wechat: { whitelist: { private: ['123'], groups: [] }, assistant: { administrators: ['wxid_voice_admin'] } },
+    wechat: {
+      whitelist: { private: ['wxid_fixture'], groups: [] },
+      assistant: { administrators: ['wxid_voice_admin'] },
+    },
   };
   const configFile = path.join(f.dir, 'config/wechatagent.json');
   fs.writeFileSync(configFile, JSON.stringify(config));
@@ -1058,7 +1129,7 @@ test('voice input routes the installed API plugin through bound audio without cr
         'speech-recognition': {
           enabled: true,
           permissions: ['audio_read'],
-          chats: [key],
+          chatScopes: { [account]: { [key]: 'legacy' } },
           settings,
           generation: 'voice-fixture',
         },
@@ -1100,6 +1171,8 @@ async function fixture(t) {
   );
   const pluginDir = path.join(dir, 'packages/dsh-social-bridge-plugin');
   fs.mkdirSync(pluginDir, { recursive: true });
+  for (const name of ['wechat-identity.mjs', 'wechat-file-reference.mjs'])
+    fs.copyFileSync(path.join('packages', name), path.join(dir, 'packages', name));
   fs.copyFileSync('packages/dsh-social-bridge-plugin/native-context.mjs', path.join(pluginDir, 'native-context.mjs'));
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
   fs.copyFileSync('scripts/reader-account-state.mjs', path.join(dir, 'scripts/reader-account-state.mjs'));
@@ -1128,6 +1201,7 @@ async function fixture(t) {
     'model-search.mjs',
     'dsh-access.mjs',
     'file-tools.mjs',
+    'file-storage.mjs',
     'file-transfers.mjs',
     'assistant-policy.mjs',
     'conversation-policy.mjs',
@@ -1145,6 +1219,7 @@ async function fixture(t) {
     'history-policy.mjs',
     'history-store.mjs',
     'history-runtime.mjs',
+    'native-quote-source.mjs',
     'usage-summary.mjs',
     'request-window.mjs',
   ])
@@ -1183,22 +1258,6 @@ async function fixture(t) {
     fs.rmSync(dir, { recursive: true, force: true });
   });
   async function start(options = {}) {
-    let port;
-    for (;;) {
-      const portServer = http.createServer();
-      try {
-        await new Promise((resolve, reject) => {
-          portServer.once('error', reject);
-          portServer.listen(20000 + crypto.randomInt(40000), '127.0.0.1', resolve);
-        });
-      } catch (error) {
-        if (error.code === 'EADDRINUSE') continue;
-        throw error;
-      }
-      port = portServer.address().port;
-      await new Promise(r => portServer.close(r));
-      break;
-    }
     const listeners = new Map(),
       agents = new Map(),
       calls = {
@@ -1569,6 +1628,10 @@ async function fixture(t) {
         bytes: image.data.length,
       }),
     };
+    const probe = http.createServer();
+    await once(probe.listen(0, '127.0.0.1'), 'listening');
+    const { port } = probe.address();
+    await new Promise(resolve => probe.close(resolve));
     apply(ctx, {
       port,
       statePath,
@@ -1622,7 +1685,7 @@ async function fixture(t) {
   };
   return { start, store, statePath, dir, archived, setPersona };
 }
-const key = 'wechat:private:123',
+const key = 'wechat:private:wxid_fixture',
   persona = '固定测试人格：简短自然。',
   info = { conversationKey: key, persona, personaName: '测试人格', conversationName: '测试好友' };
 
@@ -1632,7 +1695,7 @@ test('WeChat window personas live in isolated native system prefixes across turn
   const file = path.join(f.dir, 'config/wechatagent.json'),
     settings = {
       wechat: {
-        whitelist: { private: ['123', '456'], groups: [] },
+        whitelist: { private: ['wxid_fixture', '456'], groups: [] },
         history: { enabled: true, mode: 'window', recentMessages: 4, recentChars: 2000 },
       },
     };
@@ -1715,7 +1778,7 @@ test('native prefix mode refuses an unavailable system registry before invoking 
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
-      wechat: { whitelist: { private: ['123'], groups: [] }, history: { enabled: true, mode: 'window' } },
+      wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, history: { enabled: true, mode: 'window' } },
     }),
   );
   const r = await f.start({ disableSystemPrompt: true }),
@@ -1730,7 +1793,7 @@ test('the native system prefix is limited to the WeChat friend preset, not a cus
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
-      wechat: { whitelist: { private: ['123'], groups: [] }, history: { enabled: true, mode: 'window' } },
+      wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, history: { enabled: true, mode: 'window' } },
     }),
   );
   const r = await f.start({ agentPreset: 'custom-social' }),
@@ -1774,7 +1837,7 @@ function allowGroupFixture(f) {
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
-    JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] } } }),
+    JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture'], groups: [] } } }),
   );
 }
 test('moving between real workspace directories inherits every event, keeps the protected head and resumes after restart', async t => {
@@ -1905,7 +1968,7 @@ test('empty sessions admit extension slots after the native system head and keep
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
-    JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: true } } }),
+    JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, search: { enabled: true } } }),
   );
   const r = await f.start({ steps: 3 }),
     configured = await r.request('/configure', info);
@@ -2088,7 +2151,7 @@ function idleContextFixture(f, patch = {}) {
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   const settings = {
     wechat: {
-      whitelist: { private: [123], groups: [] },
+      whitelist: { private: ['wxid_fixture'], groups: [] },
       context: { enabled: true, maxTokens: 100000, idleSeconds: 60, chats: {}, ...patch },
     },
   };
@@ -2237,7 +2300,7 @@ for (const initialized of [false, true])
         configFile,
         JSON.stringify({
           wechat: {
-            whitelist: { private: ['123'], groups: [] },
+            whitelist: { private: ['wxid_fixture'], groups: [] },
             history: { enabled: true, mode: 'window', recentMessages: 4, recentChars: 2000 },
             search: { ...SEARCH_DEFAULTS, enabled: true },
           },
@@ -2246,7 +2309,7 @@ for (const initialized of [false, true])
       const rows = Array.from({ length: 4 }, (_, i) => ({
         id: 'history-prefetch-' + i,
         message_id: 'history-prefetch-' + i,
-        sender_id: '123',
+        sender_id: 'wxid_fixture',
         sender_name: '好友',
         text: i === 3 ? '约的是周六去书店，不是周五。' : '之前的话 ' + i,
         timestamp: 1000 + i,
@@ -2409,6 +2472,52 @@ test('an admitted timeout is not appended again and a different later batch rema
   );
 });
 
+for (const interrupted of [false, true]) {
+  test('a native reply is cached only after response hooks finish, interrupted=' + interrupted, async t => {
+    const f = await fixture(t);
+    const { PluginRuntime } = await import(pathToFileURL(path.join(f.dir, 'packages/plugin-api/index.mjs')).href);
+    const batchId = '9'.repeat(64);
+    const body = { ...info, batchId, message: 'response finalization fixture' };
+    const cachedReply = () => JSON.parse(fs.readFileSync(f.statePath, 'utf8')).profiles[key].cache?.[batchId];
+    const originalHooks = PluginRuntime.prototype.hooks;
+    let observedCache,
+      hookCalls = 0;
+    t.mock.method(PluginRuntime.prototype, 'hooks', async function (hook, ...args) {
+      if (hook !== 'after-response') return originalHooks.call(this, hook, ...args);
+      observedCache = cachedReply();
+      hookCalls++;
+      if (interrupted) throw new Error('fixture response hook interrupted');
+      return [{ text: 'RESPOND: finalized fixture reply' }];
+    });
+    const first = await f.start({
+      assistantMessages: [[{ type: 'text', text: 'RESPOND: initial fixture reply' }]],
+    });
+    const response = await first.request('/followup', body, interrupted ? 503 : 200);
+    assert.equal(hookCalls, 1);
+    assert.equal(observedCache, undefined);
+    if (interrupted) {
+      assert.equal(response.admitted, true);
+      assert.equal(cachedReply(), undefined);
+    } else {
+      assert.equal(response.text, 'RESPOND: finalized fixture reply');
+      assert.equal(cachedReply().output.text, response.text);
+    }
+    await first.stop();
+
+    const restored = await f.start();
+    const replay = await restored.request('/followup', body, interrupted ? 502 : 200);
+    if (interrupted) {
+      assert.equal(replay.error, 'turn_already_admitted');
+      assert.equal(replay.admitted, true);
+    } else {
+      assert.equal(replay.cached, true);
+      assert.equal(replay.text, response.text);
+    }
+    assert.equal(restored.calls.model.length, 0);
+    assert.equal(hookCalls, 1);
+  });
+}
+
 test('terminal failure receipts and journal admission survive restart without a second inbox append', async t => {
   const f = await fixture(t),
     body = { ...info, message: '终态失败也去重', batchId: '5'.repeat(64) };
@@ -2560,7 +2669,7 @@ test('legacy extension upgrades append once without rewriting the cached prefix 
   const f = await fixture(t),
     file = path.join(f.dir, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const config = { wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: true } } };
+  const config = { wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, search: { enabled: true } } };
   fs.writeFileSync(file, JSON.stringify(config));
   const r = await f.start({ contextTokens: 1 }),
     configured = await r.request('/configure', info),
@@ -2607,7 +2716,7 @@ test('single-turn network opt-out preserves the stable instruction slot while ex
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(
     file,
-    JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: true } } }),
+    JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, search: { enabled: true } } }),
   );
   const visible = [],
     blocked = [];
@@ -2644,7 +2753,7 @@ test('fixed rules and extension descriptions stay single across batches and mode
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
-    JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: true } } }),
+    JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, search: { enabled: true } } }),
   );
   const r = await f.start({ steps: 3 });
   let response;
@@ -2669,7 +2778,7 @@ test('fixed rules and extension descriptions stay single across batches and mode
   assert.equal(slots().length, 1);
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
-    JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] }, search: { enabled: false } } }),
+    JSON.stringify({ wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, search: { enabled: false } } }),
   );
   await r.request('/followup', { ...info, message: '关闭搜索' });
   assert(!r.calls.model.at(-1).includes('[内置拓展 联网搜索]'));
@@ -2745,7 +2854,9 @@ test('public built-in layout count refreshes stable rules once and survives rest
   const settings = maxMessages =>
     fs.writeFileSync(
       path.join(configDir, 'wechatagent.json'),
-      JSON.stringify({ wechat: { whitelist: { private: ['123'], groups: [] }, replyLayout: { maxMessages } } }),
+      JSON.stringify({
+        wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, replyLayout: { maxMessages } },
+      }),
     );
   settings(2);
   const r = await f.start(),
@@ -2769,7 +2880,7 @@ test('public built-in layout count refreshes stable rules once and survives rest
 
 test('member evidence has one reusable turn slot and is removed after a turn while tool instructions stay stable', async t => {
   const f = await fixture(t),
-    group = 'wechat:group:123',
+    group = 'wechat:group:123@chatroom',
     account = 'b'.repeat(64),
     member = 'a'.repeat(64);
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
@@ -2780,7 +2891,9 @@ test('member evidence has one reusable turn slot and is removed after a turn whi
   );
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
-    JSON.stringify({ wechat: { whitelist: { groups: ['123'], private: [] }, memberMemory: { enabled: true } } }),
+    JSON.stringify({
+      wechat: { whitelist: { groups: ['123@chatroom'], private: [] }, memberMemory: { enabled: true } },
+    }),
   );
   const r = await f.start({ steps: 3 });
   let response;
@@ -2887,7 +3000,7 @@ test('persona changes reinitialize only that conversation and groups receive the
     a = await r.request('/followup', { ...info, message: '私聊一' });
   const group = await r.request('/followup', {
     ...info,
-    conversationKey: 'wechat:group:456',
+    conversationKey: 'wechat:group:456@chatroom',
     conversationName: '测试群',
     message: '群聊一',
   });
@@ -3072,7 +3185,7 @@ test('archiving a chat rotates only its session, preserves the archive and resum
   const old = await r.request('/followup', { ...info, message: '旧会话里的内容' });
   const group = await r.request('/followup', {
     ...info,
-    conversationKey: 'wechat:group:456',
+    conversationKey: 'wechat:group:456@chatroom',
     message: '另一个群的内容',
   });
   const oldEvents = f.store.get(old.sessionId).snapshotEvents();
@@ -3091,7 +3204,7 @@ test('archiving a chat rotates only its session, preserves the archive and resum
   );
   const listed = await r.request('/sessions');
   assert.equal(listed.sessions.find(s => s.conversationKey === key).generation, 1);
-  assert.equal(listed.sessions.find(s => s.conversationKey === 'wechat:group:456').sessionId, group.sessionId);
+  assert.equal(listed.sessions.find(s => s.conversationKey === 'wechat:group:456@chatroom').sessionId, group.sessionId);
   await r.stop();
   const resumed = await f.start();
   const next = await resumed.request('/followup', { ...info, message: '重启后的续聊' });
@@ -3178,7 +3291,7 @@ test('assistant and social modes preserve independent native histories across sw
   const file = path.join(f.dir, 'config/wechatagent.json'),
     config = JSON.parse(fs.readFileSync(file));
   const mode = value => {
-    config.wechat.assistant = { administrators: ['wxid_fixture_admin'] };
+    config.wechat.assistant = { administrators: ['wxid_fixture'] };
     config.wechat.workModes = { [key]: value };
     fs.writeFileSync(file, JSON.stringify(config));
   };
@@ -3188,7 +3301,7 @@ test('assistant and social modes preserve independent native histories across sw
   mode('assistant');
   const helper = await r.request('/followup', {
     ...info,
-    assistantSender: 'wxid_fixture_admin',
+    assistantSender: 'wxid_fixture',
     message: '助手独立任务',
     workMode: 'assistant',
   });
@@ -3213,7 +3326,7 @@ test('assistant and social modes preserve independent native histories across sw
     (
       await resumed.request('/followup', {
         ...info,
-        assistantSender: 'wxid_fixture_admin',
+        assistantSender: 'wxid_fixture',
         message: '重启继续任务',
         workMode: 'assistant',
       })
@@ -3231,8 +3344,8 @@ test('assistant task status and cancellation bypass the running followup without
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
-        assistant: { administrators: ['wxid_fixture_admin'] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
+        assistant: { administrators: ['wxid_fixture'] },
         workModes: { [key]: 'assistant' },
       },
     }),
@@ -3254,7 +3367,7 @@ test('assistant task status and cancellation bypass the running followup without
     '/followup',
     {
       ...info,
-      assistantSender: 'wxid_fixture_admin',
+      assistantSender: 'wxid_fixture',
       message: '独立离线慢任务',
       workMode: 'assistant',
       batchId: 'f'.repeat(64),
@@ -3274,7 +3387,7 @@ test('assistant task status and cancellation bypass the running followup without
   await new Promise(resolve => setTimeout(resolve, 10));
   const next = await r.request('/followup', {
     ...info,
-    assistantSender: 'wxid_fixture_admin',
+    assistantSender: 'wxid_fixture',
     message: '取消后继续',
     workMode: 'assistant',
   });
@@ -3290,9 +3403,12 @@ test('assistant admission rejects unauthenticated senders before creating sessio
     file = path.join(f.dir, 'config/wechatagent.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const w = {
-    whitelist: { private: ['123'], groups: ['456'] },
-    workModes: { [key]: 'assistant', 'wechat:group:456': 'assistant' },
-    assistant: { administrators: ['wxid_admin', 'wxid_member'], adminOnlyGroups: { 'wechat:group:456': false } },
+    whitelist: { private: ['wxid_fixture'], groups: ['456@chatroom'] },
+    workModes: { [key]: 'assistant', 'wechat:group:456@chatroom': 'assistant' },
+    assistant: {
+      administrators: ['wxid_fixture', 'wxid_member'],
+      adminOnlyGroups: { 'wechat:group:456@chatroom': false },
+    },
   };
   const save = () => fs.writeFileSync(file, JSON.stringify({ wechat: w }));
   save();
@@ -3314,39 +3430,59 @@ test('assistant admission rejects unauthenticated senders before creating sessio
   assert.equal(r.calls.create.length, 0);
   const first = r.request(
     '/followup',
-    { ...info, assistantSender: 'wxid_member', conversationKey: 'wechat:group:456', message: '成员任务' },
+    { ...info, assistantSender: 'wxid_member', conversationKey: 'wechat:group:456@chatroom', message: '成员任务' },
     503,
   );
   for (let i = 0; i < 100 && !started; i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert(started);
-  await r.request('/assistant-task/status', { conversationKey: 'wechat:group:456', senderWxid: 'wxid_stranger' }, 403);
-  await r.request('/assistant-task/cancel', { conversationKey: 'wechat:group:456', senderWxid: 'wxid_stranger' }, 403);
+  await r.request(
+    '/assistant-task/status',
+    { conversationKey: 'wechat:group:456@chatroom', senderWxid: 'wxid_stranger' },
+    403,
+  );
+  await r.request(
+    '/assistant-task/cancel',
+    { conversationKey: 'wechat:group:456@chatroom', senderWxid: 'wxid_stranger' },
+    403,
+  );
   assert.equal(
-    (await r.request('/assistant-task/status', { conversationKey: 'wechat:group:456', senderWxid: 'wxid_member' }))
-      .running,
+    (
+      await r.request('/assistant-task/status', {
+        conversationKey: 'wechat:group:456@chatroom',
+        senderWxid: 'wxid_member',
+      })
+    ).running,
     true,
   );
   const agent = [...r.agents.values()][0],
     check = agent.ctx[Symbol.for('wechatagent.assistant-access.v1')];
   assert.equal(check(), true);
-  w.assistant.administrators = ['wxid_admin'];
+  w.assistant.administrators = ['wxid_fixture'];
   save();
   assert.equal(check(), false);
-  await r.request('/assistant-task/cancel', { conversationKey: 'wechat:group:456', senderWxid: 'wxid_member' }, 403);
+  await r.request(
+    '/assistant-task/cancel',
+    { conversationKey: 'wechat:group:456@chatroom', senderWxid: 'wxid_member' },
+    403,
+  );
   assert.equal(
-    (await r.request('/assistant-task/cancel', { conversationKey: 'wechat:group:456', senderWxid: 'wxid_admin' }))
-      .running,
+    (
+      await r.request('/assistant-task/cancel', {
+        conversationKey: 'wechat:group:456@chatroom',
+        senderWxid: 'wxid_fixture',
+      })
+    ).running,
     false,
   );
   await first;
   release();
   await new Promise(resolve => setTimeout(resolve, 10));
-  const next = await r.request('/followup', { ...info, assistantSender: 'wxid_admin', message: '管理员继续' });
+  const next = await r.request('/followup', { ...info, assistantSender: 'wxid_fixture', message: '管理员继续' });
   assert(next.sessionId);
 });
 
 function coldWakeFixture(f) {
-  const group = 'wechat:group:456',
+  const group = 'wechat:group:456@chatroom',
     at = Math.floor(Date.now() / 1000),
     file = path.join(f.dir, 'state/social-messages.json');
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
@@ -3354,7 +3490,7 @@ function coldWakeFixture(f) {
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: ['456'] },
+        whitelist: { private: ['wxid_fixture'], groups: ['456@chatroom'] },
         history: {
           enabled: true,
           mode: 'window',
@@ -3370,7 +3506,7 @@ function coldWakeFixture(f) {
     id: 'cold-old-' + i,
     platform: 'wechat',
     kind: 'group',
-    conversation_id: '456',
+    conversation_id: '456@chatroom',
     sender_id: '42',
     sender_name: '群友',
     timestamp: at - 4000 + i,
@@ -3488,12 +3624,15 @@ for (const [text, count, mode] of [
 test('the real native stream guard accepts updated system snapshots in both private and group histories', async t => {
   for (const kind of ['private', 'group']) {
     const f = await fixture(t),
-      chat = 'wechat:' + kind + ':123';
+      chat = kind === 'group' ? 'wechat:group:123@chatroom' : key;
     fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
     fs.writeFileSync(
       path.join(f.dir, 'config/wechatagent.json'),
       JSON.stringify({
-        wechat: { whitelist: { private: ['123'], groups: ['123'] }, history: { enabled: true, mode: 'window' } },
+        wechat: {
+          whitelist: { private: ['wxid_fixture'], groups: ['123@chatroom'] },
+          history: { enabled: true, mode: 'window' },
+        },
       }),
     );
     const r = await f.start({ systemPromptUpdate: 'in-history' });
@@ -3527,7 +3666,7 @@ test('a truly missing system prefix blocks the provider and rebinds once on the 
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
-      wechat: { whitelist: { private: ['123'], groups: [] }, history: { enabled: true, mode: 'window' } },
+      wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, history: { enabled: true, mode: 'window' } },
     }),
   );
   const r = await f.start({ omitInitialNativePrefix: true }),
@@ -3565,7 +3704,7 @@ test('persistent prefix failures cannot loop registrations or bypass the guard; 
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
-      wechat: { whitelist: { private: ['123'], groups: [] }, history: { enabled: true, mode: 'window' } },
+      wechat: { whitelist: { private: ['wxid_fixture'], groups: [] }, history: { enabled: true, mode: 'window' } },
     }),
   );
   const options = { omitNativePrefix: true },
@@ -3624,13 +3763,13 @@ test('persistent prefix failures cannot loop registrations or bypass the guard; 
 
 test('member chat headers omit toolChoice entirely and stay lossless JSON while administrator tools remain intact', async t => {
   const f = await fixture(t),
-    group = 'wechat:group:456';
+    group = 'wechat:group:456@chatroom';
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   fs.writeFileSync(
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
       wechat: {
-        whitelist: { private: [], groups: ['456'] },
+        whitelist: { private: [], groups: ['456@chatroom'] },
         workModes: { [group]: 'assistant' },
         assistant: { administrators: ['wxid_admin'], adminOnlyGroups: { [group]: true } },
         dshAccess: { chats: { [group]: { mode: 'native', skills: [], tools: [] } } },
@@ -3688,9 +3827,9 @@ test('unready assistant presets reject task submission clearly without persistin
     path.join(f.dir, 'config/wechatagent.json'),
     JSON.stringify({
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
         workModes: { [key]: 'assistant' },
-        assistant: { administrators: ['wxid_admin'] },
+        assistant: { administrators: ['wxid_fixture'] },
       },
     }),
   );
@@ -3702,8 +3841,8 @@ test('unready assistant presets reject task submission clearly without persistin
   };
   const body = {
     conversationKey: key,
-    senderWxid: 'wxid_admin',
-    assistantSender: 'wxid_admin',
+    senderWxid: 'wxid_fixture',
+    assistantSender: 'wxid_fixture',
     message: 'Task after restart',
     batchId: 'e'.repeat(64),
   };
@@ -3719,7 +3858,7 @@ test('unready assistant presets reject task submission clearly without persistin
   assert.equal(r.calls.create.length, 0);
   assert.equal(r.calls.model.length, 0);
   assert.deepEqual(
-    (await r.request('/assistant-task/list', { conversationKey: key, senderWxid: 'wxid_admin' })).tasks,
+    (await r.request('/assistant-task/list', { conversationKey: key, senderWxid: 'wxid_fixture' })).tasks,
     [],
   );
   r.ctx.agentPresets.resolve = async id => ({ id });
@@ -3729,7 +3868,7 @@ test('unready assistant presets reject task submission clearly without persistin
   for (let i = 0; i < 200; i++) {
     done = await r.request('/assistant-task/result', {
       conversationKey: key,
-      senderWxid: 'wxid_admin',
+      senderWxid: 'wxid_fixture',
       taskId: accepted.task.id,
     });
     if (done.task.state === 'completed') break;
@@ -3751,17 +3890,17 @@ test('preset preflight does not retry unrelated failures and rechecks owner revo
   const file = path.join(f.dir, 'config/wechatagent.json'),
     settings = {
       wechat: {
-        whitelist: { private: ['123'], groups: [] },
+        whitelist: { private: ['wxid_fixture'], groups: [] },
         workModes: { [key]: 'assistant' },
-        assistant: { administrators: ['wxid_admin'] },
+        assistant: { administrators: ['wxid_fixture'] },
       },
     };
   fs.writeFileSync(file, JSON.stringify(settings));
   const r = await f.start(),
     body = {
       conversationKey: key,
-      senderWxid: 'wxid_admin',
-      assistantSender: 'wxid_admin',
+      senderWxid: 'wxid_fixture',
+      assistantSender: 'wxid_fixture',
       message: 'Guarded task',
       batchId: 'f'.repeat(64),
     };

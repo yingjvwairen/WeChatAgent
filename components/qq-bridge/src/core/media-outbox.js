@@ -2,8 +2,8 @@ import { boundedTask } from '../../../../packages/dsh-social-bridge-plugin/deadl
 
 // Media delivery has its own durable lane. It never owns the model/chat lock.
 export class MediaOutbox {
-  constructor({ buffer, send, policy, quota, noteOutgoing, retry, log }) {
-    Object.assign(this, { buffer, send, policy, quota, noteOutgoing, retry, log });
+  constructor({ buffer, send, policy, quota, noteOutgoing, retry, log, deliveryControls, inspectReceipt }) {
+    Object.assign(this, { buffer, send, policy, quota, noteOutgoing, retry, log, deliveryControls, inspectReceipt });
     this.running = new Map();
     this.timers = new Map();
     this.stopped = false;
@@ -14,8 +14,11 @@ export class MediaOutbox {
       this.wake(key);
       return;
     }
+    const grant = pending.rosterGrant ?? pending.message?.readerGrant ?? 'legacy';
+    if (this.deliveryControls && !this.deliveryControls.register(key, grant, [part])) return;
     const peers = [...this.buffer.mediaReplies.values()].filter(item => item.key === key);
     if (peers.length >= 3 || this.buffer.mediaReplies.size >= 64) {
+      this.deliveryControls?.update(key, grant, part.deliveryId, 'cancelled');
       this.buffer.setContextNotice(key, {
         id: part.deliveryId,
         text: '本机待发表情队列已满，本轮配图已取消；文字回复继续。',
@@ -25,7 +28,7 @@ export class MediaOutbox {
     const now = Date.now();
     this.buffer.mediaReplies.set(part.deliveryId, {
       key,
-      message: pending.message,
+      message: { ...pending.message, readerGrant: grant },
       part: { ...part },
       createdAt: now,
       expiresAt: now + this.retry.mediaDeadlineMs,
@@ -46,7 +49,7 @@ export class MediaOutbox {
       ),
     );
   }
-  finish(item, reason) {
+  finish(item, reason, state) {
     if (['sending', 'submitted'].includes(item.part.state)) {
       // Release only the adapter's matching receipt reservation. This RPC has
       // no native-send path and cannot submit the abandoned image again.
@@ -60,6 +63,12 @@ export class MediaOutbox {
         { timeoutMs: 1000 },
       ).catch(() => {});
     }
+    state ??= ['sending', 'submitted'].includes(item.part.state)
+      ? 'unconfirmed'
+      : item.part.state === 'confirmed'
+        ? 'confirmed'
+        : 'cancelled';
+    this.deliveryControls?.update(item.key, item.message?.readerGrant ?? 'legacy', item.part.deliveryId, state);
     this.buffer.mediaReplies.delete(item.part.deliveryId);
     this.buffer.saveMedia();
     if (reason) this.buffer.setContextNotice(item.key, { id: item.part.deliveryId, text: reason });
@@ -72,10 +81,42 @@ export class MediaOutbox {
     this.running.set(key, controller);
     let nextAt = Date.now();
     const { part } = item,
-      receiptOnly = ['sending', 'submitted'].includes(part.state);
+      grant = item.message?.readerGrant ?? 'legacy';
+    let receiptOnly = ['sending', 'submitted'].includes(part.state);
     try {
-      if (Date.now() >= item.expiresAt) {
-        this.finish(item, '本机上一轮配图已超过等待时限，不再提交；已提交的图片送达情况未知，不能声称已收到。');
+      if (this.deliveryControls && !this.deliveryControls.register(key, grant, [part])) {
+        this.finish(item, '聊天已移出自动回复范围，旧配图不再发送。');
+        return;
+      }
+      if (item.observeOnly) {
+        nextAt = Date.now() + this.retry.receiptDelayMs;
+        let status;
+        try {
+          status = await this.inspectReceipt(item.message, part);
+        } catch (error) {
+          if (!['CONVERSATION_NOT_ALLOWED', 'NATIVE_SEND_REJECTED', 'TEXT_DELIVERY_ID_CONFLICT'].includes(error.code))
+            return;
+        }
+        if (this.stopped || status === 'pending') return;
+        const confirmed = status === 'confirmed';
+        part.state = confirmed ? 'confirmed' : 'unconfirmed';
+        this.buffer.recordReplyPart(key, part, {
+          ...item.message,
+          sender_id: item.message.self_id,
+          timestamp: Date.now() / 1000,
+          text: confirmed ? '[已发送微信原生表情包]' : '[微信原生表情送达待核对]',
+          delivery_status: part.state,
+          sticker_id: part.stickerId,
+        });
+        this.finish(item, undefined, part.state);
+        return;
+      }
+      if (!part.desktopPending && Date.now() >= item.expiresAt) {
+        this.finish(
+          item,
+          '本机上一轮配图已超过等待时限，不再提交；已提交的图片送达情况未知，不能声称已收到。',
+          receiptOnly ? 'unconfirmed' : 'expired',
+        );
         return;
       }
       if (!receiptOnly) {
@@ -102,6 +143,16 @@ export class MediaOutbox {
         nextAt = Math.min(part.retryAt, item.expiresAt);
         return;
       }
+      const claim = this.deliveryControls?.claim(key, grant, part.deliveryId) ?? 'send';
+      if (claim === 'paused') {
+        nextAt = Math.min(item.expiresAt, Date.now() + 1000);
+        return;
+      }
+      if (['cancelled', 'expired', 'failed', 'unconfirmed', 'confirmed'].includes(claim)) {
+        this.finish(item, undefined, claim);
+        return;
+      }
+      receiptOnly ||= claim === 'submitted';
       if (receiptOnly) part.receiptChecks = (part.receiptChecks ?? 0) + 1;
       part.state = 'sending';
       delete part.retryAt;
@@ -117,16 +168,19 @@ export class MediaOutbox {
               ...(receiptOnly ? { receiptOnly: true } : {}),
             }),
           {
-            timeoutMs: Math.max(1, Math.min(this.retry.mediaCallTimeoutMs, item.expiresAt - Date.now())),
+            timeoutMs: receiptOnly
+              ? this.retry.mediaCallTimeoutMs
+              : Math.max(1, Math.min(this.retry.mediaCallTimeoutMs, item.expiresAt - Date.now())),
             signal: controller.signal,
             code: 'MEDIA_DELIVERY_TIMEOUT',
           },
         );
       } catch (error) {
-        if (this.stopped) return;
+        if (this.stopped || item.observeOnly || !this.buffer.mediaReplies.has(part.deliveryId)) return;
         if (error.code === 'SENDER_BUSY') {
           part.state = receiptOnly ? 'submitted' : 'queued';
           if (receiptOnly) part.receiptChecks--;
+          this.deliveryControls?.update(key, grant, part.deliveryId, part.state);
           part.busyAttempts = (part.busyAttempts ?? 0) + 1;
           if (part.busyAttempts > this.retry.maxBusyRetries) {
             this.finish(item, '本机发送器持续忙碌，上一轮配图已终结，文字回复继续。');
@@ -146,10 +200,19 @@ export class MediaOutbox {
         // A timed-out/lost RPC may already have submitted the sticker.
         delivery = { delivered: 'unconfirmed' };
       }
-      if (this.stopped) return;
+      if (this.stopped || item.observeOnly || !this.buffer.mediaReplies.has(part.deliveryId)) return;
+      if (delivery?.pending === true) {
+        part.state = 'submitted';
+        part.desktopPending = true;
+        part.receiptChecks = 0;
+        this.deliveryControls?.update(key, grant, part.deliveryId, 'submitted');
+        nextAt = Date.now() + this.retry.receiptDelayMs;
+        return;
+      }
       const confirmed = delivery?.delivered !== 'unconfirmed',
         at = Date.now();
       part.state = confirmed ? 'confirmed' : 'submitted';
+      this.deliveryControls?.update(key, grant, part.deliveryId, part.state);
       if (confirmed) this.buffer.mediaReplies.delete(part.deliveryId);
       const existing = this.buffer
         .recent(key, this.buffer.maxPerChat)
@@ -194,9 +257,16 @@ export class MediaOutbox {
   cancelOffline() {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
-    for (const controller of this.running.values()) controller.abort(Error('DSH_OFFLINE'));
-    for (const item of [...this.buffer.mediaReplies.values()])
-      this.finish(item, 'DSH 已离线或重启，旧配图不再补发；已提交部分保留送达记录，不视为已确认。');
+    for (const item of [...this.buffer.mediaReplies.values()]) {
+      if (this.inspectReceipt && ['sending', 'submitted'].includes(item.part.state)) {
+        item.observeOnly = true;
+        item.part.state = 'submitted';
+        this.buffer.saveMedia();
+        this.wake(item.key);
+      } else {
+        this.finish(item, 'DSH 已离线或重启，旧配图不再补发；已提交部分保留送达记录，不视为已确认。');
+      }
+    }
   }
   stop() {
     this.stopped = true;

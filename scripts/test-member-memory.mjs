@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,12 +14,12 @@ import {
   validateMemberMemory,
   MEMBER_MEMORY_POLICY,
 } from '../packages/dsh-social-bridge-plugin/member-memory-policy.mjs';
-import { HookOneBot } from './hook-onebot.mjs';
+import { WechatOneBot } from './wechat-onebot.mjs';
 import { normalizeOneBotEvent } from '../components/qq-bridge/src/onebot/normalize.js';
 import { MessageBuffer } from '../components/qq-bridge/src/core/message-buffer.js';
 import { applyBuiltinUpdate, builtinCatalog } from './extension-status.mjs';
-const group = 'wechat:group:123',
-  otherGroup = 'wechat:group:456',
+const group = 'wechat:group:123@chatroom',
+  otherGroup = 'wechat:group:456@chatroom',
   member = 'a'.repeat(64),
   other = 'b'.repeat(64),
   account = 'c'.repeat(64);
@@ -32,7 +33,10 @@ function fixture(t) {
   let clock = Date.now(),
     active = true;
   const config = {
-    wechat: { whitelist: { groups: ['123', '456'], private: ['789'] }, memberMemory: { enabled: true } },
+    wechat: {
+      whitelist: { groups: ['123@chatroom', '456@chatroom'], private: ['789'] },
+      memberMemory: { enabled: true },
+    },
   };
   const save = () => fs.writeFileSync(path.join(root, 'config/wechatagent.json'), JSON.stringify(config));
   save();
@@ -55,7 +59,12 @@ function fixture(t) {
     make,
     row,
     turn,
-    file: path.join(root, 'state/member-memory', account, '123.json'),
+    file: path.join(
+      root,
+      'state/member-memory',
+      account,
+      crypto.createHash('sha256').update('wechat:group:123@chatroom').digest('hex') + '.json',
+    ),
     advance: ms => (clock += ms),
     revoke: () => (active = false),
   };
@@ -72,9 +81,9 @@ test('stable full member identifiers survive renaming and are preserved through 
     rawid: 'first',
     sourceName: '原昵称',
   };
-  const first = HookOneBot.prototype.incoming.call(host, payload),
-    renamed = HookOneBot.prototype.incoming.call(host, { ...payload, rawid: 'second', sourceName: '新昵称' }),
-    different = HookOneBot.prototype.incoming.call(host, { ...payload, talkerId: 'wxid_user_b' });
+  const first = WechatOneBot.prototype.incoming.call(host, payload),
+    renamed = WechatOneBot.prototype.incoming.call(host, { ...payload, rawid: 'second', sourceName: '新昵称' }),
+    different = WechatOneBot.prototype.incoming.call(host, { ...payload, talkerId: 'wxid_user_b' });
   assert.equal(first.wechatagent.memberId, renamed.wechatagent.memberId);
   assert.notEqual(first.wechatagent.memberId, different.wechatagent.memberId);
   const normalized = normalizeOneBotEvent('wechat', 'wechat-onebot', first),

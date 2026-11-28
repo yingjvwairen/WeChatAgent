@@ -9,9 +9,9 @@ export function normalizeQuoteReply(value) {
   if (
     !ref ||
     [
-      ['senderId', 128],
+      ['senderId', 256],
       ['senderName', 80],
-      ['conversationId', 128],
+      ['conversationId', 256],
       ['messageId', 32],
       ['time', 64],
       ['kind', 16],
@@ -64,26 +64,26 @@ export function quoteReplyText(reply) {
 }
 
 export function normalizeForwardedRecord(value) {
+  // Reader counts Unicode code points. Apply the same bounds at the JS boundary.
+  const length = text => [...text].length;
+  const bounded = (text, limit) =>
+    typeof text === 'string' && text.isWellFormed() && text.length <= limit * 2 && length(text) <= limit;
   if (
     !value ||
     value.version !== 1 ||
-    typeof value.title !== 'string' ||
-    value.title.length > 200 ||
+    !bounded(value.title, 200) ||
     !Array.isArray(value.items) ||
     value.items.length > 50
   )
     return null;
   const items = [];
-  let size = value.title.length;
+  let size = length(value.title);
   for (const item of value.items) {
     if (
       !item ||
-      typeof item.sender !== 'string' ||
-      item.sender.length > 80 ||
-      typeof item.time !== 'string' ||
-      item.time.length > 64 ||
-      typeof item.text !== 'string' ||
-      item.text.length > 801 ||
+      !bounded(item.sender, 80) ||
+      !bounded(item.time, 64) ||
+      !bounded(item.text, 801) ||
       typeof item.kind !== 'string' ||
       item.kind.length > 8 ||
       !Number.isSafeInteger(item.depth) ||
@@ -91,7 +91,7 @@ export function normalizeForwardedRecord(value) {
       item.depth > 3
     )
       return null;
-    size += item.sender.length + item.time.length + item.text.length + 12;
+    size += length(item.sender) + length(item.time) + length(item.text) + 12;
     if (size > 6400) return null;
     items.push({ sender: item.sender, time: item.time, text: item.text, kind: item.kind, depth: item.depth });
   }

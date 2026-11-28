@@ -1,3 +1,4 @@
+import { validChatKey } from '../../../../packages/wechat-identity.mjs';
 import crypto from 'node:crypto';
 export const PROACTIVE_DEFAULTS = Object.freeze({
   enabled: false,
@@ -9,7 +10,6 @@ export const PROACTIVE_DEFAULTS = Object.freeze({
   useSearch: true,
   jitterMinutes: 15,
 });
-const chatKey = /^wechat:(private|group):[1-9]\d{0,15}$/;
 const clock = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 export function validateProactiveSettings(value) {
   if (value === undefined) return;
@@ -35,10 +35,7 @@ export function validateProactiveSettings(value) {
     (!value.chats ||
       typeof value.chats !== 'object' ||
       Array.isArray(value.chats) ||
-      Object.entries(value.chats).some(
-        ([key, flag]) =>
-          !chatKey.test(key) || !Number.isSafeInteger(Number(key.split(':').at(-1))) || typeof flag !== 'boolean',
-      ))
+      Object.entries(value.chats).some(([key, flag]) => !validChatKey(key) || typeof flag !== 'boolean'))
   )
     throw Error('Invalid proactive chats');
 }

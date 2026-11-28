@@ -1,10 +1,12 @@
 """Prepare current-chat sends independently from long-term pool admission."""
 
-import base64, hashlib, io, json, re, time, threading
+from wechat_identity import parse_chat_key
+import base64, hashlib, io, json, re, time, threading, uuid, os
 from collections import OrderedDict
 from PIL import Image
 from wechat_sticker_send import native_gif_bytes, stage_sticker_bytes
 from wechat_image_normalize import normalize_image
+from wechat_image_limits import MAX_BYTES, inspect_image
 
 PREPARED_LIMIT = 16
 PREPARED_BYTES = 32 * 1024 * 1024
@@ -18,23 +20,62 @@ class MemeSendResources:
         self.pool = pool
         self.items = OrderedDict()
         self.lock = threading.RLock()
+        self.generation = uuid.uuid4().hex
+        self.directory = pool.safe(pool.folder / 'prepared')
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.write('generation', {'version': 1, 'generation': self.generation, 'pid': os.getpid()})
+        for file in self.directory.glob('*.json'):
+            if re.fullmatch(r'[a-f0-9]{64}\.json', file.name):
+                self.pool.safe(file).unlink(missing_ok=True)
+
+    def write(self, name, value):
+        file = self.pool.safe(self.directory / (name + '.json'))
+        temp = self.pool.safe(self.directory / (uuid.uuid4().hex + '.tmp'))
+        try:
+            temp.write_text(json.dumps(value), encoding='utf-8')
+            temp.replace(file)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def forget(self, image_id):
+        self.items.pop(image_id, None)
+        file = self.pool.safe(self.directory / (image_id + '.json'))
+        if file.exists() and json.loads(file.read_text(encoding='utf-8')).get('generation') == self.generation:
+            file.unlink()
 
     def allowed(self, key):
-        if not self.pool.active() or not meme_import_allowed(self.pool.policy(), key):
+        generation = self.pool.safe(self.directory / 'generation.json')
+        if (
+            getattr(self, 'closed', False)
+            or not generation.exists()
+            or json.loads(generation.read_text(encoding='utf-8')).get('generation') != self.generation
+            or not self.pool.active()
+            or not meme_import_allowed(self.pool.policy(), key)
+        ):
             raise PermissionError('Meme send is not allowed')
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            for image_id in list(self.items):
+                self.forget(image_id)
+            file = self.pool.safe(self.directory / 'generation.json')
+            if file.exists() and json.loads(file.read_text(encoding='utf-8')).get('generation') == self.generation:
+                file.unlink()
 
     def prune(self):
         now = time.monotonic()
         for image_id, item in list(self.items.items()):
             if item['expires'] <= now:
-                del self.items[image_id]
+                self.forget(image_id)
         while self.items and (
             len(self.items) > PREPARED_LIMIT or sum(len(item['raw']) for item in self.items.values()) > PREPARED_BYTES
         ):
-            self.items.popitem(last=False)
+            self.forget(next(iter(self.items)))
 
     def prepare(self, key, raw):
         self.allowed(key)
+        inspect_image(raw)
         digest = hashlib.sha256(raw).hexdigest()
         md5 = hashlib.md5(raw).hexdigest()
         image_id = hashlib.sha256(
@@ -50,6 +91,7 @@ class MemeSendResources:
             'sha256': digest,
             'fields': {'md5': md5, 'len': len(raw), 'type': 2, 'width': width, 'height': height, 'productid': ''},
             'origin': 'dsh-meme-temporary',
+            'temporaryReference': {'id': image_id, 'generation': self.generation, 'sha256': digest},
         }
         with self.lock:
             self.prune()
@@ -59,6 +101,20 @@ class MemeSendResources:
             self.prune()
             if image_id not in self.items:
                 raise RuntimeError('MEME_SEND_CACHE_FULL')
+            self.write(
+                image_id,
+                {
+                    'version': 1,
+                    'id': image_id,
+                    'generation': self.generation,
+                    'accountScope': self.pool.account_key,
+                    'conversationKey': key,
+                    'sha256': digest,
+                    'md5': md5,
+                    'size': len(raw),
+                    'expiresAt': int(time.time() * 1000) + PREPARED_TTL * 1000,
+                },
+            )
         return image_id
 
     def resource(self, image_id, key):
@@ -80,7 +136,11 @@ class MemeSendResources:
                 return None
             key = item['resource']['conversationKey']
             self.resource(image_id, key)
-            return {**normalize_image(item['raw'], animated=True), 'imageId': image_id, 'conversationKey': key}
+            return {
+                **normalize_image(item['raw'], animated=True, max_source_bytes=MAX_BYTES),
+                'imageId': image_id,
+                'conversationKey': key,
+            }
 
 
 def send_resources(reader):
@@ -91,14 +151,14 @@ def send_resources(reader):
 
 
 def meme_import_allowed(policy, key):
-    match = re.fullmatch(r'wechat:(private|group):([1-9]\d{0,15})', str(key))
+    match = parse_chat_key(key)
     if not match:
         return False
-    allowed = policy.get('whitelist', {}).get('private' if match[1] == 'private' else 'groups', [])
+    allowed = policy.get('whitelist', {}).get('private' if match[0] == 'private' else 'groups', [])
     feature = policy.get('memeLibrary', {})
     stickers = policy.get('stickers', {})
     return (
-        match[2] in map(str, allowed)
+        match[1] in allowed
         and feature.get('chats', {}).get(key, feature.get('enabled', False)) is True
         and stickers.get('chats', {}).get(key, stickers.get('enabled', True)) is True
     )
@@ -112,24 +172,16 @@ def decode_library_image(reader, body):
     if not pool.active() or not meme_import_allowed(pool.policy(), key):
         raise PermissionError('Meme import is not allowed')
     value = body.get('b64')
-    if not isinstance(value, str) or not 0 < len(value) <= 11200000:
+    if not isinstance(value, str) or not 0 < len(value) <= ((MAX_BYTES + 2) // 3) * 4:
         raise ValueError('Invalid meme image')
     try:
         raw = base64.b64decode(value, validate=True)
     except Exception:
         raise ValueError('Invalid meme image') from None
-    if not 0 < len(raw) <= 8 * 1024 * 1024:
+    if not 0 < len(raw) <= MAX_BYTES:
         raise ValueError('Invalid meme image')
     try:
-        with Image.open(io.BytesIO(raw)) as image:
-            if (
-                image.format not in ('GIF', 'PNG', 'JPEG', 'WEBP')
-                or not 0 < image.width <= 4096
-                or not 0 < image.height <= 4096
-            ):
-                raise ValueError()
-            if image.width * image.height * getattr(image, 'n_frames', 1) > 80000000:
-                raise ValueError()
+        inspect_image(raw)
     except Exception:
         raise ValueError('Unsupported meme image') from None
     return key, raw
@@ -137,7 +189,7 @@ def decode_library_image(reader, body):
 
 def inspect_library_sticker(reader, body):
     key, raw = decode_library_image(reader, body)
-    return {**normalize_image(raw, animated=True), 'conversationKey': key}
+    return {**normalize_image(raw, animated=True, max_source_bytes=MAX_BYTES), 'conversationKey': key}
 
 
 def import_library_sticker(reader, body):

@@ -5,6 +5,7 @@ import { UiTextOutbox } from './ui-text-outbox.mjs';
 import { validSelectionScope } from './selection-scope.mjs';
 import { inspectReplyImage, REPLY_IMAGE_MAX_BYTES, staticImageReceiptMatches } from '../reply-image-format.mjs';
 import { acquireDeliveryLock } from './delivery-lock.mjs';
+import { FILE_LIMIT, safeFileName } from '../../packages/wechat-file-reference.mjs';
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const md5 = value => crypto.createHash('md5').update(value).digest('hex');
@@ -135,9 +136,10 @@ export class UiImageOutbox {
       !digest(value.sourceImageSha256) ||
       !['png', 'jpg', 'gif', 'file'].includes(value.extension) ||
       (value.extension === 'gif' && !md5Digest(value.sourceImageMd5)) ||
+      (value.extension === 'file' && !safeFileName(value.fileName)) ||
       !integer(value.bytes) ||
       value.bytes < (value.extension === 'file' ? 0 : 4) ||
-      value.bytes > (value.extension === 'file' ? 50 * 1024 * 1024 : REPLY_IMAGE_MAX_BYTES) ||
+      value.bytes > (value.extension === 'file' ? FILE_LIMIT : REPLY_IMAGE_MAX_BYTES) ||
       !validSelectionScope(value.selectionScope) ||
       value.selectionScope.account !== value.account ||
       value.selectionScope.target !== value.target
@@ -175,7 +177,7 @@ export class UiImageOutbox {
   }
   #assetPath(metadata) {
     return metadata.extension === 'file'
-      ? path.join(this.fileAssetsDirectory, metadata.id, path.basename(metadata.fileName))
+      ? path.join(this.fileAssetsDirectory, metadata.id, metadata.fileName)
       : path.join(this.assetsDirectory, metadata.id + '.' + metadata.extension);
   }
   #asset(metadata) {
@@ -185,7 +187,7 @@ export class UiImageOutbox {
     if (
       !stat.isFile() ||
       stat.size !== metadata.bytes ||
-      stat.size > (metadata.extension === 'file' ? 50 * 1024 * 1024 : REPLY_IMAGE_MAX_BYTES)
+      stat.size > (metadata.extension === 'file' ? FILE_LIMIT : REPLY_IMAGE_MAX_BYTES)
     )
       throw fault('UI_IMAGE_ASSET_CHANGED');
     const bytes = fs.readFileSync(file);
@@ -426,14 +428,15 @@ export class UiImageOutbox {
         if (
           !stat.isFile() ||
           stat.size < (mode === 'file' ? 0 : 4) ||
-          stat.size > (mode === 'file' ? 50 * 1024 * 1024 : REPLY_IMAGE_MAX_BYTES)
+          stat.size > (mode === 'file' ? FILE_LIMIT : REPLY_IMAGE_MAX_BYTES)
         )
           throw fault('UI_IMAGE_ASSET_INVALID');
         const bytes = fs.readFileSync(image.path);
         if (bytes.length !== stat.size || hash(bytes) !== image.sha256) throw fault('UI_IMAGE_ASSET_CHANGED');
         const extension = mode === 'file' ? 'file' : imageKind(bytes),
           fileName = image.fileName ?? path.basename(image.path);
-        if (fileName !== path.basename(fileName) || !fileName) throw fault('UI_IMAGE_ASSET_INVALID');
+        if (mode === 'file' ? !safeFileName(fileName) : fileName !== path.basename(fileName) || !fileName)
+          throw fault('UI_IMAGE_ASSET_INVALID');
         const snapshot = this.#assetPath({ id: deliveryId, extension, fileName });
         noLinks(snapshot);
         fs.mkdirSync(path.dirname(snapshot), { recursive: true, mode: 0o700 });
@@ -441,7 +444,7 @@ export class UiImageOutbox {
           const prior = fs.readFileSync(snapshot);
           if (hash(prior) !== image.sha256) throw fault('UI_IMAGE_ASSET_CHANGED');
         } else {
-          const temporary = snapshot + '.' + crypto.randomUUID() + '.tmp';
+          const temporary = path.join(path.dirname(snapshot), crypto.randomUUID() + '.tmp');
           try {
             fs.writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o600, flush: true });
             fs.renameSync(temporary, snapshot);

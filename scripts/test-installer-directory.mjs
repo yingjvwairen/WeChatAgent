@@ -57,7 +57,7 @@ test('the installer has one native root selector and validates before uninstalli
   assert(!/Page custom|CreateDirRequest|SelectFolderDialog|WcaStoragePage/.test(include));
   assert.match(include, /StrCpy \$0 \$mui\.DirectoryPage\.Directory\s+System::Call 'user32::GetWindowTextW/);
   assert.match(
-    fs.readFileSync(path.join(root, 'scripts/build-installer.mjs'), 'utf8'),
+    fs.readFileSync(path.join(root, 'scripts/installer-package.mjs'), 'utf8'),
     /singleDirectoryTemplate\(assisted\)/,
   );
 });

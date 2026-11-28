@@ -1,3 +1,4 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -87,6 +88,6 @@ export class PolicySnapshots {
     return this.epoch;
   }
   permits(key) {
-    return !this.failure && /^wechat:(private|group):[1-9]\d*$/.test(key ?? '') && this.allowed.has(key);
+    return !this.failure && validChatKey(key ?? '') && this.allowed.has(key);
   }
 }

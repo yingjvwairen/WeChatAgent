@@ -21,12 +21,17 @@ export function compareVersions(a, b) {
   return left.revision - right.revision;
 }
 function metadata(root) {
-  for (const file of ['deployment.json', 'package.json'])
+  const installedRecord = 'config/distribution.json';
+  for (const file of ['deployment.json', installedRecord, 'package.json']) {
     try {
-      const data = JSON.parse(fs.readFileSync(path.join(root, file), 'utf8')),
-        publicVersion = version(data.releaseVersion ?? data.version);
-      if (publicVersion) return { ...data, version: publicVersion.label };
-    } catch {}
+      const data = JSON.parse(fs.readFileSync(path.join(root, file), 'utf8'));
+      if (file === installedRecord && data.installed !== true) continue;
+      const publicVersion = version(data.releaseVersion ?? data.version);
+      if (publicVersion) return { version: publicVersion.label, buildId: data.buildId, builtAt: data.builtAt };
+    } catch {
+      // Check the remaining metadata sources in source and installed workspaces.
+    }
+  }
   return { version: '0.3.6' };
 }
 function sameDownloadUrl(actual, expected) {
@@ -85,43 +90,40 @@ export function createUpdateChecker({ root, fetchImpl = fetch, now = Date.now } 
       if (data.draft || data.prerelease || !version(data.tag_name)) throw Error('UPDATE_RELEASE_INVALID');
       const latestVersion = version(data.tag_name).label,
         tag = encodeURIComponent(data.tag_name);
-      const file = 'WeChatAgent-Setup-' + latestVersion + '-x64.exe',
-        downloadUrl = releaseRoot + 'download/' + tag + '/' + encodeURIComponent(file);
-      const installer = (data.assets ?? []).find(
-        asset =>
-          asset.name === file && asset.state === 'uploaded' && sameDownloadUrl(asset.browser_download_url, downloadUrl),
-      );
-      const comparison = compareVersions(latestVersion, local.version);
-      if (!installer || comparison < 0) return { ...base, status: 'up_to_date', checkedAt: stamp };
-      let sameVersionBuild = false;
-      if (comparison === 0) {
-        const infoUrl = releaseRoot + 'download/' + tag + '/VERIFICATION.json';
-        const info = (data.assets ?? []).find(
+      function assetUrl(name) {
+        const expected = releaseRoot + 'download/' + tag + '/' + encodeURIComponent(name);
+        const uploaded = (data.assets ?? []).some(
           asset =>
-            asset.name === 'VERIFICATION.json' &&
-            asset.state === 'uploaded' &&
-            sameDownloadUrl(asset.browser_download_url, infoUrl),
+            asset.name === name && asset.state === 'uploaded' && sameDownloadUrl(asset.browser_download_url, expected),
         );
-        if (info && local.buildId && local.builtAt) {
-          const result = await request(infoUrl, signal),
-            remote = result.data;
+        return uploaded ? expected : undefined;
+      }
+      const downloadUrl = assetUrl('WeChatAgent-Setup-' + latestVersion + '-x64.exe');
+      const comparison = compareVersions(latestVersion, local.version);
+      if (!downloadUrl || comparison < 0) return { ...base, status: 'up_to_date', checkedAt: stamp };
+      let sameVersionBuild = false;
+      const buildIdPattern = /^[a-f0-9]{16}$/;
+      const localBuildTime = Date.parse(local.builtAt);
+      if (comparison === 0 && buildIdPattern.test(local.buildId) && Number.isFinite(localBuildTime)) {
+        const infoUrl = assetUrl('VERIFICATION-' + latestVersion + '.json') ?? assetUrl('VERIFICATION.json');
+        if (infoUrl) {
+          const { data: remote } = await request(infoUrl, signal);
           sameVersionBuild =
-            result.response.ok &&
             remote?.version === local.version &&
-            /^[a-f0-9]{16}$/.test(remote.buildId ?? '') &&
+            buildIdPattern.test(remote.buildId) &&
             remote.buildId !== local.buildId &&
-            Number.isFinite(Date.parse(remote.builtAt)) &&
-            Date.parse(remote.builtAt) > Date.parse(local.builtAt);
+            Date.parse(remote.builtAt) > localBuildTime;
         }
       }
+      const available = comparison > 0 || sameVersionBuild;
       return {
         ...base,
-        status: comparison > 0 || sameVersionBuild ? 'available' : 'up_to_date',
+        status: available ? 'available' : 'up_to_date',
         latestVersion,
         sameVersionBuild,
         checkedAt: stamp,
         releaseUrl: releaseRoot + 'tag/' + tag,
-        ...(comparison > 0 || sameVersionBuild ? { downloadUrl } : {}),
+        ...(available ? { downloadUrl } : {}),
       };
     } catch {
       return { ...base, status: 'unavailable', checkedAt: stamp };

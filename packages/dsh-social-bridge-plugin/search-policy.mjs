@@ -1,3 +1,4 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import { isWebReadRequest } from './web-reader-policy.mjs';
 import { weatherIntent, weatherRequest } from './weather-query.mjs';
 export const SEARCH_DEFAULTS = Object.freeze({
@@ -29,12 +30,7 @@ export function validateSearchSettings(value) {
     (!value.chats ||
       typeof value.chats !== 'object' ||
       Array.isArray(value.chats) ||
-      Object.entries(value.chats).some(
-        ([key, flag]) =>
-          !/^wechat:(private|group):[1-9]\d{0,15}$/.test(key) ||
-          !Number.isSafeInteger(Number(key.split(':').at(-1))) ||
-          typeof flag !== 'boolean',
-      ))
+      Object.entries(value.chats).some(([key, flag]) => !validChatKey(key) || typeof flag !== 'boolean'))
   )
     throw Error('Invalid search chats');
 }

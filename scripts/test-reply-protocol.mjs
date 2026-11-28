@@ -13,11 +13,32 @@ import { MessageBuffer, replyDeliveryParts } from '../components/qq-bridge/src/c
 import { SocialEngine } from '../components/qq-bridge/src/core/social-engine.js';
 import { ProactiveEngine } from '../components/qq-bridge/src/core/proactive-engine.js';
 import { PROACTIVE_DEFAULTS } from '../components/qq-bridge/src/core/proactive-policy.js';
+import { textSegments } from './onebot-actions.mjs';
+
+test('long model replies fit the desktop transport on grapheme boundaries', () => {
+  const body = '测'.repeat(6000);
+  const split = parseSocialDecision('RESPOND: ' + body, {}, { maxChars: 12000 });
+  assert.equal(split.textParts.join(''), body);
+  for (const text of split.textParts) assert.equal(textSegments([{ type: 'text', data: { text } }]), text);
+
+  const id = 'a'.repeat(64);
+  for (const [reply, options] of [
+    [body, { maxChars: 12000, maxTextParts: 1 }],
+    ['[QUOTE:Q1] ' + body, { maxChars: 12000, quoteRefs: { Q1: id } }],
+    ['a'.repeat(1199) + '👩‍💻', {}],
+  ]) {
+    const result = parseSocialDecision('RESPOND: ' + reply, {}, options);
+    assert.equal(result.decision, 'RESPOND');
+    assert.equal(result.textParts, undefined);
+    assert(result.text.endsWith('…'));
+    assert.equal(textSegments([{ type: 'text', data: { text: result.text } }]), result.text);
+  }
+});
 const key = 'wechat:private:123';
 const message = (id = 'fixture', kind = 'private') => ({
   platform: 'wechat',
   kind,
-  conversation_id: '123',
+  conversation_id: kind === 'group' ? '123@chatroom' : '123',
   sender_id: '456',
   self_id: '99',
   message_id: id,
@@ -164,7 +185,7 @@ test('private and group replies deliver cleaned bodies once and record only actu
     });
     t.after(() => engine.stop());
     const msg = message(kind, kind),
-      chat = 'wechat:' + kind + ':123';
+      chat = 'wechat:' + kind + ':' + msg.conversation_id;
     engine.receive(msg);
     await until(() => f.buffer.unread(chat).length === 0 && !engine.running.has(chat));
     assert.deepEqual(sent, ['第一段', '第二段']);
@@ -361,6 +382,7 @@ import crypto from 'node:crypto';
 import { SOCIAL_VOICE_NOTICE, MAX_VOICE_REPLY_CHARS } from '../components/qq-bridge/src/core/decision-format.js';
 
 test('RESPOND_VOICE parses only when voice is offered and suitable; otherwise valid text stays text', () => {
+  assert.equal(MAX_VOICE_REPLY_CHARS, 400);
   assert.deepEqual(parseSocialDecision('RESPOND_VOICE: 好的，我念给你听。', {}, { allowVoice: true }), {
     decision: 'RESPOND',
     mode: 'voice',
@@ -373,7 +395,13 @@ test('RESPOND_VOICE parses only when voice is offered and suitable; otherwise va
   });
   assert.equal(parseSocialDecision('RESPOND_VOICE: 好的，我念给你听。').mode, undefined);
   assert.equal(parseSocialDecision('RESPOND_VOICE: 好的，我念给你听。').text, '好的，我念给你听。');
-  for (const text of ['链接是 https://example.com/a', '```\nls -la\n```', '长'.repeat(MAX_VOICE_REPLY_CHARS + 1)]) {
+  for (const text of [
+    '链接是 https://example.com/a',
+    'www.example.test',
+    '执行 `npm test`',
+    '```\nls -la\n```',
+    '长'.repeat(MAX_VOICE_REPLY_CHARS + 1),
+  ]) {
     const result = parseSocialDecision('RESPOND_VOICE: ' + text, {}, { allowVoice: true });
     assert.equal(result.decision, 'RESPOND');
     assert.equal(result.mode, undefined);
@@ -394,12 +422,13 @@ test('RESPOND_VOICE parses only when voice is offered and suitable; otherwise va
   );
 });
 
-function voiceEngine(f, { voiceAllowed = true, sendVoice, decide, buffer = f.buffer } = {}) {
+function voiceEngine(f, { voiceAllowed = true, sendVoice, decide, buffer = f.buffer, ...options } = {}) {
   const sent = [],
     voiced = [],
     prompts = [];
   let calls = 0;
   const engine = new SocialEngine({
+    ...options,
     buffer,
     batchMs: 1,
     minIntervalMs: 0,
@@ -414,7 +443,12 @@ function voiceEngine(f, { voiceAllowed = true, sendVoice, decide, buffer = f.buf
       return decide ? decide() : 'RESPOND_VOICE: 我用语音回你。';
     },
     sendVoice: async (target, text, options) => {
-      voiced.push({ text, deliveryId: options.deliveryId, chat: target.conversation_id });
+      voiced.push({
+        text,
+        deliveryId: options.deliveryId,
+        chat: target.conversation_id,
+        receiptOnly: options.receiptOnly,
+      });
       return sendVoice ? sendVoice(voiced.length) : { status: 'confirmed' };
     },
     send: async (_target, text, options) => {
@@ -424,6 +458,16 @@ function voiceEngine(f, { voiceAllowed = true, sendVoice, decide, buffer = f.buf
   });
   return { engine, sent, voiced, prompts, calls: () => calls };
 }
+
+test('authorized assistant tasks can choose a short voice reply', async t => {
+  const f = fixture(t),
+    run = voiceEngine(f, { workModeFor: () => 'assistant', assistantAccess: () => true, assistantBatchMs: 1 });
+  t.after(() => run.engine.stop());
+  run.engine.receive({ ...message('assistant-voice'), sender_wxid: 'fixture-admin' });
+  await until(() => run.voiced.length === 1);
+  assert.match(run.prompts[0], /RESPOND_VOICE/);
+  assert.equal(run.sent.length, 0);
+});
 
 test('a voice turn sends exactly one voice message, no text, and a restart sends nothing more', async t => {
   const f = fixture(t),
@@ -484,7 +528,7 @@ test('a definite synthesis failure falls back to one text message with its own d
 
 test('uncertain or rejected voice deliveries are never replaced by text', async t => {
   for (const [label, sendVoice] of [
-    ['pending', () => ({ status: 'pending' })],
+    ['unconfirmed', () => ({ status: 'unconfirmed' })],
     ['rejected', () => ({ status: 'rejected', error: 'VOICE_NATIVE_REJECTED' })],
     [
       'timeout',
@@ -507,18 +551,38 @@ test('uncertain or rejected voice deliveries are never replaced by text', async 
       1,
       label + ' keeps one delivery ID for receipt checks',
     );
-    if (label === 'pending') assert.equal(run.voiced.length, 3, 'two receipt checks after the first submit');
-    else assert.equal(run.voiced.length, 1, label);
+    assert.equal(run.voiced.length, 1, label);
   }
 });
 
-test('a persisted submitted voice part only re-checks its receipt after restart', async t => {
+test('a slow voice uses one submission and follows its original ID until confirmed', async t => {
+  const f = fixture(t),
+    run = voiceEngine(f, { sendVoice: n => ({ status: n < 5 ? 'pending' : 'confirmed' }) });
+  t.after(() => run.engine.stop());
+  run.engine.receive(message('slow-voice'));
+  await until(() => run.voiced.length === 5 && f.buffer.pendingReplies.size === 0);
+  assert.deepEqual(
+    run.voiced.map(x => x.receiptOnly),
+    [false, true, true, true, true],
+  );
+  assert.equal(new Set(run.voiced.map(x => x.deliveryId)).size, 1);
+  assert.deepEqual(
+    f.buffer
+      .recent(key)
+      .filter(x => x.outgoing)
+      .map(x => x.delivery_status),
+    ['confirmed'],
+  );
+});
+
+test('a persisted long submitted voice part only re-checks its receipt after restart', async t => {
   const f = fixture(t),
     msg = message('voice-restart');
   f.buffer.append(msg);
   const throughId = f.buffer.unread(key)[0].id,
     deliveryId = 'f'.repeat(64);
-  const result = { decision: 'RESPOND', mode: 'voice', text: '重启前已提交的语音' },
+  const text = '重启前已提交的语音。'.repeat(150);
+  const result = { decision: 'RESPOND', mode: 'voice', text },
     parts = replyDeliveryParts(result, deliveryId);
   parts[0].state = 'submitted';
   f.buffer.rememberReply(key, { result, parts, throughId, deliveryId, message: msg, sending: true });
@@ -531,14 +595,14 @@ test('a persisted submitted voice part only re-checks its receipt after restart'
   assert.deepEqual(run.sent, []);
   assert.deepEqual(
     run.voiced.map(item => [item.text, item.deliveryId]),
-    [['重启前已提交的语音', parts[0].deliveryId]],
+    [[text, parts[0].deliveryId]],
   );
   assert.deepEqual(
     restored
       .recent(key)
       .filter(row => row.outgoing)
       .map(row => row.text),
-    ['[语音] 重启前已提交的语音'],
+    ['[语音] ' + text],
   );
 });
 
@@ -557,4 +621,36 @@ test('without a voice-capable backend the prompt has no voice notice and RESPOND
   textRun.engine.receive(message('text-turn'));
   await until(() => textRun.sent.length === 1 && !textRun.engine.running.has(key));
   assert.deepEqual([textRun.sent[0].text, textRun.voiced.length], ['普通文字回复', 0]);
+});
+
+test('the 12000-character assistant budget fits the desktop and survives an outbox restart', t => {
+  const text = 'x'.repeat(12000);
+  const result = parseSocialDecision('RESPOND: ' + text, {}, { maxChars: text.length, maxTextParts: 2 });
+  assert.equal(result.decision, 'RESPOND');
+  assert.deepEqual(
+    result.textParts.map(part => part.length),
+    [10000, 2000],
+  );
+  assert.equal(result.textParts.join(''), text);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-long-reply-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const buffer = new MessageBuffer(path.join(directory, 'messages.json'));
+  const target = { ...message('long'), work_mode: 'assistant' };
+  const row = buffer.append(target);
+  const deliveryId = 'a'.repeat(64);
+  const parts = replyDeliveryParts(result, deliveryId);
+  buffer.rememberReply(key, { result, parts, deliveryId, throughId: row.id, message: target });
+  const restored = new MessageBuffer(buffer.file).pendingReplies.get(key);
+  assert.deepEqual(restored.result, result);
+  assert.deepEqual(restored.parts, parts);
+  const quoted = parseSocialDecision(
+    'RESPOND: [QUOTE:Q1] ' + text,
+    {},
+    {
+      maxChars: text.length,
+      quoteRefs: { Q1: 'a'.repeat(64) },
+    },
+  );
+  assert.equal(quoted.text, 'x'.repeat(9999) + '…');
+  assert.equal(quoted.quoteEventId, 'a'.repeat(64));
 });

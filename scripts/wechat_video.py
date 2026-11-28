@@ -20,6 +20,11 @@ MAX_AUDIO_SECONDS = 300
 SEGMENT_SECONDS = 60
 
 
+class VideoWithoutAudio(RuntimeError):
+    def __init__(self):
+        super().__init__('VOICE_VIDEO_NO_AUDIO')
+
+
 def audio_segment(raw, segment=0):
     if type(segment) is not int or not 0 <= segment < 5:
         raise ValueError('VOICE_SEGMENT_INVALID')
@@ -137,9 +142,11 @@ def decode(raw, count, *, audio=False, metadata_only=False):
         if not 0 < video.width <= 3840 or not 0 < video.height <= 3840 or video.width * video.height > 3840 * 2160:
             raise ValueError('VIDEO_DIMENSIONS_UNSUPPORTED')
         if metadata_only:
-            return seconds
+            return {'durationSeconds': seconds, 'audioPresent': bool(movie.streams.audio)}
         if audio:
-            if len(movie.streams.audio) != 1 or seconds > MAX_AUDIO_SECONDS:
+            if not movie.streams.audio:
+                raise VideoWithoutAudio()
+            if len(movie.streams.audio) != 1:
                 raise ValueError('VOICE_VIDEO_AUDIO_UNAVAILABLE')
             return decode_audio(movie)
         results = []
@@ -200,9 +207,11 @@ def decode_isolated(raw, count, *, audio=False, kind='video'):
         [sys.executable, '-I', '-B', __file__, mode, str(count)],
         input=raw,
         capture_output=True,
-        timeout=10,
+        timeout=3 if mode == 'duration' else 10,
         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
     )
+    if mode == 'audio' and result.returncode == 3:
+        raise VideoWithoutAudio()
     if result.returncode or len(result.stdout) > (MAX_AUDIO_SECONDS * 32000 + 4096 if audio else 5 * 1024 * 1024):
         raise ValueError('VIDEO_DECODE_UNAVAILABLE')
     if audio:
@@ -254,7 +263,7 @@ class VideoPreviews:
             meta = video_metadata(source)
         if not meta or not part and meta != record['video']:
             raise ValueError('VIDEO_MESSAGE_CHANGED')
-        if not self.lock.acquire(timeout=5):
+        if not self.lock.acquire(timeout=0 if metadata_only else 5):
             raise ValueError('VIDEO_PROCESS_BUSY')
         try:
             active()
@@ -277,15 +286,7 @@ class VideoPreviews:
                     thumbnails=part.get('thumbnailHashes', ()),
                 )
             else:
-                try:
-                    raw = bound_bytes(reader.account, talker, meta['hashes'], kind)
-                except ValueError as error:
-                    if str(error) != 'VIDEO_NOT_DOWNLOADED':
-                        raise
-                    names = resource_hints()
-                    if not names:
-                        raise
-                    raw = bound_bytes(reader.account, talker, meta['hashes'], kind, resource_names=names)
+                raw = bound_bytes(reader.account, talker, meta['hashes'], kind, resource_names=resource_hints())
             count = record.get('frameCount', meta['frames'])
             key = (str(reader.account), talker, record['serverId'], hashlib.sha256(raw).digest(), kind, count)
             if metadata_only:
@@ -330,7 +331,7 @@ if __name__ == '__main__':
             json.dumps(
                 [
                     normalize_image(
-                        decode_image_source(raw), animated=mode == 'sticker', max_source_bytes=32 * 1024 * 1024
+                        decode_image_source(raw), animated=True, max_side=2048, max_source_bytes=32 * 1024 * 1024
                     )
                 ]
             ).encode()
@@ -356,5 +357,8 @@ if __name__ == '__main__':
             with av.open(io.BytesIO(raw), format=format, options={'protocol_whitelist': 'pipe'}) as sound:
                 sys.stdout.buffer.write(decode_audio(sound)[0])
     else:
-        decoded = decode(raw, count, audio=mode == 'audio', metadata_only=mode == 'duration')
+        try:
+            decoded = decode(raw, count, audio=mode == 'audio', metadata_only=mode == 'duration')
+        except VideoWithoutAudio:
+            sys.exit(3)
         sys.stdout.buffer.write(decoded[0] if mode == 'audio' else json.dumps(decoded).encode())

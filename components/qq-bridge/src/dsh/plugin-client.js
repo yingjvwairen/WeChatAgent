@@ -1,7 +1,9 @@
 import { formatAssistantTask } from '../../../../packages/dsh-social-bridge-plugin/assistant-tasks.mjs';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { historyQuoteRefs } from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 import { MAX_RPC_BYTES } from '../../../../packages/dsh-social-bridge-plugin/local-policy.mjs';
+import { VOICE_TRANSCRIPTION_TIMEOUT_MS } from '../../../../packages/dsh-social-bridge-plugin/deadline.mjs';
 
 export class DshPluginClient {
   constructor(
@@ -77,7 +79,10 @@ export class DshPluginClient {
       method: 'POST',
       headers: { authorization: 'Bearer ' + this.token, 'content-type': 'application/json' },
       body: JSON.stringify({ conversationKey, id: voice.id, senderWxid }),
-      signal: AbortSignal.any([AbortSignal.timeout(34000), ...(signal ? [signal] : [])]),
+      signal: AbortSignal.any([
+        AbortSignal.timeout(VOICE_TRANSCRIPTION_TIMEOUT_MS + 1000),
+        ...(signal ? [signal] : []),
+      ]),
     });
     const body = await response.json();
     if (!response.ok)
@@ -188,6 +193,7 @@ export class DshPluginClient {
         fallbackMetadata,
         { busyRetries: rejectedVision ? 10 : 0 },
       );
+      if (metadata.allowHistoryQuote) metadata.historyQuoteRefs = fallbackMetadata.historyQuoteRefs;
       return output.split(/STICKER_LABELS:/)[0].trim();
     }
     if (!response.ok || body.error) {
@@ -217,6 +223,7 @@ export class DshPluginClient {
             item.tags.every(tag => typeof tag === 'string' && tag.length <= 16),
         )
         .slice(0, 1);
+    if (metadata.allowHistoryQuote) metadata.historyQuoteRefs = historyQuoteRefs(body.historyQuoteRefs);
     return String(body.text ?? '');
   }
 
@@ -259,14 +266,20 @@ export class DshPluginClient {
       await new Promise(resolve => setTimeout(resolve, this.taskPollMs ?? 1000));
       result = await this.assistantTask(body.conversationKey, 'result', {
         senderWxid: body.senderWxid,
+        rosterGrant: body.rosterGrant,
         taskId: job.id,
       });
       job = result.task;
     }
     if (!job) throw Error('ASSISTANT_TASK_NOT_FOUND');
     if (job.state === 'completed' && !job.output)
-      job = (await this.assistantTask(body.conversationKey, 'result', { senderWxid: body.senderWxid, taskId: job.id }))
-        .task;
+      job = (
+        await this.assistantTask(body.conversationKey, 'result', {
+          senderWxid: body.senderWxid,
+          rosterGrant: body.rosterGrant,
+          taskId: job.id,
+        })
+      ).task;
     if (this.feedback) await notify(job);
     if (job.state === 'completed')
       return new Response(JSON.stringify(job.output ?? { text: 'RESPOND: 任务已完成。' }), { status: 200 });

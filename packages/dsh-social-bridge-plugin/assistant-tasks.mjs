@@ -113,7 +113,12 @@ export class AssistantTasks {
   }
   list(key, sender, { admin = false } = {}) {
     return [...this.jobs.values()]
-      .filter(job => job.key === key && (admin || job.sender === sender))
+      .filter(
+        job =>
+          job.key === key &&
+          (admin || job.sender === sender) &&
+          this.allowed(job.key, job.sender, job.request.rosterGrant),
+      )
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, 20)
       .map(job => this.view(job));
@@ -124,12 +129,12 @@ export class AssistantTasks {
       sender = request.assistantSender,
       batchId = request.batchId;
     if (!/^[a-f0-9]{64}$/.test(batchId ?? '')) throw taskFault('ASSISTANT_BATCH_REQUIRED', 400);
-    if (!this.allowed(key, sender)) throw taskFault('ASSISTANT_SENDER_DENIED', 403);
+    if (!this.allowed(key, sender, request.rosterGrant)) throw taskFault('ASSISTANT_SENDER_DENIED', 403);
     const id =
         'T' +
         crypto
           .createHash('sha256')
-          .update(key + '\0' + sender + '\0' + batchId)
+          .update(JSON.stringify([key, sender, batchId, request.rosterGrant ?? 'legacy']))
           .digest('hex')
           .slice(0, 16),
       prior = this.jobs.get(id);
@@ -139,7 +144,12 @@ export class AssistantTasks {
     let parent;
     if (request.assistantParentId) {
       parent = this.jobs.get(request.assistantParentId);
-      if (!parent || parent.key !== key || parent.sender !== sender)
+      if (
+        !parent ||
+        parent.key !== key ||
+        parent.sender !== sender ||
+        !this.allowed(key, sender, parent.request.rosterGrant)
+      )
         throw taskFault('ASSISTANT_PARENT_NOT_ALLOWED', 403);
       if (liveTask(parent)) throw taskFault('ASSISTANT_PARENT_RUNNING');
     }
@@ -184,10 +194,10 @@ export class AssistantTasks {
         'T' +
         crypto
           .createHash('sha256')
-          .update(key + '\0' + sender + '\0' + request.batchId)
+          .update(JSON.stringify([key, sender, request.batchId, request.rosterGrant ?? 'legacy']))
           .digest('hex')
           .slice(0, 16);
-    if (this.closed || !this.allowed(key, sender) || this.jobs.has(id))
+    if (this.closed || !this.allowed(key, sender, request.rosterGrant) || this.jobs.has(id))
       throw taskFault('ASSISTANT_BACKGROUND_ALREADY_ADMITTED');
     if (this.jobs.size >= 200) {
       const old = [...this.jobs.values()].find(job => terminal.has(job.state));
@@ -278,7 +288,7 @@ export class AssistantTasks {
       if (this.active.size >= this.concurrency) break;
       if (job.state !== 'queued') continue;
       if ([...this.active.keys()].some(id => this.jobs.get(id)?.key === job.key)) continue;
-      if (!this.allowed(job.key, job.sender)) {
+      if (!this.allowed(job.key, job.sender, job.request.rosterGrant)) {
         this.update(job.id, { state: 'cancelled', stage: '权限已收回', finishedAt: this.now() });
         continue;
       }

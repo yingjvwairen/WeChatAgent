@@ -1,9 +1,9 @@
+import { validChatKey } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { notebookHash } from './fish-notebook-policy.mjs';
 const HEX = /^[a-f0-9]{64}$/,
-  KEY = /^wechat:(private|group):[1-9]\d{0,15}$/,
   ID = /^\d{4}-\d{2}-\d{2}-[a-f0-9]{16}$/,
   MAX = 1024 * 1024;
 export function notebookTextValid(text, max = 1000) {
@@ -23,7 +23,7 @@ export class FishNotebookStore {
     this.accountScope = accountScope;
   }
   directory(key) {
-    if (!KEY.test(key ?? '')) throw Error('NOTEBOOK_CHAT_INVALID');
+    if (!validChatKey(key ?? '')) throw Error('NOTEBOOK_CHAT_INVALID');
     return this.safe('fish-notebook', this.accountScope, notebookHash(key));
   }
   safe(...parts) {

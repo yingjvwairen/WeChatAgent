@@ -12,7 +12,7 @@ export class AdapterError extends Error {
 // executor owns submission, server-record matching and exclusive receipt claims.
 export async function deliverDesktopMessage(adapter, request, prepare) {
   const { kind, target, text, quoteEventId, receiptOnly, proactive, media } = request;
-  const deliveryId = request.deliveryId || crypto.randomUUID();
+  const deliveryId = request.deliveryId ?? crypto.randomBytes(32).toString('hex');
   const key = adapter.textDeliveries.key(kind, target, deliveryId, text);
   const lane = kind + ':' + target;
   const uncertain = () =>
@@ -41,6 +41,8 @@ export async function deliverDesktopMessage(adapter, request, prepare) {
     adapter.reload();
     if (!adapter.allowed(kind, target)) throw new AdapterError('CONVERSATION_NOT_ALLOWED');
     const grant = adapter.project.wechat.rosterGrants?.['wechat:' + lane] ?? 'legacy';
+    if (request.expectedRosterGrant !== undefined && request.expectedRosterGrant !== grant)
+      throw new AdapterError('CONVERSATION_GRANT_CHANGED');
     const scope = { account, accountRef: adapter.accountRef, kind, target, rosterGrant: grant };
     const plugin = request.voicePlugin;
     if (
@@ -93,10 +95,6 @@ export async function deliverDesktopMessage(adapter, request, prepare) {
       if (request.observeOnly) throw uncertain();
       if (attempt?.withdrawn) throw new AdapterError('NATIVE_SEND_REJECTED', { rejected: true, attempted: false });
       if (!ownsLane && !acquireLane()) return pending();
-      if (adapter.status.paused) {
-        if (attempt) return pending();
-        throw new AdapterError('INPUT_PAUSED');
-      }
       const proactiveContext = attempt ? attempt.proactive : proactive;
       if (proactiveContext)
         adapter.assertProactive(kind, target, await adapter.messages(target), proactiveContext, { account });

@@ -239,6 +239,11 @@ async function fixture(t, options = {}) {
         };
       },
     };
+  const processes = {
+    spawn() {
+      assert.fail('the console already owns the desktop speech lease');
+    },
+  };
   const context = {
     fixtureConsole: consoleApp,
     process: { pid: process.pid, resourcesPath: root, env: { WECHATAGENT_NODE_EXECUTABLE: process.execPath } },
@@ -247,27 +252,29 @@ async function fixture(t, options = {}) {
     clearTimeout,
     console,
     require: id =>
-      id === 'electron'
-        ? electron
-        : id === './desktop-policy.cjs'
-          ? {
-              projectDirectory: () => root,
-              safeNavigation: () => true,
-              externalWebUrl: () => null,
-              windowPlacement: () => ({ width: 900, height: 620 }),
-            }
-          : id === './appearance.cjs'
-            ? { createAppearanceStore: () => ({ read: () => ({}) }), strengthOf: x => x }
-            : options.packaged && id === './storage-location.cjs'
-              ? fakeStorage
-              : options.packaged && id === './deployment.cjs'
-                ? {
-                    bootstrapDeployment: async (_resources, dataHome, _progress, settings) => {
-                      state.deployments.push({ ...settings });
-                      return { node: process.execPath, root: path.join(dataHome, 'workspace') };
-                    },
-                  }
-                : load(id),
+      id === 'node:child_process'
+        ? processes
+        : id === 'electron'
+          ? electron
+          : id === './desktop-policy.cjs'
+            ? {
+                projectDirectory: () => root,
+                safeNavigation: () => true,
+                externalWebUrl: () => null,
+                windowPlacement: () => ({ width: 900, height: 620 }),
+              }
+            : id === './appearance.cjs'
+              ? { createAppearanceStore: () => ({ read: () => ({}) }), strengthOf: x => x }
+              : options.packaged && id === './storage-location.cjs'
+                ? fakeStorage
+                : options.packaged && id === './deployment.cjs'
+                  ? {
+                      bootstrapDeployment: async (_resources, dataHome, _progress, settings) => {
+                        state.deployments.push({ ...settings });
+                        return { node: process.execPath, root: path.join(dataHome, 'workspace') };
+                      },
+                    }
+                  : load(id),
   };
   vm.runInNewContext(code, context, { filename: path.join(source, 'main.cjs') });
   await until(() => state.windows.some(window => window.loaded) || state.exited);
