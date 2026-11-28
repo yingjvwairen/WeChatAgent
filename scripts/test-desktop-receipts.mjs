@@ -94,6 +94,34 @@ const receiptCases = [
   ],
 ];
 
+test('quoted images and GIFs need both a content match and the exact quoted source', async t => {
+  const f = fixture(t);
+  for (const [type, operation, field] of [
+    [3, 'image', 'imageMd5'],
+    [47, 'sticker', 'stickerMd5'],
+  ]) {
+    const job = {
+      ...f.job,
+      deliveryId: 'quoted-' + operation,
+      operation,
+      path: 'fixture',
+      md5: receiptMd5,
+      quote: { serverId: '555' },
+    };
+    f.setRows([]);
+    await prepare(f, job);
+    await submit(f, job);
+    const body = { localType: type, [field]: receiptMd5 };
+    f.setRows([f.row(body), f.row({ ...body, localId: 2, serverId: '101', quoteSourceServerId: '556' })]);
+    assert.equal((await query(f, job)).confirmed, false);
+    f.setRows([f.row(body), f.row({ ...body, localId: 3, serverId: String(type + 100), quoteSourceServerId: '555' })]);
+    const result = await query(f, job);
+    assert.equal(result.confirmed, true);
+    assert.equal(result.receipt.sourceServerId, '555');
+    assert.equal(result.receipt.localId, '3');
+  }
+});
+
 test('late database rows from the preceding second cannot confirm ordinary sends', async t => {
   const f = fixture(t);
   let nextId = 801;

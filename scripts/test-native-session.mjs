@@ -524,6 +524,155 @@ test('scheduled assistant chat requires its own opt-in and cannot use the task s
   assert.equal(r.calls.model.length, 2);
 });
 
+test('system notices in assistant mode only reach the tool-free chat with the current roster grant', async t => {
+  const f = await fixture(t),
+    peer = 'wxid_fixture',
+    chat = 'wechat:private:' + peer,
+    grant = crypto.randomUUID(),
+    file = path.join(f.dir, 'config/wechatagent.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      wechat: {
+        whitelist: { private: [peer], groups: [] },
+        rosterGrants: { [chat]: grant },
+        workModes: { [chat]: 'assistant' },
+        assistant: { administrators: [] },
+      },
+    }),
+  );
+  const r = await f.start({ requestSeed: { tools: [{ name: 'pwsh', parameters: {} }] } });
+  const body = {
+    ...info,
+    conversationKey: chat,
+    workMode: 'assistant',
+    rosterGrant: grant,
+    systemNotice: true,
+    message: '[系统通知] 对方撤回了一条消息。',
+    batchId: '3'.repeat(64),
+  };
+  await r.request('/followup', body, 403);
+  await r.request('/assistant-chat', { ...body, rosterGrant: 'legacy' }, 403);
+  await r.request('/assistant-chat', { ...body, scheduledChat: true }, 403);
+  await r.request('/assistant-chat', { ...body, systemNotice: undefined }, 403);
+  await r.request('/assistant-chat', body);
+  assert.equal(r.calls.model.length, 1);
+  assert.match(r.calls.model[0], /撤回了一条消息/);
+  assert.equal(r.calls.requests.at(-1).tools.length, 0);
+});
+
+test('assistant tasks, normal chat and system notices read the same delivered WeChat history', async t => {
+  let history;
+  t.after(() => history?.close());
+  const f = await fixture(t),
+    target = '456@chatroom',
+    key = 'wechat:group:' + target,
+    grant = crypto.randomUUID(),
+    admin = 'wxid_admin',
+    file = path.join(f.dir, 'config/wechatagent.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const wechat = {
+    whitelist: { private: [], groups: [target, 'other@chatroom'] },
+    rosterGrants: { [key]: grant, 'wechat:group:other@chatroom': grant },
+    workModes: { [key]: 'assistant' },
+    assistant: { administrators: [admin] },
+    proactive: { enabled: true, chats: { [key]: true }, assistantChats: { [key]: true } },
+    history: { enabled: true, mode: 'window', windowStrategy: 'append', recentMessages: 8, recentChars: 4000 },
+  };
+  const save = () => fs.writeFileSync(file, JSON.stringify({ wechat }));
+  save();
+  const r = await f.start({ requestSeed: { tools: [{ name: 'pwsh', parameters: {} }] } });
+  const base = { ...info, conversationKey: key, workMode: 'assistant', rosterGrant: grant };
+  const task = await r.request('/followup', { ...base, assistantSender: admin, message: 'NATIVE_TASK_ONLY_NOTE' });
+  history = new HistoryStore(f.dir);
+  const timestamp = Math.floor(Date.now() / 1000) - 100;
+  const row = (id, text, offset, fields = {}) => ({
+    id,
+    message_id: id,
+    platform: 'wechat',
+    kind: 'group',
+    conversation_id: target,
+    sender_id: admin,
+    readerGrant: grant,
+    outgoing: false,
+    timestamp: timestamp + offset,
+    text,
+    ...fields,
+  });
+  const previous = row('public-task', '小李入群时请在群里提醒我', 1);
+  history.append(key + ':assistant', previous);
+  history.append(key + ':assistant-chat', { ...previous, id: 'old-backfill-copy' }, { source: 'buffer-backfill' });
+  history.append(
+    key + ':assistant',
+    row('public-result', 'PUBLIC_TASK_RESULT', 2, { outgoing: true, delivery_status: 'confirmed' }),
+  );
+  history.append(
+    key + ':assistant',
+    row('unsent', 'UNCONFIRMED_RESULT', 3, { outgoing: true, delivery_status: 'unconfirmed' }),
+  );
+  history.append(key + ':assistant', row('old-grant', 'OLD_GRANT_MESSAGE', 4, { readerGrant: crypto.randomUUID() }));
+  history.append(
+    'wechat:group:other@chatroom:assistant',
+    row('other', 'OTHER_CHAT_MESSAGE', 5, { conversation_id: 'other@chatroom' }),
+  );
+  history.append(key + ':assistant', row('legacy', 'NATIVE_ARCHIVE_FRAGMENT', 6), { source: 'legacy-context' });
+  const join = row('join', '小李加入了群聊', 8, { sender_id: 'wechat-system', systemNotice: true });
+  history.append(key + ':assistant-chat', join);
+  history.append(key + ':assistant', row('later', 'FUTURE_MESSAGE', 7));
+  const chat = await r.request('/assistant-chat', {
+    ...base,
+    systemNotice: true,
+    historyExcludeIds: [join.id],
+    message: join.text,
+  });
+  assert.notEqual(chat.sessionId, task.sessionId);
+  const shared = r.calls.model.at(-1);
+  assert.equal(shared.split(previous.text).length, 2);
+  assert.match(shared, /小李入群时请在群里提醒我[\s\S]+PUBLIC_TASK_RESULT[\s\S]+小李加入了群聊/);
+  assert.doesNotMatch(
+    shared,
+    /NATIVE_TASK_ONLY_NOTE|UNCONFIRMED_RESULT|OLD_GRANT_MESSAGE|OTHER_CHAT_MESSAGE|NATIVE_ARCHIVE_FRAGMENT|FUTURE_MESSAGE/,
+  );
+  assert.equal(r.calls.requests.at(-1).tools.length, 0);
+
+  history.append(key + ':assistant-chat', row('member', 'PUBLIC_MEMBER_AGREEMENT', 9, { sender_id: 'wxid_member' }));
+  await r.request('/assistant-chat', { ...base, assistantSender: 'wxid_member', message: '刚才助手在群里发了什么？' });
+  assert.match(r.calls.model.at(-1), /PUBLIC_TASK_RESULT/);
+  assert.equal(r.calls.requests.at(-1).tools.length, 0);
+  await r.request('/followup', { ...base, assistantSender: admin, message: '按群里刚才的约定执行' });
+  assert.match(r.calls.model.at(-1), /PUBLIC_MEMBER_AGREEMENT/);
+  assert.doesNotMatch(
+    r.calls.model.at(-1),
+    /UNCONFIRMED_RESULT|OLD_GRANT_MESSAGE|OTHER_CHAT_MESSAGE|NATIVE_ARCHIVE_FRAGMENT/,
+  );
+
+  await r.request('/assistant-chat', { ...base, scheduledChat: true, message: '本机定时主动聊一聊' });
+  assert.match(r.calls.model.at(-1), /PUBLIC_MEMBER_AGREEMENT/);
+  assert.match(r.calls.model.at(-1), /PUBLIC_TASK_RESULT/);
+  assert.equal(r.calls.requests.at(-1).tools.length, 0);
+
+  wechat.workModes[key] = 'social';
+  save();
+  const social = await r.request('/followup', { ...base, workMode: 'social', message: '切回聊天后接着刚才的话题' });
+  assert.notEqual(social.sessionId, task.sessionId);
+  assert.match(r.calls.model.at(-1), /PUBLIC_MEMBER_AGREEMENT/);
+  assert.match(r.calls.model.at(-1), /PUBLIC_TASK_RESULT/);
+  assert.doesNotMatch(r.calls.model.at(-1), /NATIVE_TASK_ONLY_NOTE/);
+
+  const newGrant = crypto.randomUUID();
+  wechat.workModes[key] = 'assistant';
+  wechat.rosterGrants[key] = newGrant;
+  save();
+  await r.request('/assistant-chat', {
+    ...base,
+    rosterGrant: newGrant,
+    assistantSender: 'wxid_member',
+    message: '新授权后的消息',
+  });
+  assert.doesNotMatch(r.calls.model.at(-1), /PUBLIC_MEMBER_AGREEMENT|PUBLIC_TASK_RESULT|小李入群时请在群里提醒我/);
+});
+
 test('chat sessions expose WeChat file tools only for the current sender and roster grant', async t => {
   const f = await fixture(t),
     sender = 'wxid_fixture',

@@ -4,6 +4,8 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Windows.Automation;
+using System.Windows.Automation.Text;
 
 internal static partial class WechatDraftProbe
 {
@@ -317,8 +319,82 @@ internal static partial class WechatDraftProbe
         return proof != null && proof.InputOnly && QtSameTextStep(proof.Step, step) &&
                QtEnterProofMatches(proof, "text", proofId, QtHash(Encoding.UTF8.GetBytes(prefix)), frame, UtcMs());
     }
-    // OCR shared mode types one grapheme while retaining only our own accepted
-    // input prefix. Like fast paste this never reads or overwrites the draft.
+    static ValuePattern QtTypedEditorValue(QtFrame frame, Rect area, out AutomationElement element)
+    {
+        element = null;
+        try
+        {
+            var editor = QtQuoteEditor(frame.Binding);
+            if (!editor.Enabled || (!Contains(editor.Rect, area) && !Contains(area, editor.Rect)))
+                return null;
+            object pattern;
+            if (!editor.Element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern))
+                return null;
+            element = editor.Element;
+            return (ValuePattern)pattern;
+        }
+        catch (Fault)
+        {
+            return null;
+        }
+        catch (ElementNotAvailableException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+        catch (COMException)
+        {
+            return null;
+        }
+    }
+    static string QtReadTypedValue(ValuePattern value, QtFrame frame)
+    {
+        QtInputStable(frame, false);
+        string actual = QtNormalizeText(value.Current.Value);
+        QtInputStable(frame, false);
+        return actual;
+    }
+    static string QtAwaitTypedChange(ValuePattern value, QtFrame frame, string before, string expected)
+    {
+        long deadline = Now() + 450;
+        for (;;)
+        {
+            string actual = QtReadTypedValue(value, frame);
+            if (actual != before && (actual == expected || !expected.StartsWith(actual, StringComparison.Ordinal)))
+                return actual;
+            Need(Now() < deadline, "QT_TYPED_TEXT_ACK_UNCONFIRMED");
+            Thread.Sleep(10);
+        }
+    }
+    static bool QtTypedRepeatedPreviousUnit(string prefix, string actual)
+    {
+        if (prefix.Length == 0 || actual == null || actual.Length != prefix.Length + 1 ||
+            !actual.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+        char repeated = prefix[prefix.Length - 1];
+        var category = Char.GetUnicodeCategory(repeated);
+        return actual[actual.Length - 1] == repeated && !Char.IsSurrogate(repeated) && !Char.IsControl(repeated) &&
+               category != UnicodeCategory.Format && category != UnicodeCategory.NonSpacingMark &&
+               category != UnicodeCategory.SpacingCombiningMark && category != UnicodeCategory.EnclosingMark;
+    }
+    static bool QtTypedCaretAtEnd(AutomationElement editor)
+    {
+        object pattern;
+        if (editor == null || !editor.TryGetCurrentPattern(TextPattern.Pattern, out pattern))
+            return false;
+        var text = (TextPattern)pattern;
+        var selection = text.GetSelection();
+        var document = text.DocumentRange;
+        return selection.Length == 1 &&
+               selection[0].CompareEndpoints(TextPatternRangeEndpoint.Start, document, TextPatternRangeEndpoint.End) ==
+                   0 &&
+               selection[0].CompareEndpoints(TextPatternRangeEndpoint.End, document, TextPatternRangeEndpoint.End) == 0;
+    }
+    // On an editor that exposes its value, confirm the actual write before
+    // advancing the prefix. An OCR-only editor still gets the final readback.
     static object QtTypeText(Dictionary<string, object> request)
     {
         QtEmptyPhaseProof = null;
@@ -336,6 +412,11 @@ internal static partial class WechatDraftProbe
         QtNeedTextAnchors(frame, header, editor);
         Need(QtTypedPrefixMatches(QtPendingEnter, step, text, expected, frame, Text(request, "textEnterProofId")),
              "QT_TYPED_TEXT_PREFIX_CHANGED");
+        string prefix = expected.Substring(0, expected.Length - text.Length);
+        AutomationElement editorElement;
+        var editorValue = QtTypedEditorValue(frame, editor, out editorElement);
+        if (editorValue != null)
+            Need(QtReadTypedValue(editorValue, frame) == prefix, "UI_QT_TYPED_TEXT_MISMATCH");
         QtInputStable(frame);
         QtRevokeEnter();
         QtCurrent = null;
@@ -343,8 +424,31 @@ internal static partial class WechatDraftProbe
         var report = Data("performed", true, "attempted", true, "revision", frame.Revision, "typeApplied", true,
                           "readbackPerformed", false, "intendedText", expected, "clipboardAccessed", false,
                           "interrupted", false);
+        bool repairing = false;
         try
         {
+            if (editorValue != null)
+            {
+                string actual = QtAwaitTypedChange(editorValue, frame, prefix, expected);
+                if (actual != expected && QtTypedRepeatedPreviousUnit(prefix, actual) &&
+                    QtTypedCaretAtEnd(editorElement) && QtReadTypedValue(editorValue, frame) == actual)
+                {
+                    // Only remove the last duplicated character from this
+                    // exact, checked write. Clear its Unicode key state
+                    // before entering the intended character once.
+                    repairing = true;
+                    SendEvents(new[] { Key(0x08, 0), Key(0x08, 2) });
+                    Need(QtAwaitTypedChange(editorValue, frame, actual, prefix) == prefix, "UI_QT_TYPED_TEXT_MISMATCH");
+                    SendEvents(new[] { Key(0, prefix[prefix.Length - 1], 6) });
+                    QtInputStable(frame, false);
+                    SendEvents(events);
+                    actual = QtAwaitTypedChange(editorValue, frame, prefix, expected);
+                    report["typingCorrected"] = true;
+                }
+                Need(actual == expected, "UI_QT_TYPED_TEXT_MISMATCH");
+                report["readbackPerformed"] = true;
+                report["draft"] = actual;
+            }
             QtInputStable(frame, false);
             QtAttachEnterProof(report, "text", expected, frame,
                                new List<QtAnchor> { new QtAnchor { Rect = header }, new QtAnchor { Rect = editor } },
@@ -352,7 +456,7 @@ internal static partial class WechatDraftProbe
         }
         catch (Exception)
         {
-            if (Stopping || Interlocked.Read(ref Revision) == frame.Revision)
+            if (repairing || Stopping || Interlocked.Read(ref Revision) == frame.Revision)
                 throw;
             var proof = new QtEnterProof { Id = Guid.NewGuid().ToString("N"),
                                            Kind = "text",

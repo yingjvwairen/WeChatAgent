@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { wechatServerEventId } from '../../packages/wechat-identity.mjs';
 import { archiveDelivery, readArchivedDelivery, boundedDeliveryNames, deliverySequence } from './delivery-archive.mjs';
 import { clipboardBackupDiagnostic, clipboardBackupRefusal } from './clipboard-backup-diagnostic.mjs';
 import { acquireDeliveryLock } from './delivery-lock.mjs';
@@ -83,18 +84,14 @@ const mediaQuoteKinds = new Set(['image', 'voice', 'video', 'sticker', 'link', '
 const titledQuoteKinds = new Set(['text', 'link', 'file', 'record', 'quote', 'card']);
 
 export function validUiQuote(quote, target) {
+  const sourceId = wechatServerEventId(target, quote?.serverId);
   if (
     !plain(quote) ||
-    typeof quote.serverId !== 'string' ||
-    !/^[1-9][0-9]{0,19}$/.test(quote.serverId) ||
+    !sourceId ||
     !identifier(quote.sender) ||
     !integer(quote.timestamp) ||
     !validText(quote.text, 4000) ||
-    quote.id !==
-      crypto
-        .createHash('sha256')
-        .update(target + '\0' + quote.serverId)
-        .digest('hex')
+    quote.id !== sourceId
   )
     return false;
   if (!Object.hasOwn(quote, 'kind'))

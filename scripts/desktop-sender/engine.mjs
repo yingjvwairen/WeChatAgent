@@ -397,6 +397,8 @@ export class DesktopSenderEngine {
   async admit(operation, payload, admissionDeadlineAt) {
     if (!['text', 'voice', 'image', 'sticker', 'file'].includes(operation))
       throw fault('DESKTOP_OPERATION_UNSUPPORTED');
+    if (payload.quote !== undefined && !['text', 'image', 'sticker'].includes(operation))
+      throw Object.assign(fault('INPUT_QUOTE_UNAVAILABLE'), { attempted: false });
     if (operation === 'text') {
       payload = { ...payload, text: normalizeDesktopText(payload.text) };
       if (!validDesktopText(payload.text)) throw Object.assign(fault('DESKTOP_TEXT_INVALID'), { attempted: false });
@@ -536,6 +538,7 @@ export class DesktopSenderEngine {
           target: job.target,
           image: { path: job.path, sha256: job.sha256, ...(job.fileName ? { fileName: job.fileName } : {}) },
           mode: job.operation === 'file' ? 'file' : 'image',
+          ...(job.quote ? { quote: job.quote } : {}),
           selectionScope: row.scope,
         });
     } catch (error) {

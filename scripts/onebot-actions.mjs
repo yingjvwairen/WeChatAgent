@@ -93,6 +93,11 @@ export async function executeOnebotAction(adapter, request) {
       if (!validChatId(kind, target)) fail('CONVERSATION_NOT_ALLOWED');
       const deliveryId = params.wechatagent_delivery_id;
       if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) fail('INVALID_DELIVERY_ID');
+      const quoted = Array.isArray(params.message) && params.message[0]?.type === 'reply';
+      const sourceId = quoted ? params.message[0].data?.id : undefined;
+      if (quoted && (typeof sourceId !== 'string' || !/^[a-f0-9]{64}$/.test(sourceId))) fail('INVALID_QUOTE_SOURCE');
+      const message = quoted ? params.message.slice(1) : params.message;
+      const sticker = Array.isArray(message) && message.length === 1 && message[0]?.type === 'wechat_sticker';
       if (params.wechatagent_receipt_only !== undefined && typeof params.wechatagent_receipt_only !== 'boolean')
         fail('INVALID_RECEIPT_QUERY');
       if (
@@ -109,14 +114,7 @@ export async function executeOnebotAction(adapter, request) {
         )
       )
         fail('INVALID_DELIVERY_DEADLINE');
-      if (
-        params.wechatagent_receipt_only === true &&
-        (!deliveryId ||
-          !Array.isArray(params.message) ||
-          params.message.length !== 1 ||
-          params.message[0]?.type !== 'wechat_sticker')
-      )
-        fail('INVALID_RECEIPT_QUERY');
+      if (params.wechatagent_receipt_only === true && (!deliveryId || !sticker)) fail('INVALID_RECEIPT_QUERY');
       if (!receiptLookup && !adapter.allowed(kind, target)) fail('CONVERSATION_NOT_ALLOWED');
       if (params.wechatagent_source !== undefined && params.wechatagent_source !== 'proactive')
         fail('INVALID_SEND_SOURCE');
@@ -142,14 +140,11 @@ export async function executeOnebotAction(adapter, request) {
                 : {}),
             }
           : null;
-      if (
-        Array.isArray(params.message) &&
-        params.message.length === 1 &&
-        params.message[0]?.type === 'wechat_sticker'
-      ) {
-        data = await adapter.sendSticker(kind, target, String(params.message[0].data?.id ?? ''), {
+      if (sticker) {
+        data = await adapter.sendSticker(kind, target, String(message[0].data?.id ?? ''), {
           deliveryId,
           proactive,
+          ...(sourceId ? { quoteEventId: sourceId } : {}),
           receiptOnly: params.wechatagent_receipt_only === true,
           deadlineAt: params.wechatagent_deadline_at,
           admissionDeadlineAt: params.wechatagent_admission_deadline_at,
@@ -159,10 +154,7 @@ export async function executeOnebotAction(adapter, request) {
           reserveAdmission: receiptLookup ? reserveAdmission : undefined,
         });
       } else {
-        const reply = Array.isArray(params.message) && params.message[0]?.type === 'reply';
-        const sourceId = reply ? params.message[0].data?.id : undefined;
-        if (reply && (typeof sourceId !== 'string' || !/^[a-f0-9]{64}$/.test(sourceId))) fail('INVALID_QUOTE_SOURCE');
-        const text = textSegments(reply ? params.message.slice(1) : params.message);
+        const text = textSegments(message);
         data = await adapter.send(
           kind,
           target,

@@ -84,6 +84,7 @@ export class RealtimeReplies {
       path.basename(this.file(record.id)) !== path.basename(file) ||
       !['deciding', 'decided', 'sent', 'failed', 'forward'].includes(record.stage) ||
       !validChatId(record.kind, record.target) ||
+      (record.workMode !== undefined && !['assistant', 'social'].includes(record.workMode)) ||
       (record.observeOnly !== undefined && record.observeOnly !== true) ||
       (record.naturalGroupEpoch !== undefined && !validGroupWakeEpoch(record.naturalGroupEpoch)) ||
       (record.mode !== undefined && !['voice', 'text'].includes(record.mode)) ||
@@ -370,6 +371,7 @@ export class RealtimeReplies {
       rosterGrant: input.rosterGrant,
       rawid: input.rawid,
       input: input.voiceId ? 'voice' : 'text',
+      workMode: input.workMode ?? 'social',
       sender: String(input.sender ?? ''),
       mentioned: input.mentioned === true,
       ...(input.naturalGroupEpoch ? { naturalGroupEpoch: input.naturalGroupEpoch } : {}),
@@ -386,6 +388,7 @@ export class RealtimeReplies {
       const synthesis = this.voiceSend.synthesis;
       const selected = synthesis.selected(key, dialogueFeature);
       record.voicePlugin = this.voiceSend.pluginGrant(capability, kind, target, selected, dialogueFeature);
+      if (record.workMode === 'assistant') record.voicePlugin.realtimeId = id;
       if (!capability.voice && !capability.text)
         throw Object.assign(new Error('VOICE_REALTIME_NO_REPLY_FORM'), { code: 'VOICE_REALTIME_NO_REPLY_FORM' });
       reply = await synthesis.generate({
@@ -395,6 +398,10 @@ export class RealtimeReplies {
         feature: dialogueFeature,
         voiceAllowed: capability.voice,
         textAllowed: capability.text,
+        beforeInvoke: () => {
+          if (!permitted(record))
+            throw Object.assign(Error('VOICE_TTS_PERMISSION_CHANGED'), { code: 'VOICE_TTS_PERMISSION_CHANGED' });
+        },
         ...(input.voiceId ? { voiceId: input.voiceId } : { text: input.text }),
       });
       if (reply.mode === 'voice' && !suitableForAutomaticVoice(reply.text)) {
@@ -437,6 +444,39 @@ export class RealtimeReplies {
       this.audioBytes += reply.wav.length;
     }
     return record;
+  }
+
+  permitsAssistantDelivery(job) {
+    const { realtimeId } = job.voicePlugin;
+    if (!/^realtime-[a-f0-9]{64}$/.test(realtimeId ?? '')) return false;
+    let record;
+    try {
+      record = this.load(realtimeId);
+    } catch {
+      return false;
+    }
+    if (
+      record?.workMode !== 'assistant' ||
+      record.input !== 'voice' ||
+      record.stage !== 'decided' ||
+      record.observeOnly ||
+      !this.matchesAccount(record) ||
+      record.accountRef !== job.accountRef ||
+      record.rosterGrant !== job.rosterGrant ||
+      record.kind !== job.kind ||
+      record.target !== job.target ||
+      record.voicePlugin?.realtimeId !== realtimeId ||
+      record.voicePlugin.feature !== dialogueFeature ||
+      record.voicePlugin.id !== job.voicePlugin.id ||
+      record.voicePlugin.generation !== job.voicePlugin.generation
+    )
+      return false;
+    const text = record.mode === 'text' || record.fallback === 'text';
+    return (
+      job.operation === (text ? 'text' : 'voice') &&
+      job.parentId === (text ? textDeliveryId(record) : record.id) &&
+      this.adapter.realtimePermitted(record)(record)
+    );
   }
 
   async deliver(record, permitted) {

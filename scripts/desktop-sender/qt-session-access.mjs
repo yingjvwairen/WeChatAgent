@@ -63,6 +63,7 @@ const attachment = /** @type {const} */ ([
   'resetInputSession',
   'root',
   'textResume',
+  'textStepBinding',
 ]);
 export const attachmentAccess = owner => view(owner, attachment);
 const voice = /** @type {const} */ ([

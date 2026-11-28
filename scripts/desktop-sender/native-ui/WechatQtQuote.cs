@@ -1212,7 +1212,8 @@ internal static partial class WechatDraftProbe
             string action = Text(request, "action");
             bool firstInput =
                 (action == "paste" || action == "typeText") && Text(request, "expectedText") == Text(request, "text");
-            if (frame != null && frame.MetadataOnly && (action == "submitTextEnter" || firstInput))
+            if (frame != null && frame.MetadataOnly &&
+                (action == "submitTextEnter" || action == "pasteUiaImage" || action == "submitUiaImage" || firstInput))
                 Need(QtQuoteInputClear(QtQuoteEditor(frame.Binding), false), "QT_QUOTE_DRAFT_PRESENT");
             return;
         }

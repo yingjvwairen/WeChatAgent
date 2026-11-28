@@ -97,6 +97,7 @@ export class ProactiveEngine {
     buffer,
     social,
     taskContext,
+    historyFor,
     settingsFor,
     personaFor,
     decide,
@@ -113,6 +114,7 @@ export class ProactiveEngine {
       buffer,
       social,
       taskContext,
+      historyFor,
       settingsFor,
       personaFor,
       decide,
@@ -418,9 +420,8 @@ export class ProactiveEngine {
         images: [],
         batchId: job.id,
         ...connection?.metadata(),
-        ...(this.taskContext
-          ? { workMode: 'assistant', assistantChatOnly: true, scheduledChat: true, rosterGrant }
-          : {}),
+        rosterGrant,
+        ...(this.taskContext ? { workMode: 'assistant', assistantChatOnly: true, scheduledChat: true } : {}),
         searchOptOut: mode === 'greeting' || !policy.useSearch || search?.status === 'unavailable',
       };
       if (search?.status === 'ready') {
@@ -442,7 +443,7 @@ export class ProactiveEngine {
       const prompt =
         buildProactivePrompt({
           key,
-          rows,
+          rows: this.historyFor?.(key, rosterGrant) ?? rows,
           mode: job.mode,
           now: this.now(),
           searchStatus: search?.status,

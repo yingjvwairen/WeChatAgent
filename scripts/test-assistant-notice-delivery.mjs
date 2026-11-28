@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { WechatOneBotAdapter } from '../components/qq-bridge/src/adapters/wechat/wechat-onebot-adapter.js';
 import { createAssistantNoticeDelivery } from '../components/qq-bridge/src/core/assistant-notice-delivery.js';
+import { MessageBuffer } from '../components/qq-bridge/src/core/message-buffer.js';
 import { assistantNotificationText } from '../components/qq-bridge/src/core/decision-format.js';
 import { AssistantNotifications } from '../packages/dsh-social-bridge-plugin/assistant-notifications.mjs';
 import { AssistantFeedback } from '../packages/dsh-social-bridge-plugin/assistant-feedback.mjs';
@@ -27,6 +28,7 @@ function fixture(t) {
   const controls = new ReplyDeliveryControls(root, 'legacy');
   const queue = new AssistantNotifications(path.join(root, 'notices.json'), () => true),
     adapter = new WechatOneBotAdapter(),
+    buffer = new MessageBuffer(path.join(root, 'messages.json')),
     sent = [],
     logs = [],
     requests = [];
@@ -47,6 +49,7 @@ function fixture(t) {
     delivery = createAssistantNoticeDelivery({
       adapter,
       plugin,
+      buffer,
       settingsFor: () => w,
       deliveryControls: controls,
       log: line => logs.push(line),
@@ -54,7 +57,7 @@ function fixture(t) {
   t.after(() => delivery.stop());
   const add = (extra = {}) =>
     queue.queue({ id: 'schedule-' + Object.keys(queue.messages).length, key, sender, kind: 'result', text, ...extra });
-  return { root, w, save, controls, queue, adapter, sent, logs, requests, plugin, delivery, add };
+  return { root, w, save, controls, queue, buffer, adapter, sent, logs, requests, plugin, delivery, add };
 }
 
 test('scheduled text survives stale sticker hints, reaches the real adapter contract, and acknowledges once', async t => {
@@ -67,6 +70,11 @@ test('scheduled text survives stale sticker hints, reaches the real adapter cont
   assert.equal(f.sent[0].params.message[0].data.text, '时间到，该喝水了。');
   assert.equal(f.sent[0].params.wechatagent_delivery_id, id);
   assert.equal(f.queue.messages[id].state, 'delivered');
+  const recorded = f.buffer.findReplyPart(key, id);
+  assert.equal(recorded.text, '时间到，该喝水了。');
+  assert.equal(recorded.readerGrant, 'legacy');
+  assert.equal(recorded.work_mode, 'assistant');
+  assert.equal(recorded.delivery_status, 'confirmed');
   await f.delivery.tick();
   assert.equal(f.sent.length, 1);
   assert(f.logs.some(line => line.includes('notification_delivery=confirmed')));
@@ -103,6 +111,7 @@ test('unconfirmed or missing server receipts never acknowledge a scheduled notic
   await f.delivery.tick();
   assert.equal(f.queue.messages[id].state, 'queued');
   assert.equal(f.requests.filter(item => item.action === 'notification-ack').length, 0);
+  assert.equal(f.buffer.findReplyPart(key, id), undefined);
 });
 
 test('a queued notice loses native input permission when its task administrator is revoked', async t => {

@@ -59,7 +59,13 @@ function describeForegroundCommand({ client, sequence, action, role, startedAt, 
     return undefined;
   const preflight = action === 'inspectFocusHandoff';
   const refusal = preflight && result?.ready === false && !preflightWaits.has(result.reason);
-  if (!foregroundCommands.has(action) && !refusal && !(error && (preflight || preparationCommands.has(action))))
+  const typingCorrected = action === 'typeText' && result?.typingCorrected === true;
+  if (
+    !foregroundCommands.has(action) &&
+    !refusal &&
+    !typingCorrected &&
+    !(error && (preflight || preparationCommands.has(action)))
+  )
     return undefined;
   const outcome = error ?? result;
   const confirmation = focusConfirmationDiagnostic(outcome?.focusConfirmation);
@@ -93,6 +99,7 @@ function describeForegroundCommand({ client, sequence, action, role, startedAt, 
     client,
     sequence,
     action,
+    ...(typingCorrected ? { typingCorrected: true } : {}),
     ...(['editor', 'search'].includes(role) ? { role } : {}),
     elapsedMs: Math.max(0, finishedAt - startedAt),
     outcome: error ? 'error' : refusal ? 'preflight-refused' : 'completed',

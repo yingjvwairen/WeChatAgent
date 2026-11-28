@@ -11,7 +11,7 @@ import { validReplyMessageLimit } from '../../../../packages/dsh-social-bridge-p
 import { verifiedAssistantSender } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import { validQuoteRefs, nativeQuoteKind } from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 import { validGroupWakeEpoch } from '../../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
-import { TERMINAL_DELIVERY_STATES } from '../../../../packages/delivery-contract.mjs';
+import { replyDeliveryStatus, replySentAt, TERMINAL_DELIVERY_STATES } from '../../../../packages/delivery-contract.mjs';
 import { validReaderOrder } from '../../../../packages/wechat-identity.mjs';
 
 export function replyDeliveryParts(result, deliveryId) {
@@ -38,13 +38,8 @@ export function replyDeliveryParts(result, deliveryId) {
 
 function validQuotedDecision(result) {
   if (result.quoteEventId === undefined) return true;
-  return (
-    /^[a-f0-9]{64}$/.test(result.quoteEventId) &&
-    result.decision === 'RESPOND' &&
-    result.mode !== 'voice' &&
-    !result.stickerId &&
-    !result.textParts
-  );
+  if (!/^[a-f0-9]{64}$/.test(result.quoteEventId) || result.mode || result.textParts) return false;
+  return result.decision === 'STICKER' ? result.text === '' : !result.stickerId;
 }
 
 function replyTextLimit(item) {
@@ -232,6 +227,7 @@ export class MessageBuffer {
           !/^[a-f0-9]{64}$/.test(id) ||
           item?.part?.deliveryId !== id ||
           !/^[a-f0-9]{64}$/.test(item.part.stickerId ?? '') ||
+          (item.part.quoteEventId !== undefined && !/^[a-f0-9]{64}$/.test(item.part.quoteEventId)) ||
           !['queued', 'sending', 'submitted', 'confirmed'].includes(item.part.state) ||
           (item.observeOnly !== undefined && typeof item.observeOnly !== 'boolean') ||
           (item.retiredAt !== undefined && (!Number.isSafeInteger(item.retiredAt) || item.retiredAt < 1)) ||
@@ -307,6 +303,7 @@ export class MessageBuffer {
     if (validReaderOrder(message.readerOrder)) row.readerOrder = message.readerOrder;
     if (message.readerReplay === 'context' || message.readerReplay === 'reply') row.readerReplay = message.readerReplay;
     if (message.contextOnly === true) row.contextOnly = true;
+    if (message.platform === 'wechat' && message.systemNotice === true) row.systemNotice = true;
     if (message.attachmentUnavailable === true) row.attachmentUnavailable = true;
     if (!outgoing) {
       const quoteKind = nativeQuoteKind(message);
@@ -607,6 +604,16 @@ export class MessageBuffer {
   findReplyPart(key, deliveryId) {
     return this.chats.get(key)?.find(row => row.outgoing && row.delivery_id === deliveryId);
   }
+  recordConfirmedText(message, deliveryId, text, delivery) {
+    if (replyDeliveryStatus(delivery) !== 'confirmed') return;
+    const at = replySentAt(delivery);
+    this.recordReplyPart(
+      buildConversationKey(message.platform, message.kind, message.conversation_id),
+      { deliveryId },
+      { ...message, sender_id: message.self_id, text, timestamp: at / 1000, delivery_status: 'confirmed' },
+      { inSendOrder: delivery.sentAt === at, receiptOrder: delivery.readerOrder },
+    );
+  }
   recordReplyPart(key, item, outgoing, { inSendOrder = false, receiptOrder } = {}) {
     const rows = this.chats.get(key) ?? [];
     if (outgoing) {
@@ -635,6 +642,8 @@ export class MessageBuffer {
         ...(outgoing.work_mode ? { work_mode: outgoing.work_mode } : {}),
         ...(/^[a-f0-9]{64}$/.test(outgoing.sticker_id ?? '') ? { sticker_id: outgoing.sticker_id } : {}),
       };
+      if (row.readerGrant === undefined && typeof outgoing.readerGrant === 'string')
+        row.readerGrant = outgoing.readerGrant;
       const hasReceiptOrder =
         !row.readerOrder &&
         outgoing.delivery_status === 'confirmed' &&

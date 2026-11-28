@@ -124,7 +124,7 @@ export class WechatOneBotAdapter extends BaseAdapter {
       observeOnly: true,
     };
     if (part.stickerId) {
-      const result = await this.sendSticker({ ...scope, id: part.stickerId });
+      const result = await this.sendSticker({ ...scope, id: part.stickerId, quoteEventId: part.quoteEventId });
       if (replyDeliveryStatus(result) === 'pending') return { status: 'pending' };
       return {
         status: replyDeliveryStatus(result),
@@ -264,6 +264,7 @@ export class WechatOneBotAdapter extends BaseAdapter {
     kind,
     target,
     id,
+    quoteEventId,
     deliveryId,
     rosterGrant,
     receiptOnly = false,
@@ -273,11 +274,16 @@ export class WechatOneBotAdapter extends BaseAdapter {
     observeOnly = false,
   }) {
     if (!validChatId(kind, target) || !/^[a-f0-9]{64}$/.test(id)) throw new TypeError('invalid sticker target');
+    if (quoteEventId !== undefined && (!deliveryId || !/^[a-f0-9]{64}$/.test(quoteEventId)))
+      throw new TypeError('invalid quote source');
     let result;
     try {
       result = await this.server.action(kind === 'group' ? 'send_group_msg' : 'send_private_msg', {
         [kind === 'group' ? 'group_id' : 'user_id']: target,
-        message: [{ type: 'wechat_sticker', data: { id } }],
+        message: [
+          ...(quoteEventId ? [{ type: 'reply', data: { id: quoteEventId } }] : []),
+          { type: 'wechat_sticker', data: { id } },
+        ],
         ...(deliveryId ? { wechatagent_delivery_id: deliveryId } : {}),
         ...(rosterGrant === undefined ? {} : { wechatagent_roster_grant: rosterGrant }),
         ...(receiptOnly ? { wechatagent_receipt_only: true } : {}),

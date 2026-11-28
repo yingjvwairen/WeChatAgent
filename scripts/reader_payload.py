@@ -2,14 +2,13 @@
 
 import hashlib
 import json
-import re
 import xml.etree.ElementTree as ET
 from reader_message_rows import server_event_id
 from wechat_files import FILE_TYPE, parse_file_message
 from wechat_voice_input import voice_info
 from wechat_video import video_metadata
 from wechat_quote_locator import link_or_file
-from wechat_extra_card import card_text, parse_extra_card, parse_link_card, parse_other_message
+from wechat_extra_card import card_text, is_system_message, parse_extra_card, parse_link_card, parse_other_message
 from wechat_forwarded import FORWARD_TYPE, parse_forwarded_record
 from wechat_quote import QUOTE_TYPE, parse_quote_reply
 from wechat_sticker import sticker_image_xml
@@ -19,9 +18,11 @@ from wechat_identity import group_username, valid_chat_id
 PAT_TYPE = (62 << 32) | 49
 
 
-def parse_pat(content, sender, own_wxid):
+def parse_pat(content, sender):
     """System pats may omit the DB sender; validate their XML actor/target."""
-    if not content or len(content) > 100_000 or '<!DOCTYPE' in content.upper() or '<!ENTITY' in content.upper():
+    if not isinstance(content, str) or not content or len(content) > 100_000:
+        return None
+    if '<!DOCTYPE' in content.upper() or '<!ENTITY' in content.upper():
         return None
     try:
         root = ET.fromstring(content)
@@ -30,8 +31,7 @@ def parse_pat(content, sender, own_wxid):
         if app is None or app.findtext('type') != '62' or info is None:
             return None
         actor, target = info.findtext('fromusername', ''), info.findtext('pattedusername', '')
-        own = own_wxid
-        if not actor or (sender and actor != sender) or actor == own or target != own:
+        if not valid_chat_id('private', actor) or not valid_chat_id('private', target) or (sender and actor != sender):
             return None
         return {'actor': actor, 'target': target}
     except ET.ParseError:
@@ -39,18 +39,24 @@ def parse_pat(content, sender, own_wxid):
 
 
 def push_payload(talker, message, names, own_wxid):
-    if not valid_chat_id('group' if group_username(talker) else 'private', talker):
+    group = group_username(talker)
+    if not valid_chat_id('group' if group else 'private', talker):
         return None
     sender = message.get('senderUsername', '')
-    if message.get('isSend'):
-        return None
     kind = message.get('localType')
     if type(kind) is not int or not 0 <= kind < 2**64:
         return None
-    pat = parse_pat(message.get('fullText', ''), sender, own_wxid) if kind == PAT_TYPE else None
-    if kind == PAT_TYPE and not pat:
+    system_row = is_system_message(kind, message.get('fullText', ''))
+    if message.get('isSend') and not (system_row or kind == PAT_TYPE):
         return None
-    if pat:
+    pat = parse_pat(message.get('fullText', ''), sender) if kind == PAT_TYPE else None
+    if kind == PAT_TYPE and (not pat or not group and not {pat['actor'], pat['target']} <= {talker, own_wxid}):
+        return None
+    directed_pat = pat and pat['target'] == own_wxid and pat['actor'] != own_wxid and not message.get('isSend')
+    system_notice = system_row or bool(pat and not directed_pat)
+    if system_notice:
+        sender = 'wechat-system'
+    elif directed_pat:
         sender = pat['actor']
     if sender and sender == own_wxid:
         return None
@@ -80,14 +86,14 @@ def push_payload(talker, message, names, own_wxid):
         or kind in (49, APPMSG_STICKER_TYPE)
         and sticker_image_xml(kind, message.get('fullText', '')) is not None
     )
-    card = parse_extra_card(kind, message.get('fullText', ''))
+    card = parse_extra_card(kind, message.get('fullText', '')) if not pat else None
     link = parse_link_card(kind, message.get('fullText', ''))
     other = None
     if kind not in (1, 3, 34, 43, 62) and not any((sticker, card, link, pat, file_display, forwarded, quote_reply)):
         other = parse_other_message(kind, message.get('fullText', ''))
     # Unsupported cards/notices contribute display-only context. In particular,
     # a system row without a person as sender must never become an assistant task.
-    context_only = other is not None or card is not None and card['label'] == '应用卡片'
+    context_only = system_notice or other is not None or card is not None and card['label'] == '应用卡片'
     if not sender and context_only:
         sender = 'wechat-system'
     if not sender:
@@ -102,6 +108,8 @@ def push_payload(talker, message, names, own_wxid):
         else '[表情包：附件为静态画面或动画采样画面]'
         if sticker
         else '[拍一拍] 对方刚刚拍了拍你。'
+        if directed_pat
+        else '[拍一拍] 聊天中发生了拍一拍。'
         if pat
         else '[合并转发聊天记录] ' + forwarded['title']
         if forwarded
@@ -125,7 +133,6 @@ def push_payload(talker, message, names, own_wxid):
         )
     if not content.strip():
         return None
-    group = group_username(talker)
     rawid = server_event_id(talker, message.get('serverId'))
     # Local notices and pats can permanently lack a server ID. Use the physical
     # row throughout their lifetime, even if the server later acknowledges it.
@@ -140,12 +147,21 @@ def push_payload(talker, message, names, own_wxid):
         **({key: message[key] for key in ('mentionsSelf', 'mentionsAll') if key in message} if group else {}),
         'groupName': names.get(talker, talker) if group else '',
         'sourceName': names.get(sender, sender) if group else names.get(talker, talker),
-        'senderName': names.get(sender, sender),
+        'senderName': '微信系统' if system_notice else names.get(sender, sender),
         'talkerId': sender,
         'content': content.encode('utf-8')[:16000].decode('utf-8', 'ignore') if kind == 1 else content[:4000],
-        'type': FILE_TYPE if file_info else 1 if file_display or card or link or other else 47 if sticker else kind,
+        'type': (
+            FILE_TYPE
+            if file_info
+            else 1
+            if system_notice or file_display or card or link or other
+            else 47
+            if sticker
+            else kind
+        ),
         'timestamp': message.get('createTime', 0),
         **({'contextOnly': True} if context_only else {}),
+        **({'systemNotice': True} if system_notice else {}),
         **({'attachmentUnavailable': True} if is_video and not video else {}),
         **(
             {
@@ -200,7 +216,7 @@ def push_payload(talker, message, names, own_wxid):
             if video
             else {}
         ),
-        **({'pat': pat} if pat else {}),
+        **({'pat': pat} if directed_pat else {}),
         **({'forwardedRecord': forwarded} if forwarded else {}),
         **(
             {

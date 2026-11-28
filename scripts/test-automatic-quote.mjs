@@ -11,6 +11,7 @@ import { HistoryStore } from '../packages/dsh-social-bridge-plugin/history-store
 import { bindHistory } from '../packages/dsh-social-bridge-plugin/history-runtime.mjs';
 import { quotedHistoryMatches } from '../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 import { parseSocialDecision } from '../components/qq-bridge/src/core/decision-format.js';
+import { readerEvent } from './onebot-events.mjs';
 
 const key = 'wechat:private:123';
 const sourceId = 'a'.repeat(64);
@@ -124,6 +125,46 @@ test('automatic recent quote reaches native reply segment without leaking the co
     { type: 'text', data: { text: '好，周六见。' } },
   ]);
   assert.equal(buffer.recent(key).find(row => row.outgoing).text, '好，周六见。');
+});
+
+test('the model sends a quoted image as one native media message', async t => {
+  const f = fixture(t),
+    buffer = new MessageBuffer(f.bufferFile),
+    sent = [];
+  const stickerId = 'c'.repeat(64);
+  const adapter = new WechatOneBotAdapter();
+  adapter.server.action = async (action, params) => {
+    sent.push({ action, params });
+    return {
+      data: {
+        receipt: 'wechat-server-id',
+        delivered: 'database-confirmed',
+        media_type: 'wechat-image',
+        imageContentMatch: 'source-md5',
+      },
+    };
+  };
+  const engine = f.engine({
+    buffer,
+    stickerChoicesFor: async () => [
+      { id: stickerId, source: 'local-library', description: '示例图片', tags: ['图片'] },
+    ],
+    decide: async (_key, prompt) => {
+      assert.match(prompt, /\[QUOTE:Q编号\] \[STICKER:S编号\]/);
+      assert.match(prompt, /S1：/);
+      return 'RESPOND: [QUOTE:Q1] [STICKER:S1]';
+    },
+    send: async () => assert.fail('The media has its own quote'),
+    sendSticker: (target, id, options) =>
+      adapter.sendSticker({ kind: target.kind, target: target.conversation_id, id, ...options }),
+  });
+  engine.receive(incoming({ text: '引用我这条消息并发一张图片' }));
+  await until(() => sent.length === 1 && buffer.mediaReplies.size === 0);
+  assert.deepEqual(sent[0].params.message, [
+    { type: 'reply', data: { id: sourceId } },
+    { type: 'wechat_sticker', data: { id: stickerId } },
+  ]);
+  assert.equal(buffer.recent(key).filter(row => row.outgoing).length, 1);
 });
 
 test('messages received before a group mention stay available for recent and historical quotes', async t => {
@@ -330,6 +371,82 @@ test('system and unknown-card context is stored without waking the bot or becomi
   assert.equal(buffer.unread(key).length, 0);
   assert.equal(engine.timers.size, 0);
   assert.equal(decisions, 0);
+});
+
+test('a WeChat system notice is evaluated in the assistant chat lane without starting a task', async t => {
+  const f = fixture(t),
+    buffer = new MessageBuffer(f.bufferFile),
+    prompts = [];
+  const engine = f.engine({
+    buffer,
+    workModeFor: () => 'assistant',
+    assistantChatOnly: true,
+    assistantBatchMs: 1,
+    assistantAccess: (_key, message) => message.systemNotice === true,
+    decide: async (_key, prompt, metadata) => {
+      prompts.push({ prompt, metadata });
+      return 'SILENT';
+    },
+    send: () => assert.fail('No send expected'),
+  });
+  const content = '[系统通知] 对方撤回了一条消息';
+  const event = readerEvent(
+    {
+      event: 'message.new',
+      type: 1,
+      sessionId: '123',
+      talkerId: 'wechat-system',
+      sourceName: '会话联系人',
+      rawid: sourceId,
+      timestamp: Math.floor(Date.now() / 1000) - 1,
+      content,
+      contextOnly: true,
+      systemNotice: true,
+    },
+    { ownWxid: '99', allowed: (kind, target) => kind === 'private' && target === '123' },
+  );
+  const notice = normalizeOneBotEvent('wechat', 'fixture', event);
+  assert.equal(notice.conversation_name, '会话联系人');
+  assert.equal(notice.sender_name, '微信系统');
+  engine.receive(notice);
+  assert.equal(buffer.recent(key).at(-1).systemNotice, true);
+  await until(() => prompts.length === 1 && !engine.running.has(key));
+  assert.ok(prompts[0].prompt.includes(content));
+  assert.equal(prompts[0].metadata.assistantChatOnly, true);
+  assert.equal(prompts[0].metadata.systemNotice, true);
+  assert.deepEqual(prompts[0].metadata.files, []);
+});
+
+test('a group join notice enters reply judgment in mention-only mode', async t => {
+  const f = fixture(t),
+    buffer = new MessageBuffer(f.bufferFile),
+    prompts = [];
+  const engine = f.engine({
+    buffer,
+    mode: 'mention',
+    decide: async (_key, prompt) => {
+      prompts.push(prompt);
+      return 'SILENT';
+    },
+    send: () => assert.fail('No send expected'),
+  });
+  const target = 'fixture@chatroom';
+  const event = readerEvent(
+    {
+      event: 'message.new',
+      type: 1,
+      sessionId: target,
+      talkerId: 'wechat-system',
+      rawid: sourceId,
+      content: '[系统通知] 新成员加入了群聊',
+      contextOnly: true,
+      systemNotice: true,
+    },
+    { ownWxid: '99', allowed: (kind, id) => kind === 'group' && id === target },
+  );
+  engine.receive(normalizeOneBotEvent('wechat', 'fixture', event));
+  await until(() => prompts.length === 1 && !engine.running.has('wechat:group:' + target));
+  assert.match(prompts[0], /新成员加入了群聊/);
 });
 
 test('unknown, nested and voice quote markers cannot reach a normal text send', () => {

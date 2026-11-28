@@ -1182,6 +1182,13 @@ static int QtEnterSelfTest()
         count++;
         Expect(delegate { QtTypedTextEvents("ab", null); }, "DRAFT_APPEND_NOT_SINGLE_GRAPHEME");
         count++;
+        Need(QtTypedRepeatedPreviousUnit("\uff1f", "\uff1f\uff1f") &&
+                 !QtTypedRepeatedPreviousUnit("\uff1f", "\uff1f\u8bf4") &&
+                 !QtTypedRepeatedPreviousUnit("\uff1f", "\u8bf4\uff1f") &&
+                 !QtTypedRepeatedPreviousUnit("e\u0301", "e\u0301\u0301") &&
+                 !QtTypedRepeatedPreviousUnit("\ud83d\ude0a", "\ud83d\ude0a\ude0a"),
+             "QT_TEST_TYPED_REPAIR_ONLY_REMOVES_OUR_REPEATED_APPEND");
+        count++;
         var typedFrame = new QtFrame { Binding = textFrame.Binding, Revision = textFrame.Revision, Issued = UtcMs(),
                                        Anchors = textFrame.Anchors };
         var typedProof =

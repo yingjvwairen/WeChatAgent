@@ -8,7 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from wechat_files import FILE_TYPE, parse_file_message
-from wechat_quote import QUOTE_TYPE, parse_quote_receipt
+from wechat_quote import QUOTE_TYPE, media_quote_server_id, parse_quote_receipt
 from wechat_sticker_send import APPMSG_STICKER_TYPE, sticker_receipt_md5
 from wechat_voice_input import voice_info
 
@@ -88,6 +88,10 @@ def attachment_fields(kind, text, *, outgoing):
         quote = parse_quote_receipt(text)
         if quote:
             fields.update(quoteSourceServerId=quote['sourceServerId'], quoteReplyText=quote['body'])
+    if outgoing and kind in (3, 47, 49, APPMSG_STICKER_TYPE):
+        source_id = media_quote_server_id(text)
+        if source_id:
+            fields.setdefault('quoteSourceServerId', source_id)
     file = parse_file_message(kind, text)
     if file:
         fields.update(fileKind='appmsg-6', fileName=file['name'], fileSize=file['size'], fileMd5=file['md5'])
@@ -138,8 +142,7 @@ def _outgoing_row(nt, raw, shard, sender, group):
         duration = recorded_voice_duration(text)
         if duration is not None:
             row['recordedDurationMs'] = duration
-    else:
-        row.update(attachment_fields(kind, text, outgoing=True))
+    row.update(attachment_fields(kind, text, outgoing=True))
     return row
 
 

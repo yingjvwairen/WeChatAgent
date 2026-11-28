@@ -144,11 +144,29 @@ def parse_quote_receipt(value):
         titles, references = app.findall('title'), app.findall('refermsg')
         if len(titles) != 1 or len(references) != 1 or len(titles[0]):
             return None
-        ids = references[0].findall('svrid')
-        sid = ids[0].text if len(ids) == 1 and not len(ids[0]) else None
+        sid = _receipt_source_id(references[0])
         body = titles[0].text
-        if not body or not re.fullmatch(r'[1-9][0-9]{0,19}', sid or '') or int(sid) >= 2**64:
+        if not body or not sid:
             return None
         return {'body': body, 'sourceServerId': sid}
+    except (ValueError, ET.ParseError, RecursionError):
+        return None
+
+
+def _receipt_source_id(reference):
+    ids = reference.findall('svrid')
+    sid = ids[0].text if len(ids) == 1 and not len(ids[0]) else None
+    return sid if re.fullmatch(r'[1-9][0-9]{0,19}', sid or '') and int(sid) < 2**64 else None
+
+
+def media_quote_server_id(value):
+    """Images and animations carry the reference alongside their own payload."""
+    if not isinstance(value, str) or len(value) > MAX_XML or '<extcommoninfo>' not in value:
+        return None
+    try:
+        root = safe_xml(value)
+        metadata = root.findall('extcommoninfo') if root.tag == 'msg' else []
+        references = metadata[0].findall('refermsg') if len(metadata) == 1 else []
+        return _receipt_source_id(references[0]) if len(references) == 1 else None
     except (ValueError, ET.ParseError, RecursionError):
         return None

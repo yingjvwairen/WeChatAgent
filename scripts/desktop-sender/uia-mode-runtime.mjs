@@ -943,11 +943,10 @@ export function createUiaControlProvider({
         (allowLayoutRefresh && (config.layoutMode !== 'uia-v1' || !request || request.searchPopupHwnd === '0'))
       )
         throw fault('UIA_MODE_READINESS_INVALID');
-      // The native image paste proved the same editor while observing its
-      // attachment-induced size change. Refresh locators to those exact new
-      // bounds before the ordinary strict submit check; never use a tolerance.
+      // Quote selection and media paste can change the editor bounds. Refresh
+      // the locators against the exact bounds observed by those native steps.
       if (
-        ['image-submit', 'image-resume', 'text-input', 'text-submit'].includes(operation) &&
+        ['image-input', 'image-submit', 'image-resume', 'text-input', 'text-submit'].includes(operation) &&
         cachedLayout &&
         ['editor', 'send'].some(role => !same(config.layout[role], cachedLayout.layout[role]))
       )

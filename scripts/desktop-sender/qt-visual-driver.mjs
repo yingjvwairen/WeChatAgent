@@ -653,7 +653,7 @@ class QtVisualDriver {
       result?.performed !== true ||
       result.attempted !== true ||
       result.typeApplied !== true ||
-      result.readbackPerformed !== false ||
+      (result.readbackPerformed === true ? result.draft !== text : result.readbackPerformed !== false) ||
       result.intendedText !== text ||
       result.clipboardAccessed !== false ||
       typeof result.interrupted !== 'boolean' ||
@@ -1152,7 +1152,7 @@ class QtVisualDriver {
       };
     try {
       const dialog = this.#attachments.observeFileDialog(job);
-      if (dialog) return dialog;
+      if (dialog) return { ...dialog, inputProcess: desktopProcessIdentity(current.binding) };
       if (current.imageApplied === job.id) {
         if (this.config.layoutMode === 'uia-v1') {
           if (
@@ -1176,6 +1176,7 @@ class QtVisualDriver {
             idleMs: this.frame.idleMs,
             editorToken: current.editorToken,
             activityRevision: current.revision,
+            inputProcess: desktopProcessIdentity(this.frame.binding),
             appliedImageId: job.id,
           };
         }
@@ -1197,6 +1198,7 @@ class QtVisualDriver {
           idleMs: frame.idleMs,
           editorToken: current.editorToken,
           activityRevision: current.revision,
+          inputProcess: desktopProcessIdentity(frame.binding),
           appliedImageId: job.id,
         };
       }

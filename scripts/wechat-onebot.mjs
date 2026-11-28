@@ -28,6 +28,10 @@ import {
   conversationWorkMode,
   naturalGroupWakeEpoch,
 } from '../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
+import {
+  assistantGroupChatAllowed,
+  assistantSenderAllowed,
+} from '../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import { DesktopSender } from './desktop-sender.mjs';
 import { DesktopReceipts } from './desktop-receipts.mjs';
 import {
@@ -340,7 +344,13 @@ export class WechatOneBot {
     if (job.voicePlugin) {
       const feature = job.voicePlugin.feature ?? 'voice-output-v1';
       if (!['voice-output-v1', dialogueFeature].includes(feature)) return false;
-      if (feature === dialogueFeature && conversationWorkMode(config.wechat, key) === 'assistant') return false;
+      if (
+        feature === dialogueFeature &&
+        (job.voicePlugin.realtimeId !== undefined
+          ? !this.realtime?.permitsAssistantDelivery?.(job)
+          : conversationWorkMode(config.wechat, key) === 'assistant')
+      )
+        return false;
       const candidates = this.voiceSend.synthesis.candidates(key, feature);
       if (
         candidates.length !== 1 ||
@@ -451,6 +461,17 @@ export class WechatOneBot {
       throw new AdapterError('SENDER_BUSY', { reason: 'INPUT_QUOTE_LOOKUP_UNAVAILABLE' });
     }
   }
+  async requireQuoteSource(target, id) {
+    if (!id) return undefined;
+    const quote = await this.quoteSource(target, id);
+    if (!quote)
+      throw new AdapterError('NATIVE_SEND_REJECTED', {
+        rejected: true,
+        attempted: false,
+        reason: 'INPUT_QUOTE_SOURCE_UNVERIFIED',
+      });
+    return quote;
+  }
   async send(
     kind,
     target,
@@ -483,13 +504,7 @@ export class WechatOneBot {
         permitInput,
       },
       async wxid => {
-        const quote = quoteEventId ? await this.quoteSource(wxid, quoteEventId) : undefined;
-        if (quoteEventId && !quote)
-          throw new AdapterError('NATIVE_SEND_REJECTED', {
-            rejected: true,
-            attempted: false,
-            reason: 'INPUT_QUOTE_SOURCE_UNVERIFIED',
-          });
+        const quote = await this.requireQuoteSource(wxid, quoteEventId);
         return { operation: 'text', body: { text, ...(quote ? { quote } : {}) } };
       },
     );
@@ -615,6 +630,7 @@ export class WechatOneBot {
     {
       deliveryId,
       proactive,
+      quoteEventId,
       receiptOnly = false,
       deadlineAt,
       admissionDeadlineAt,
@@ -625,6 +641,8 @@ export class WechatOneBot {
     } = {},
   ) {
     if (abandon && (!deliveryId || !receiptOnly)) fail('INVALID_RECEIPT_QUERY');
+    if (quoteEventId !== undefined && (!deliveryId || proactive || !/^[a-f0-9]{64}$/.test(quoteEventId)))
+      fail('INPUT_QUOTE_UNAVAILABLE');
     if (!/^[a-f0-9]{64}$/.test(id)) fail('INVALID_STICKER_REFERENCE');
     const key = 'wechat:' + kind + ':' + target;
     return deliverDesktopMessage(
@@ -643,6 +661,7 @@ export class WechatOneBot {
         reserveAdmission,
         media: true,
         text: '[STICKER:' + id + ']',
+        quoteEventId,
       },
       async () => {
         if (!this.status.native_sticker_send) fail('NATIVE_STICKER_UNAVAILABLE');
@@ -677,6 +696,7 @@ export class WechatOneBot {
           : sticker.origin === 'dsh-meme-temporary'
             ? { temporaryReference: sticker.temporaryReference, expectedSha256: sticker.sha256 }
             : { poolReference: id };
+        const quote = await this.requireQuoteSource(target, quoteEventId);
         return {
           operation: image ? 'image' : 'sticker',
           body: {
@@ -687,6 +707,7 @@ export class WechatOneBot {
               ? { mediaName: local?.name ?? sticker.description }
               : {}),
             ...reference,
+            ...(quote ? { quote } : {}),
           },
         };
       },
@@ -702,7 +723,17 @@ export class WechatOneBot {
   // Trigger rules for one Realtime turn, rechecked before deciding and before
   // every send. Group text requires a native self or all-members mention. The Realtime
   // model has no silent option, unlike the DSH social pipeline.
-  realtimePermitted({ kind, target, mentioned, input, accountRef, rosterGrant, naturalGroupEpoch }) {
+  realtimePermitted({
+    kind,
+    target,
+    sender,
+    mentioned,
+    input,
+    accountRef,
+    rosterGrant,
+    naturalGroupEpoch,
+    workMode = 'social',
+  }) {
     const key = 'wechat:' + kind + ':' + target;
     return record => {
       this.reload();
@@ -713,8 +744,16 @@ export class WechatOneBot {
         this.accountRef !== accountRef ||
         !rosterGrant ||
         conversationGrant(wechat, key) !== rosterGrant ||
-        (record && record.account !== this.account) ||
-        conversationWorkMode(wechat, key) === 'assistant'
+        (record && (record.account !== this.account || (record.workMode ?? 'social') !== workMode)) ||
+        conversationWorkMode(wechat, key) !== workMode
+      )
+        return false;
+      if (
+        workMode === 'assistant' &&
+        (input !== 'voice' ||
+          !(kind === 'private'
+            ? assistantSenderAllowed(wechat, key, sender)
+            : assistantGroupChatAllowed(wechat, key, sender ?? '')))
       )
         return false;
       const candidates = this.voiceSend.synthesis.candidates(key, dialogueFeature);
@@ -734,13 +773,16 @@ export class WechatOneBot {
   realtimeInput(payload, event, receipt) {
     if (payload.contextOnly || event.wechatagent?.contextOnly || ![1, 34].includes(payload.type)) return null;
     const voice = payload.type === 34;
+    if (voice && !/^[a-f0-9]{64}$/.test(payload.voice?.id ?? '')) return null;
     if (!voice && (!payload.content.trim() || payload.content.trim().length > 4096)) return null;
     const group = event.message_type === 'group';
     const mentioned = group && oneBotMentionTarget(event.message, event.self_id) !== null;
+    const key = 'wechat:' + event.message_type + ':' + payload.sessionId;
     return {
       kind: event.message_type,
       target: payload.sessionId,
       sender: payload.talkerId,
+      workMode: conversationWorkMode(this.project.wechat, key),
       mentioned,
       ...(group && voice && !mentioned
         ? { naturalGroupEpoch: naturalGroupWakeEpoch(this.project.wechat, 'wechat:group:' + payload.sessionId) }

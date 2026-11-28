@@ -26,6 +26,7 @@ function setup({ imageContentMatch = 'raster', nativeSubmitVerified = false } = 
     checkNative: async () => identity,
     receiptAccount: () => identity,
     resolveTarget: async () => 'fixture-peer',
+    requireQuoteSource: WechatOneBot.prototype.requireQuoteSource,
     textDeliveries: { key: () => 'operation', get: id => receipts.get(id), put: item => receipts.set(item.key, item) },
     reader: async route =>
       route.startsWith('/api/v1/stickers?')

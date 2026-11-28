@@ -9,6 +9,7 @@ from wechat_forwarded import safe_xml
 
 APP_LABELS = {3: '音乐', 33: '小程序', 36: '小程序', 51: '视频号', 63: '直播', 2000: '转账', 2001: '红包'}
 EXTRA_CARD_TYPES = (42, 48, *((subtype << 32) | 49 for subtype in APP_LABELS))
+SYSTEM_MESSAGE_TYPES = frozenset((37, 40, 50, 51, 53, 10000, 10002))
 _INVALID_TEXT = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffd]|<[/!?a-zA-Z][^>]{0,300}>')
 
 
@@ -32,6 +33,11 @@ def _child(root, name):
     if root is None:
         return None
     return root if root.tag == name else root.find(name) if root.tag == 'msg' else None
+
+
+def is_system_message(local_type, text):
+    base = local_type & 0xFFFFFFFF
+    return base in SYSTEM_MESSAGE_TYPES or (base >= 10000 and _child(_root(text), 'sysmsg') is not None)
 
 
 def _card(label, title, *details):
@@ -193,7 +199,8 @@ def parse_other_message(local_type, text):
     ):
         plain = ''
     summary = ''
-    if base in (10000, 10002):
+    if base in (10000, 10002) or (base >= 10000 and _child(root, 'sysmsg') is not None):
+        label = '系统通知'
         summary = _notice_text(root) or _notice_line(text)
     elif base == 37:
         if root is not None and root.tag == 'msg':

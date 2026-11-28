@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { UiTextOutbox } from './ui-text-outbox.mjs';
+import { UiTextOutbox, validUiQuote } from './ui-text-outbox.mjs';
 import { validSelectionScope } from './selection-scope.mjs';
 import { inspectReplyImage, REPLY_IMAGE_MAX_BYTES, validStaticImageReceipt } from '../reply-image-format.mjs';
 import { acquireDeliveryLock } from './delivery-lock.mjs';
@@ -337,6 +337,7 @@ export class UiImageOutbox {
       target: job.target,
       sourceImageSha256: metadata.sourceImageSha256,
       deadlineAt: job.deadlineAt,
+      ...(job.quote ? { quote: job.quote } : {}),
       mediaKind: metadata.extension === 'file' ? 'file' : 'image',
       ...(metadata.extension === 'gif' ? { imageFormat: 'gif', sourceImageMd5: metadata.sourceImageMd5 } : {}),
     };
@@ -382,6 +383,7 @@ export class UiImageOutbox {
       r.deliveryId === job.id &&
       r.account === job.account &&
       r.target === job.target &&
+      r.sourceServerId === job.quote?.serverId &&
       r.sourceImageSha256 === binding.sourceImageSha256 &&
       decimal(String(r.localId)) &&
       decimal(String(r.serverId)) &&
@@ -394,13 +396,14 @@ export class UiImageOutbox {
       ? result
       : { confirmed: false, reason: 'UI_IMAGE_RECEIPT_BINDING_MISMATCH' };
   }
-  enqueue({ deliveryId, account, target, image, selectionScope, mode = 'image' } = {}) {
+  enqueue({ deliveryId, account, target, image, selectionScope, mode = 'image', quote } = {}) {
     if (
       !['image', 'file'].includes(mode) ||
       (mode === 'file' && !path.isAbsolute(this.fileAssetsDirectory ?? '')) ||
       !digest(deliveryId) ||
       !identifier(account) ||
       !identifier(target) ||
+      (quote !== undefined && (mode !== 'image' || !validUiQuote(quote, target))) ||
       !object(image) ||
       !path.isAbsolute(image.path ?? '') ||
       /^[/\\]{2}/.test(image.path) ||
@@ -467,7 +470,7 @@ export class UiImageOutbox {
           selectionScope: scope,
         });
       }
-      this.queue.enqueue({ deliveryId, account, target, text: marker(image.sha256) });
+      this.queue.enqueue({ deliveryId, account, target, text: marker(image.sha256), quote });
       return this.get(deliveryId);
     } finally {
       lease.release();

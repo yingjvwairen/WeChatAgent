@@ -367,6 +367,7 @@ export class DesktopReceipts {
         matches = [{ ...result.match, localType: 34 }];
     } else {
       const { messages: rows } = await this.messages(job.target, { after, before }, proof);
+      const sameQuote = row => row.quoteSourceServerId === job.quote?.serverId;
       matches = rows.filter(row => {
         // A row awaiting a server ID can still compete with an acknowledged row.
         if (!newRow(row)) return false;
@@ -383,6 +384,7 @@ export class DesktopReceipts {
             row.fileSize === job.size &&
             (!row.fileMd5 || row.fileMd5 === job.md5)
           );
+        if (!sameQuote(row)) return false;
         if (gif)
           return (
             ([47, gifType].includes(row.localType) && row.stickerMd5 === job.md5) ||
@@ -403,7 +405,14 @@ export class DesktopReceipts {
         staticImage &&
         matches.length === 1 &&
         !sameImageMd5(job, matches[0]) &&
-        rows.some(row => row.localType === 3 && row !== matches[0] && newRow(row) && row.imageRasterMatched !== false)
+        rows.some(
+          row =>
+            row.localType === 3 &&
+            row !== matches[0] &&
+            newRow(row) &&
+            sameQuote(row) &&
+            row.imageRasterMatched !== false,
+        )
       ) {
         matches = [];
         reason = 'DESKTOP_RECEIPT_AMBIGUOUS';

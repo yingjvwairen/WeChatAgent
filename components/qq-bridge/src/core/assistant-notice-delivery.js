@@ -7,6 +7,7 @@ import { replyDeliveryStatus } from '../../../../packages/delivery-contract.mjs'
 export function createAssistantNoticeDelivery({
   adapter,
   plugin,
+  buffer,
   settingsFor,
   deliveryControls,
   isReady = () => true,
@@ -51,6 +52,19 @@ export function createAssistantNoticeDelivery({
             rosterGrant: grant,
           });
           if (replyDeliveryStatus(receipt) === 'confirmed') {
+            buffer?.recordConfirmedText(
+              {
+                platform,
+                kind,
+                conversation_id: target,
+                self_id: adapter.selfId,
+                readerGrant: grant,
+                work_mode: 'assistant',
+              },
+              notice.id,
+              text,
+              receipt,
+            );
             await plugin.assistantTask(undefined, 'notification-ack', { localControl: true, id: notice.id });
             log(
               '[Assistant] notification_delivery=confirmed kind=' +

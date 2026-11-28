@@ -104,6 +104,7 @@ export class MediaOutbox {
         () =>
           this.send(item.message, item.part.stickerId, {
             deliveryId: item.part.deliveryId,
+            ...(item.part.quoteEventId ? { quoteEventId: item.part.quoteEventId } : {}),
             receiptOnly: true,
             abandon: true,
           }),
@@ -275,6 +276,7 @@ export class MediaOutbox {
           () =>
             this.send(item.message, part.stickerId, {
               deliveryId: part.deliveryId,
+              ...(part.quoteEventId ? { quoteEventId: part.quoteEventId } : {}),
               ...(receiptOnly ? { receiptOnly: true } : {}),
               ...(admissionDeadlineAt !== undefined ? { admissionDeadlineAt } : {}),
             }),

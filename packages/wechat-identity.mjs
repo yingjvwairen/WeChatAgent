@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -15,6 +15,13 @@ export const validGroupId = id => typeof id === 'string' && /^[A-Za-z0-9_.-]{1,2
 export const validUserId = id =>
   typeof id === 'string' && /^[^\s:\x00-\x1f\x7f/\\<>"|?*]{1,256}$/u.test(id) && !id.endsWith('@chatroom');
 export const validChatId = (kind, id) => (kind === 'group' ? validGroupId(id) : kind === 'private' && validUserId(id));
+
+export function wechatServerEventId(talker, serverId) {
+  if (typeof serverId !== 'string' || !/^[1-9]\d{0,19}$/.test(serverId) || BigInt(serverId) >= 2n ** 64n) return null;
+  return createHash('sha256')
+    .update(talker + '\0' + serverId)
+    .digest('hex');
+}
 
 export function parseChatKey(key) {
   if (typeof key !== 'string') return null;

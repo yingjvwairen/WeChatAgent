@@ -136,7 +136,7 @@ test('withdrawn queued input cannot hide the next mention under a fresh chat gra
   assert.equal(archived?.reply_skip_reason, 'conversation_grant_changed');
 });
 
-test('Realtime honors all-members mentions in social chats and leaves assistant chats to DSH', () => {
+test('Realtime honors group mentions and wake policy while assistant text stays with DSH', () => {
   const adapter = Object.create(WechatOneBot.prototype);
   const wechat = { whitelist: { groups: ['room@chatroom'], private: [] }, wake_mode: 'mention' };
   const key = 'wechat:group:room@chatroom';
@@ -173,6 +173,11 @@ test('Realtime honors all-members mentions in social chats and leaves assistant 
   assert.equal(trigger({ mentionsAll: true }), false);
   wechat.assistant = { administrators: ['member'] };
   assert.equal(trigger({ mentionsAll: true }), false);
+  const voice = { type: 34, voice: { id: 'c'.repeat(64), durationSeconds: 2 }, content: '[语音]' };
+  assert.equal(trigger(voice), false);
+  assert.equal(trigger({ ...voice, mentionsAll: true }), true);
+  wechat.chatModes = { [key]: 'hybrid' };
+  assert.equal(trigger(voice), true);
   wechat.workModes[key] = 'social';
   assert.equal(trigger({ mentionsAll: true }), true);
 });

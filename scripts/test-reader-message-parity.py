@@ -22,6 +22,23 @@ spec.loader.exec_module(api)
 
 
 class ReaderMessageParityTest(unittest.TestCase):
+    def test_outgoing_media_receipt_reads_only_the_single_native_reference(self):
+        from reader_message_rows import _outgoing_row
+
+        md5 = 'a' * 32
+        reference = '<extcommoninfo><refermsg><svrid>9007199254740999</svrid></refermsg></extcommoninfo>'
+        for kind, payload, digest_field in [(3, 'img', 'imageMd5'), (47, 'emoji', 'stickerMd5')]:
+            xml = f'<msg><{payload} md5="{md5}"/>{reference}</msg>'
+            row = {'local_id': 1, 'local_type': kind, 'server_id': 42, 'create_time': 10, 'message_content': xml}
+            result = _outgoing_row(api.nt, row, 'shard', 'fixture-self', False)
+            self.assertEqual(result[digest_field], md5)
+            self.assertEqual(result['quoteSourceServerId'], '9007199254740999')
+            bad = xml.replace(reference, reference + reference)
+            self.assertNotIn(
+                'quoteSourceServerId',
+                _outgoing_row(api.nt, {**row, 'message_content': bad}, 'shard', 'fixture-self', False),
+            )
+
     def test_pats_with_null_or_zero_server_ids_both_keep_the_original_xml(self):
         reader = api.Reader.__new__(api.Reader)
         reader.names, reader.own_wxid = {}, 'fixture-self'
@@ -30,7 +47,7 @@ class ReaderMessageParityTest(unittest.TestCase):
         reader.selected_talkers = lambda: [talker]
         table = 'Msg_' + hashlib.md5(talker.encode()).hexdigest()
         xml = (
-            '<msg><appmsg><type>62</type><patinfo><fromusername>fixture-peer</fromusername>'
+            '<msg><appmsg><title>拍一拍</title><type>62</type><patinfo><fromusername>fixture-peer</fromusername>'
             '<pattedusername>fixture-self</pattedusername></patinfo></appmsg></msg>'
         )
         with tempfile.TemporaryDirectory() as folder:
@@ -50,6 +67,8 @@ class ReaderMessageParityTest(unittest.TestCase):
             reader.open_messages = lambda: [sqlite3.connect(file)]
             events = [reader.make_payload(talker, row) for row in reader.scan_rows(talker, 100, 100)]
         self.assertEqual([event['pat']['actor'] if event else None for event in events], ['fixture-peer'] * 2)
+        self.assertEqual([event['type'] for event in events], [api.PAT_TYPE] * 2)
+        self.assertTrue(all(not event.get('contextOnly') for event in events))
         self.assertEqual(len({event['rawid'] for event in events}), 2)
 
     def test_peer_with_account_prefix_is_received_and_only_exact_self_is_outgoing(self):
@@ -136,12 +155,67 @@ class ReaderMessageParityTest(unittest.TestCase):
         )
         self.assertEqual(result['content'], '[系统通知] 小明撤回了一条消息')
         self.assertTrue(result['contextOnly'])
+        self.assertTrue(result['systemNotice'])
+        self.assertEqual(result['talkerId'], 'wechat-system')
         reader = api.Reader.__new__(api.Reader)
         self.assertFalse(reader.offline_wake('peer', result, {}))
         for text in ('{"secret":"raw object"}', 'a' * 100, '<invalid secret="private"/>'):
             result = payload(999, text)
             self.assertTrue(result['contextOnly'])
             self.assertNotIn(text, result['content'])
+
+    def test_other_pats_and_own_recall_remain_in_context(self):
+        def context(kind, body, sender, is_send=False, talker='room@chatroom'):
+            return api.push_payload(
+                talker,
+                {
+                    'localType': kind,
+                    'fullText': body,
+                    'senderUsername': sender,
+                    'isSend': is_send,
+                    'localId': 1,
+                    'createTime': 100,
+                    'sourceShard': 'a' * 64,
+                },
+                {},
+                'self',
+            )
+
+        pat = (
+            '<msg><appmsg><title>拍一拍</title><type>62</type><patinfo><fromusername>peer</fromusername>'
+            '<pattedusername>other</pattedusername></patinfo></appmsg></msg>'
+        )
+        other_pat = context(api.PAT_TYPE, pat, 'peer')
+        self.assertEqual(other_pat['type'], 1)
+        self.assertNotIn('pat', other_pat)
+        self.assertIn('拍一拍', other_pat['content'])
+        self.assertIsNone(context(api.PAT_TYPE, pat, 'peer', talker='peer'))
+        recall = context(
+            10002,
+            '<sysmsg type="revokemsg"><revokemsg><replacemsg>你撤回了一条消息</replacemsg></revokemsg></sysmsg>',
+            'self',
+            True,
+            talker='peer',
+        )
+        self.assertIn('撤回', recall['content'])
+        joined = context(
+            10000,
+            '<sysmsg type="sysmsgtemplate"><sysmsgtemplate><content_template>'
+            '<template>$member$加入了群聊</template><link_list><link name="member"><memberlist>'
+            '<member><nickname>新成员</nickname></member></memberlist></link></link_list>'
+            '</content_template></sysmsgtemplate></sysmsg>',
+            '',
+        )
+        self.assertIn('新成员加入了群聊', joined['content'])
+        new_notice = context(10003, '<sysmsg type="groupnotice"><content>群公告已更新</content></sysmsg>', '')
+        self.assertIn('群公告已更新', new_notice['content'])
+        for notice in (other_pat, recall, joined, new_notice):
+            self.assertTrue(notice['contextOnly'])
+            self.assertTrue(notice['systemNotice'])
+            self.assertEqual(notice['talkerId'], 'wechat-system')
+            self.assertTrue(notice['rawid'])
+        self.assertIsNone(context(1, '普通出站', 'self', True))
+        self.assertNotIn('systemNotice', context(1, '<sysmsg><content>普通消息</content></sysmsg>', 'peer'))
 
     def test_voice_and_file_without_content_grants_remain_in_the_chat(self):
         with tempfile.TemporaryDirectory() as folder:

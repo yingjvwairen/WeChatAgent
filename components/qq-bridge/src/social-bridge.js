@@ -21,6 +21,7 @@ import { searchPolicy } from '../../../packages/dsh-social-bridge-plugin/search-
 import { ProactiveEngine } from './core/proactive-engine.js';
 import { ContextMaintenance } from './core/context-maintenance.js';
 import { HistoryStore } from '../../../packages/dsh-social-bridge-plugin/history-store.mjs';
+import { historyPolicy } from '../../../packages/dsh-social-bridge-plugin/history-policy.mjs';
 import { historyScopeKey, scopeHistory } from '../../../packages/dsh-social-bridge-plugin/work-modes.mjs';
 import { activeReaderAccount, assistantChatBufferFile } from '../../../scripts/reader-account-state.mjs';
 import { ReplyDeliveryControls } from '../../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
@@ -48,18 +49,41 @@ const readerAccountIsCurrent = () => {
   const live = activeReaderAccount(historyRoot);
   return live.id === historyAccount.id && (live.id !== '' || live.legacyId === historyAccount.legacyId);
 };
+const deliveryControls = new ReplyDeliveryControls(
+  historyRoot,
+  historyAccount.id || historyAccount.legacyId || 'legacy',
+);
 const baseHistoryStore = new HistoryStore(historyRoot, historyAccount.id || historyAccount.legacyId);
 const historyStore = scopeHistory(baseHistoryStore, (_key, row) => row?.work_mode ?? 'social');
-const historyArchive = {
-  backfill: (...args) => historyStore.backfill(...args),
-  append: (...args) => {
-    if (!readerAccountIsCurrent()) throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
-    return historyStore.append(...args);
-  },
-};
+function archiveWithReceipts(history) {
+  return {
+    backfill(key, rows) {
+      const missingGrant = row =>
+        row.platform === 'wechat' && row.outgoing && row.delivery_status === 'confirmed' && !row.readerGrant;
+      if (rows.some(missingGrant) && fs.existsSync(deliveryControls.file)) {
+        try {
+          const { grant, replies } = deliveryControls.list(key);
+          if (grant) {
+            const confirmed = new Set(replies.filter(reply => reply.state === 'confirmed').map(reply => reply.id));
+            rows = rows.map(row =>
+              missingGrant(row) && confirmed.has(row.delivery_id) ? { ...row, readerGrant: grant } : row,
+            );
+          }
+        } catch {
+          log(`[History] ${key} legacy_delivery_grants_unavailable`);
+        }
+      }
+      history.backfill(key, rows);
+    },
+    append(...args) {
+      if (!readerAccountIsCurrent()) throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
+      return history.append(...args);
+    },
+  };
+}
 const buffer = new MessageBuffer(path.resolve(root, config.message_buffer?.path ?? 'state/social-messages.json'), {
   maxPerChat: config.message_buffer?.max_messages_per_chat ?? 300,
-  archive: historyArchive,
+  archive: archiveWithReceipts(historyStore),
   readerAccount: historyAccount.id,
 });
 const plugin = new DshPluginClient(
@@ -123,10 +147,6 @@ const deliveryTarget = message => ({
   target: message.conversation_id,
   rosterGrant: message.readerGrant,
 });
-const deliveryControls = new ReplyDeliveryControls(
-  historyRoot,
-  historyAccount.id || historyAccount.legacyId || 'legacy',
-);
 const engine = new SocialEngine({
   buffer,
   connection,
@@ -201,16 +221,9 @@ const engine = new SocialEngine({
 });
 const memberSettings = currentWechat;
 const memberHistory = scopeHistory(baseHistoryStore, () => 'assistant-chat', { fixedMode: 'assistant-chat' });
-const memberArchive = {
-  backfill: (...args) => memberHistory.backfill(...args),
-  append: (...args) => {
-    if (!readerAccountIsCurrent()) throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
-    return memberHistory.append(...args);
-  },
-};
 const memberBuffer = new MessageBuffer(assistantChatBufferFile(historyRoot, historyAccount), {
   maxPerChat: buffer.maxPerChat,
-  archive: memberArchive,
+  archive: archiveWithReceipts(memberHistory),
   readerAccount: historyAccount.id,
 });
 const memberConnection = new DshConnectionGuard({
@@ -221,9 +234,15 @@ const memberConnection = new DshConnectionGuard({
 const memberEngine = engine.createGroupChat({
   buffer: memberBuffer,
   connection: memberConnection,
-  assistantAccess: (key, message) =>
-    conversationWorkMode(memberSettings(), key) === 'assistant' &&
-    assistantGroupChatAllowed(memberSettings(), key, verifiedAssistantSender(message)),
+  assistantAccess: (key, message) => {
+    const settings = memberSettings();
+    return (
+      conversationWorkMode(settings, key) === 'assistant' &&
+      (message.systemNotice === true
+        ? conversationGrant(settings, key) === message.readerGrant
+        : assistantGroupChatAllowed(settings, key, verifiedAssistantSender(message)))
+    );
+  },
 });
 const proactiveState = path.resolve(config.proactive_state_file ?? path.join(root, 'state/proactive/state.json'));
 const proactiveOptions = {
@@ -231,6 +250,12 @@ const proactiveOptions = {
     config.proactive_policy_file
       ? JSON.parse(fs.readFileSync(config.proactive_policy_file, 'utf8').replace(/^\uFEFF/, ''))
       : { wechat },
+  historyFor: (key, grant) => {
+    const settings = currentWechat();
+    const policy = historyPolicy(settings, key);
+    if (policy.enabled && conversationGrant(settings, key) === grant)
+      return baseHistoryStore.windowRows(key, policy, [], grant);
+  },
   personaFor,
   decide: (...args) => plugin.followup(...args),
   searchFor: searchStateFor,
@@ -357,10 +382,11 @@ async function routeIncoming(message) {
     message = { ...message, readerGrant: grant };
     log('[WeChat] accepted ' + key);
     const memberLaneFor = settings =>
-      message.kind === 'group' &&
       conversationWorkMode(settings, key) === 'assistant' &&
-      (!assistantSenderAllowed(settings, key, verifiedAssistantSender(message)) ||
-        assistantChatRequest(message, wechat.wake_words ?? []));
+      (message.systemNotice === true ||
+        (message.kind === 'group' &&
+          (!assistantSenderAllowed(settings, key, verifiedAssistantSender(message)) ||
+            assistantChatRequest(message, wechat.wake_words ?? []))));
     let memberLane;
     for (let attempt = 0; attempt < 2; attempt++) {
       memberLane = memberLaneFor(live);
@@ -433,6 +459,7 @@ const replayTimer = setInterval(() => {
 const noticeDelivery = createAssistantNoticeDelivery({
   adapter,
   plugin,
+  buffer,
   deliveryControls,
   settingsFor: () => currentWechat(),
   isReady: () => connection.ready,

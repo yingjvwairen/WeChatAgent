@@ -512,6 +512,9 @@ test('an already-pasted UIA image or file resumes its native proof under an in-p
     assert.equal((await f.driver.resumeImage(job, { canInput: () => true })).ready, true);
     assert.equal(f.driver.textFocusLease.inPlace, true);
     assert.equal(f.driver.current.uiaImageProof.id, proof.id);
+    const observed = await f.driver.observe(job);
+    assert.equal(observed.ready, true);
+    assert.equal(observed.inputProcess, `${f.binding.pid}:${f.binding.processCreatedFileTimeUtc}`);
     assert.deepEqual(
       f.actions.map(item => item.action),
       ['inspectLayout', 'inspectFocusHandoff', 'beginForegroundSession', 'resumeUiaImage'],

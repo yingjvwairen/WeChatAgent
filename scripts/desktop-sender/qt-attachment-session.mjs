@@ -48,6 +48,11 @@ class QtAttachmentSession {
     this.#frames = frames;
     this.#focus = focus;
   }
+  #quoteRequest(job, current) {
+    if (job.quote?.serverId !== current.quoteServerId || Boolean(job.quote) !== Boolean(current.quoteToken))
+      return null;
+    return current.quoteToken ? { quoteToken: current.quoteToken, stepBinding: this.#input.textStepBinding(job) } : {};
+  }
   observeFileDialog(job) {
     const current = this.#input.current;
     if (
@@ -166,7 +171,7 @@ class QtAttachmentSession {
       send: structuredClone(roles[2].rect),
     });
   }
-  async pasteUiaImage(job, guard, current) {
+  async pasteUiaImage(job, guard, current, quote) {
     let entered = false,
       applied = false;
     try {
@@ -197,6 +202,7 @@ class QtAttachmentSession {
         sendRect: this.#frames.config.layout.send,
         imagePath: job.image.path,
         imageSha256: job.image.sha256,
+        ...quote,
       });
       if (
         result?.performed !== true ||
@@ -291,7 +297,7 @@ class QtAttachmentSession {
     this.#input.discardDraft();
     return { performed: true, attempted: true, inputReleased: result.dialogClosed === true };
   }
-  async #submitUiaImage(job, guard, current) {
+  async #submitUiaImage(job, guard, current, quote) {
     if (!validUiaImageProof(current.uiaImageProof, job.image) || this.#frames.frame !== current.uiaImageFrame)
       throw fault('UI_QT_IMAGE_APPLICATION_UNKNOWN');
     const frame = this.acceptUiaImageFrame(this.#frames.frame, current),
@@ -316,6 +322,7 @@ class QtAttachmentSession {
       idleMs: this.#frames.config.idleMs,
       imagePasteProofId: proof.id,
       imageSha256: proof.imageSha256,
+      ...quote,
     });
     const queued =
       result?.inputQueued === true &&
@@ -504,7 +511,9 @@ class QtAttachmentSession {
       return { performed: false, attempted: false, reason: 'UI_QT_INPUT_AUTHORIZATION_REQUIRED' };
     if (current.imageApplied || !object(job.image) || !hash(job.image.sha256) || !path.isAbsolute(job.image.path ?? ''))
       return { performed: false, attempted: false, reason: 'UI_QT_IMAGE_INVALID' };
-    if (this.#frames.config.layoutMode === 'uia-v1') return this.pasteUiaImage(job, guard, current);
+    const quote = this.#quoteRequest(job, current);
+    if (!quote) return { performed: false, attempted: false, reason: 'UI_QT_QUOTE_PREVIEW_UNVERIFIED' };
+    if (this.#frames.config.layoutMode === 'uia-v1') return this.pasteUiaImage(job, guard, current, quote);
     let entered = false,
       pasteApplied = false;
     try {
@@ -534,6 +543,7 @@ class QtAttachmentSession {
         foregroundOnly: !this.#focus.preparationLease(),
         imagePath: job.image.path,
         imageSha256: job.image.sha256,
+        ...quote,
       });
       if (
         result.performed !== true ||
@@ -615,8 +625,10 @@ class QtAttachmentSession {
           ? 'submitUiaImage'
           : 'submitOcrMedia';
     try {
+      const quote = this.#quoteRequest(job, current);
+      if (!quote) return { performed: false, attempted: false, reason: 'UI_QT_QUOTE_PREVIEW_UNVERIFIED' };
       if (action === 'submitFileDialog') return await this.#submitFileDialog(job, guard, current);
-      if (action === 'submitUiaImage') return await this.#submitUiaImage(job, guard, current);
+      if (action === 'submitUiaImage') return await this.#submitUiaImage(job, guard, current, quote);
       const frame = await this.#frames.capture([
         'header',
         ['gif', 'file'].includes(current.imageFormat) ? 'send' : 'editor',
@@ -636,6 +648,7 @@ class QtAttachmentSession {
         revision: frame.revision,
         idleMs: this.#frames.config.idleMs,
         rect: this.#frames.config.layout.send,
+        ...quote,
       });
       if (result.performed !== true || result.attempted !== true) throw fault('UI_QT_IMAGE_SUBMIT_UNCONFIRMED');
       this.#input.discardDraft();

@@ -37,6 +37,18 @@ export function normalizeOneBotEvent(platform, adapter, event) {
   const conversationId = String(target ?? ''),
     senderId = String(actor ?? '');
   if (!conversationId || !senderId) return null;
+  const contextNotice =
+    platform === 'wechat' &&
+    senderId === 'wechat-system' &&
+    event.wechatagent?.senderWxid === senderId &&
+    event.wechatagent?.contextOnly === true &&
+    event.wechatagent?.systemNotice === true;
+  const systemNotice =
+    contextNotice ||
+    (platform === 'wechat' &&
+      event.wechatagent?.systemNotice === true &&
+      event.wechatagent?.interaction === 'pat' &&
+      event.wechatagent?.senderWxid === senderId);
   const segments =
     typeof event.message === 'string'
       ? [{ type: 'text', data: { text: event.message } }]
@@ -122,7 +134,8 @@ export function normalizeOneBotEvent(platform, adapter, event) {
     conversation_id: conversationId,
     sender_id: senderId,
     ...(mentionTarget ? { mentionTarget } : {}),
-    ...(verifiedAssistantSender({
+    ...(!systemNotice &&
+    verifiedAssistantSender({
       platform,
       kind,
       conversation_id: conversationId,
@@ -134,8 +147,11 @@ export function normalizeOneBotEvent(platform, adapter, event) {
     conversation_name: String(
       kind === 'group' ? (event.group_name ?? conversationId) : (event.sender?.nickname ?? conversationId),
     ),
-    sender_name: String(event.sender?.card ?? event.sender?.nickname ?? senderId),
-    ...(platform === 'wechat' && kind === 'group' && /^[a-f0-9]{64}$/.test(event.wechatagent?.memberId ?? '')
+    sender_name: contextNotice ? '微信系统' : String(event.sender?.card ?? event.sender?.nickname ?? senderId),
+    ...(platform === 'wechat' &&
+    !systemNotice &&
+    kind === 'group' &&
+    /^[a-f0-9]{64}$/.test(event.wechatagent?.memberId ?? '')
       ? { sender_key: event.wechatagent.memberId }
       : {}),
     self_id: String(event.self_id ?? ''),
@@ -150,6 +166,7 @@ export function normalizeOneBotEvent(platform, adapter, event) {
     ...(voice ? { voice: { id: voice.data.voice_id, durationSeconds: voice.data.duration } } : {}),
     ...(voice?.data.source === 'video-audio' ? { voiceSource: 'video' } : {}),
     ...(platform === 'wechat' && event.wechatagent?.contextOnly === true ? { contextOnly: true } : {}),
+    ...(systemNotice ? { systemNotice: true } : {}),
     ...(platform === 'wechat' && (event.wechatagent?.attachmentUnavailable === true || unavailableFile)
       ? { attachmentUnavailable: true }
       : {}),

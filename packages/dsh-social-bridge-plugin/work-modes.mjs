@@ -52,7 +52,7 @@ export const assistantInstructionsFor = (root, limit) =>
   assistantInstructions.replace(WECHAT_MESSAGE_LAYOUT_NOTICE, currentReplyLayoutNotice(root, limit));
 export const assistantChatInstructionsFor = (root, limit, privateChat = false) =>
   (privateChat
-    ? '当前为助手的私聊通道，沿用本机助手人格。按本机定时提示找话题、问候或保持沉默。此通道不提供工具、联网、文件或任务操作。发送协议使用 RESPOND: 正文。\n' +
+    ? '当前为助手的私聊通道，沿用本机助手人格。根据本机定时提示或微信系统事件判断是否回应，也可以保持沉默。此通道不提供工具、联网、文件或任务操作。发送协议使用 RESPOND: 正文 或 SILENT。\n' +
       WECHAT_MESSAGE_LAYOUT_NOTICE
     : assistantChatInstructions
   ).replace(WECHAT_MESSAGE_LAYOUT_NOTICE, currentReplyLayoutNotice(root, limit));

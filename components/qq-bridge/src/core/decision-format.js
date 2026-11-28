@@ -17,6 +17,7 @@ import {
 import { splitStickerLabels } from './sticker-policy.js';
 import {
   hasQuoteControl,
+  NATIVE_QUOTE_NOTICE,
   parseQuoteReply,
 } from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 
@@ -89,6 +90,11 @@ function shortStickerDecision(text, stickerRefs) {
   return typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)
     ? { decision: 'STICKER', stickerId: id, text: '' }
     : { decision: 'INVALID', text: '' };
+}
+
+function stickerDecision(text, stickerRefs) {
+  const id = /^\[STICKER:([a-f0-9]{64})\]$/.exec(text)?.[1];
+  return id ? { decision: 'STICKER', stickerId: id, text: '' } : shortStickerDecision(text, stickerRefs);
 }
 
 export function parseSocialDecision(
@@ -169,12 +175,17 @@ export function parseSocialDecision(
     };
   };
   const quoted = parseQuoteReply(reply, quoteRefs);
-  if (quoted) return quoted.decision === 'RESPOND' ? response(quoted.text, quoted.quoteEventId) : quoted;
+  if (quoted) {
+    if (quoted.decision !== 'RESPOND') return quoted;
+    const media = stickerDecision(quoted.text, stickerRefs);
+    if (media?.decision === 'STICKER') return { ...media, quoteEventId: quoted.quoteEventId };
+    if (media || /\[\s*S\d+\b/i.test(quoted.text) || hasStickerControl(quoted.text))
+      return { decision: 'INVALID', text: '' };
+    return response(quoted.text, quoted.quoteEventId);
+  }
   if (!reply) return { decision: 'INVALID', text: '' };
   if (/^\[?SILENT\]?$/i.test(reply)) return { decision: 'SILENT', text: '' };
-  const sticker = /^\[STICKER:([a-f0-9]{64})\]$/.exec(reply);
-  if (sticker) return { decision: 'STICKER', stickerId: sticker[1], text: '' };
-  const short = shortStickerDecision(reply, stickerRefs);
+  const short = stickerDecision(reply, stickerRefs);
   if (short) return short;
   const caption = /^([\s\S]+?)\n\[STICKER:(S[1-9]\d{0,2}|[a-f0-9]{64})\]$/.exec(reply);
   if (allowStickerCaption && caption) {
@@ -255,7 +266,7 @@ export async function resolveSocialDecision({
       ? `如需原生表情，仅可输出 RESPOND: [STICKER:S编号]，本轮允许 ${choices.join('、')}；不能使用其他编号。\n`
       : '本次仅允许文字回复或沉默，不使用历史表情编号。\n') +
     (Object.keys(quoteRefs).length
-      ? '如需引用，仅可用 RESPOND: [QUOTE:编号] 正文，本轮允许 ' + Object.keys(quoteRefs).join('、') + '。\n'
+      ? NATIVE_QUOTE_NOTICE + ' 本轮引用编号有 ' + Object.keys(quoteRefs).join('、') + '。\n'
       : '') +
     (allowTextParts ? replyLayoutNotice(maxTextParts) + '\n' + SOCIAL_PROTOCOL_NOTICE : SOCIAL_PROTOCOL_NOTICE) +
     (allowVoice ? '\n' + SOCIAL_VOICE_NOTICE : '');

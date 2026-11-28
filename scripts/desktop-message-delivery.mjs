@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { validStaticImageReceipt } from './reply-image-format.mjs';
+import { wechatServerEventId } from '../packages/wechat-identity.mjs';
 import {
   desktopDeliveryStatus,
   desktopQueueFull,
@@ -51,6 +52,7 @@ export async function deliverDesktopMessage(adapter, request, prepare) {
     if (media) {
       submittingMedia = {
         text,
+        quoteEventId,
         withdrawn: false,
         accountRef: scope?.accountRef ?? adapter.accountRef,
         grant: scope ? scope.rosterGrant : rosterGrant(),
@@ -102,7 +104,11 @@ export async function deliverDesktopMessage(adapter, request, prepare) {
       throw new AdapterError('TEXT_DELIVERY_ID_CONFLICT');
     if (request.abandon) {
       const matchingFlight =
-        flight && flight.text === text && flight.accountRef === scope.accountRef && flight.grant === grant;
+        flight &&
+        flight.text === text &&
+        flight.quoteEventId === quoteEventId &&
+        flight.accountRef === scope.accountRef &&
+        flight.grant === grant;
       if (flight && !attempt && !matchingFlight) throw new AdapterError('TEXT_DELIVERY_ID_CONFLICT');
       if (matchingFlight) flight.withdrawn = true;
       if (attempt && !['confirmed', 'rejected'].includes(attempt.state))
@@ -230,11 +236,14 @@ export async function deliverDesktopMessage(adapter, request, prepare) {
     if (status !== 'confirmed') throw uncertain();
     const receipt = result.receipt;
     const localId = Number(receipt?.localId);
+    const receiptQuote =
+      receipt?.sourceServerId === undefined ? undefined : wechatServerEventId(target, receipt.sourceServerId);
     if (
       receipt?.source !== 'wechat-server-id' ||
       !/^[1-9]\d{0,31}$/.test(String(receipt.serverId)) ||
       !Number.isSafeInteger(localId) ||
       localId < 1 ||
+      (media && receiptQuote !== attempt.quoteEventId) ||
       (attempt.operation === 'image' && !validStaticImageReceipt(receipt))
     )
       throw uncertain();

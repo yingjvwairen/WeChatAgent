@@ -337,7 +337,7 @@ static uint QtImageCleanupSequence(QtImageRenderOwner renderer, IntPtr owner, ui
 }
 sealed class QtImageProof
 {
-    internal string Id, Epoch, Digest, Format, FilePath, FileDelivery;
+    internal string Id, Epoch, Digest, Format, FilePath, FileDelivery, QuoteToken;
     internal QtFrame Frame;
     internal QtFocusLease Lease;
     internal Rect Header, Editor, Send;
@@ -500,7 +500,7 @@ static object QtPasteUiaImage(QtClipboardOperation clipboard, Dictionary<string,
                     "imagePath", "imageSha256", "deliveryId", "titleSha256", "allowClipboardReplacement");
     else
         QtImageKeys(request, "token", "epoch", "revision", "idleMs", "headerRect", "editorRect", "sendRect",
-                    "imagePath", "imageSha256", "allowClipboardReplacement");
+                    "imagePath", "imageSha256", "allowClipboardReplacement", "quoteToken", "stepBinding");
     Need(!QtImagePasteUnconfirmed && (QtPendingImage == null || QtPendingImage.Consumed), "QT_UIA_IMAGE_PENDING");
     var source = QtCurrent;
     var lease = QtFocus.Active;
@@ -545,6 +545,7 @@ static object QtPasteUiaImage(QtClipboardOperation clipboard, Dictionary<string,
     var proof = new QtImageProof { Id = Guid.NewGuid().ToString("N"),
                                    Epoch = QtEpoch,
                                    Digest = Text(request, "imageSha256"),
+                                   QuoteToken = Text(request, "quoteToken"),
                                    Format = Text(report, "imageFormat"),
                                    Frame = frame,
                                    Lease = lease,
@@ -815,12 +816,14 @@ static object QtSubmitFileDialog(Dictionary<string, object> request)
 }
 static object QtSubmitUiaImage(Dictionary<string, object> request)
 {
-    QtImageKeys(request, "token", "epoch", "revision", "idleMs", "imagePasteProofId", "imageSha256");
+    QtImageKeys(request, "token", "epoch", "revision", "idleMs", "imagePasteProofId", "imageSha256", "quoteToken",
+                "stepBinding");
     var proof = QtPendingImage;
     var frame = QtCurrent;
     Need(!QtImagePasteUnconfirmed &&
              QtImageProofMatches(proof, Text(request, "imagePasteProofId"), Text(request, "imageSha256"), frame,
-                                 QtFocus.Active, UtcMs(), false),
+                                 QtFocus.Active, UtcMs(), false) &&
+             Text(request, "quoteToken") == proof.QuoteToken,
          "QT_UIA_IMAGE_PROOF_INVALID");
     QtGuard(request, true, false);
     Need(frame.Anchors.Count == 3 && Same(frame.Anchors[0].Rect, proof.Header) &&
@@ -836,6 +839,8 @@ static object QtSubmitUiaImage(Dictionary<string, object> request)
                                                : null) delivery =
         QtUiaPointerClick(frame, sendRole, "image-submit", delegate {
             Need(Object.ReferenceEquals(proof, QtPendingImage) && !proof.Consumed, "QT_UIA_IMAGE_PROOF_INVALID");
+            if (proof.Format != "file")
+                QtVerifyQuote(request, frame);
             proof.Consumed = true;
             QtCurrent = null;
         });
@@ -1525,6 +1530,7 @@ static object QtSubmitOcrMedia(Dictionary<string, object> request)
     var frame = QtGuard(request, true, false);
     Rect send = ParseRect(Get(request, "rect"));
     QtWaitOcrMediaSend(frame, send, true);
+    QtVerifyQuote(request, frame);
     var report = Map(QtAct(request, "click"));
     QtWaitOcrMediaSend(frame, send, false);
     report.Add("controlConsumed", true);
@@ -1556,6 +1562,8 @@ static object QtPasteImage(QtClipboardOperation clipboard, Dictionary<string, ob
             QtRevokeQueryClick(QtPopup);
             clipboard.ObserveRestore(true);
             QtFrame frame = QtGuard(request, true, false);
+            if (!ordinaryFile)
+                QtVerifyQuote(request, frame);
             Need(frame.MetadataOnly == uia && (!uia || QtUiaControlLeaseMatches(frame, QtFocus.Active)),
                  "QT_UIA_IMAGE_SOURCE_REQUIRED");
             Need(QtSurface == "main" && QtFastPasteAuthorized(QtFocus.Active != null, QtForegroundPasteOnly(request),

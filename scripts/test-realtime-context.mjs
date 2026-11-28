@@ -74,6 +74,34 @@ test('an administrator with Realtime enabled still delivers assistant control to
   assert.equal(sent[0].wechatagent.readerIntake.rawid, readerIntake.rawid);
 });
 
+test('assistant private voice uses the opt-in Realtime route only for a verified administrator', async () => {
+  const key = 'wechat:private:peer',
+    receipt = { account: 'a'.repeat(64), rawid: 'b'.repeat(64), grant: 'legacy', token: 'c'.repeat(64) },
+    voice = { id: 'd'.repeat(64), durationSeconds: 2 },
+    payload = { type: 34, sessionId: 'peer', talkerId: 'peer', content: '[语音]', voice },
+    event = { message_type: 'private', wechatagent: {} },
+    wechat = {
+      whitelist: { private: ['peer'], groups: [] },
+      workModes: { [key]: 'assistant' },
+      assistant: { administrators: ['peer'] },
+    };
+  const adapter = Object.assign(Object.create(WechatOneBot.prototype), {
+    accountRef: receipt.account,
+    project: { wechat },
+    reload() {},
+    claimIntakeRoute: async (_receipt, route) => route,
+    voiceSend: { synthesis: { candidates: () => [{ id: 'fixture' }] } },
+  });
+  assert.equal(await adapter.intakeRoute(payload, event, receipt), 'realtime');
+  assert.equal(await adapter.intakeRoute({ ...payload, offlineReplay: true }, event, receipt), 'dsh');
+  assert.equal(await adapter.intakeRoute({ ...payload, talkerId: 'other' }, event, receipt), 'dsh');
+  assert.equal(await adapter.intakeRoute({ ...payload, voice: undefined }, event, receipt), 'dsh');
+  const permitted = adapter.realtimePermitted(adapter.realtimeInput(payload, event, receipt));
+  wechat.assistant.administrators = [];
+  assert.equal(permitted(), false);
+  assert.equal(await adapter.intakeRoute(payload, event, receipt), 'dsh');
+});
+
 function savedRealtime(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'realtime-account-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -275,6 +303,77 @@ test('a queued Realtime reply obeys a work mode change while its receipt stays a
     save();
   }
 });
+
+for (const mode of ['text', 'voice']) {
+  test(`assistant Realtime ${mode} submission is bound to its authorized voice turn`, async t => {
+    const f = savedRealtime(t),
+      replies = f.make('a'),
+      { adapter, voiceSend } = replies,
+      key = 'wechat:private:peer',
+      wechat = {
+        whitelist: { groups: [], private: ['peer'] },
+        workModes: { [key]: 'assistant' },
+        assistant: { administrators: ['peer'] },
+      },
+      config = path.join(adapter.directory, 'config/wechatagent.json');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const save = () => fs.writeFileSync(config, JSON.stringify({ runtime: { sender: 'wechat-ui' }, wechat }));
+    save();
+    adapter.realtime = replies;
+    adapter.project = { wechat };
+    adapter.allowed = () => true;
+    adapter.checkNative = async () => ({ ...f.account('a'), voiceSend: true, voiceTransport: 'desktop' });
+    const selected = { id: 'fixture', generation: 'current' };
+    voiceSend.synthesis.candidates = () => [selected];
+    voiceSend.synthesis.selected = () => selected;
+    voiceSend.pluginGrant = (_identity, _kind, _target, plugin, feature) => ({ ...plugin, feature });
+    voiceSend.synthesis.generate = async ({ voiceId, beforeInvoke }) => {
+      assert.equal(voiceId, 'f'.repeat(64));
+      beforeInvoke();
+      return { mode, text: '你好', allowed: () => true };
+    };
+    const input = {
+      accountRef: adapter.accountRef,
+      rosterGrant: 'legacy',
+      kind: 'private',
+      target: 'peer',
+      sender: 'peer',
+      input: 'voice',
+      workMode: 'assistant',
+      rawid: 'b'.repeat(64),
+      voiceId: 'f'.repeat(64),
+    };
+    const turn = await replies.handle(input, adapter.realtimePermitted(input));
+    assert.equal(turn.status, 'queued');
+    const saved = replies.load(turn.id);
+    assert.equal(saved.workMode, 'assistant');
+    assert.equal(saved.voicePlugin.realtimeId, turn.id);
+    const job = {
+      ...f.account('a'),
+      kind: input.kind,
+      target: input.target,
+      rosterGrant: input.rosterGrant,
+      parentId:
+        mode === 'voice'
+          ? turn.id
+          : createHash('sha256')
+              .update(turn.id + '\0text')
+              .digest('hex'),
+      operation: mode,
+      voicePlugin: saved.voicePlugin,
+    };
+    assert.equal(adapter.authorizeDesktopCurrent(job), true);
+    assert.equal(adapter.authorizeDesktopCurrent({ ...job, parentId: 'wrong-reply' }), false);
+    delete wechat.assistant;
+    save();
+    assert.equal(adapter.authorizeDesktopCurrent(job), false);
+    assert.equal(adapter.authorizeDesktopCurrent(job, false), true);
+    wechat.assistant = { administrators: ['peer'] };
+    wechat.workModes[key] = 'social';
+    save();
+    assert.equal(adapter.authorizeDesktopCurrent(job), false);
+  });
+}
 
 test('Realtime keeps an outstanding audio submission from also falling back to text', async t => {
   const f = savedRealtime(t);

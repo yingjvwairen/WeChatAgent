@@ -228,6 +228,10 @@ export function readerEvent(payload, { ownWxid, allowed }) {
     wechatagent: {
       senderWxid: payload.talkerId,
       ...(payload.contextOnly === true ? { contextOnly: true } : {}),
+      ...(payload.type === PAT_TYPE ||
+      (payload.contextOnly === true && payload.systemNotice === true && payload.talkerId === 'wechat-system')
+        ? { systemNotice: true }
+        : {}),
       ...(payload.attachmentUnavailable === true || (file && !availableFile) ? { attachmentUnavailable: true } : {}),
       ...(['text', 'voice', 'video', 'image', 'sticker', 'link', 'file', 'record', 'quote', 'card'].includes(quoteKind)
         ? { quoteKind }

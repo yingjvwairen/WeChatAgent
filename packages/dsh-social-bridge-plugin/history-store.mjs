@@ -15,6 +15,17 @@ const decode = text => text.replaceAll('&lt;', '<').replaceAll('&gt;', '>').repl
 const readerOrder = "COALESCE(json_extract(body,'$.readerOrder'),'')";
 const historyOrder = `at,${readerOrder},seq`;
 const reverseHistoryOrder = `at DESC,${readerOrder} DESC,seq DESC`;
+function windowScope(key, rosterGrant) {
+  if (rosterGrant === undefined) return { where: "chat=? AND source!='legacy-context'", args: [key] };
+  const chat = key.replace(/:(assistant|assistant-chat)$/u, '');
+  if (!validChatKey(chat) || typeof rosterGrant !== 'string' || !rosterGrant) throw Error('HISTORY_CHAT_INVALID');
+  return {
+    where: `chat IN (?,?,?) AND source IN ('bridge','buffer-backfill') AND json_extract(body,'$.platform')='wechat'
+      AND COALESCE(json_extract(body,'$.readerGrant'),'legacy')=?
+      AND (json_extract(body,'$.outgoing')=0 OR json_extract(body,'$.delivery_status')='confirmed')`,
+    args: [chat, chat + ':assistant', chat + ':assistant-chat', rosterGrant],
+  };
+}
 function searchableText(body) {
   const quote = body.quoteReply,
     forward = body.forwardedRecord;
@@ -162,6 +173,7 @@ export class HistoryStore {
         'sticker_id',
         'forwardedRecord',
         'quoteReply',
+        'readerGrant',
         'readerOrder',
       ]
         .filter(k => row[k] !== undefined)
@@ -178,6 +190,7 @@ export class HistoryStore {
           : {}),
       }));
     if (row.contextOnly === true) body.contextOnly = true;
+    if (row.platform === 'wechat' && row.systemNotice === true) body.systemNotice = true;
     if (row.attachmentUnavailable === true) body.attachmentUnavailable = true;
     if (row.quoteKind) body.quoteKind = row.quoteKind;
     const at = Number(row.timestamp) || Date.now() / 1000;
@@ -186,6 +199,7 @@ export class HistoryStore {
       // A restart backfill must never replace a full text with its 4000-char buffer copy.
       if (previous) {
         const old = JSON.parse(previous.body);
+        if (typeof old.readerGrant === 'string') body.readerGrant = old.readerGrant;
         if (old.text.length > body.text.length && old.text.startsWith(body.text)) body.text = old.text;
         if (old.delivery_status === 'confirmed' && body.delivery_status !== 'confirmed') return previous.seq;
         if (old.delivery_status === 'confirmed') {
@@ -285,34 +299,54 @@ export class HistoryStore {
       .all(key)
       .map(r => ({ ...JSON.parse(r.body), archiveSeq: r.seq, archiveSource: r.source }));
   }
-  windowRows(key, policy, excludeIds = []) {
+  windowRows(key, policy, excludeIds = [], rosterGrant) {
+    const scope = windowScope(key, rosterGrant);
     const excluded = new Set(excludeIds);
+    const excludedRecords = new Set();
     let before = Number.MAX_SAFE_INTEGER;
-    for (const id of excludeIds) {
-      const row = this.db.prepare("SELECT seq FROM records WHERE chat=? AND json_extract(body,'$.id')=?").get(key, id);
-      if (row) before = Math.min(before, row.seq);
+    let latestAt = Number.MAX_SAFE_INTEGER;
+    if (excludeIds.length) {
+      const placeholders = excludeIds.map(() => '?').join(',');
+      const current = this.db
+        .prepare(
+          `SELECT seq,at,id FROM records WHERE ${scope.where} AND json_extract(body,'$.id') IN (${placeholders})`,
+        )
+        .all(...scope.args, ...excludeIds);
+      for (const row of current) {
+        before = Math.min(before, row.seq);
+        if (rosterGrant !== undefined) latestAt = Math.min(latestAt, row.at);
+        excludedRecords.add(row.id);
+      }
     }
+    // Shared history has one copy of each WeChat message, including records
+    // older releases backfilled into more than one archive namespace.
+    const limit = (policy.recentMessages + excludeIds.length) * (rosterGrant === undefined ? 1 : scope.args.length - 1);
     return this.db
       .prepare(
-        `SELECT seq,body,source FROM records WHERE chat=? AND source!='legacy-context' AND seq<? ORDER BY ${reverseHistoryOrder} LIMIT ?`,
+        `SELECT seq,id,body,source FROM records WHERE ${scope.where} AND seq<? AND at<=? ORDER BY ${reverseHistoryOrder} LIMIT ?`,
       )
-      .all(key, before, policy.recentMessages + excludeIds.length)
-      .filter(r => !excluded.has(JSON.parse(r.body).id))
+      .all(...scope.args, before, latestAt, limit)
+      .filter(r => {
+        if (excluded.has(JSON.parse(r.body).id)) return false;
+        if (rosterGrant === undefined) return true;
+        if (excludedRecords.has(r.id)) return false;
+        excludedRecords.add(r.id);
+        return true;
+      })
       .slice(0, policy.recentMessages)
       .reverse()
       .map(r => ({ ...JSON.parse(r.body), archiveSeq: r.seq, archiveSource: r.source }));
   }
-  windowRecords(key, ids) {
+  windowRecords(key, ids, rosterGrant) {
     if (!Array.isArray(ids) || ids.length > 100 || ids.some(id => !Number.isSafeInteger(id) || id < 1))
       throw Error('HISTORY_WINDOW_IDS_INVALID');
     if (!ids.length) return [];
+    const scope = windowScope(key, rosterGrant);
     const rows = this.db
       .prepare(
-        "SELECT seq,body,source FROM records WHERE chat=? AND source!='legacy-context' AND seq IN (" +
-          ids.map(() => '?').join(',') +
-          ')',
+        `SELECT seq,body,source FROM records WHERE ${scope.where} AND seq IN (` + ids.map(() => '?').join(',') + ')',
       )
-      .all(key, ...ids);
+      .all(...scope.args, ...ids);
     const byId = new Map(rows.map(r => [r.seq, { ...JSON.parse(r.body), archiveSeq: r.seq, archiveSource: r.source }]));
     return ids.flatMap(id => (byId.has(id) ? [byId.get(id)] : []));
   }
