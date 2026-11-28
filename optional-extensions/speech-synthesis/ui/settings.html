@@ -50,7 +50,13 @@
         <small>设定合成语音的语气或风格。只有支持语气指令的服务会使用；不支持的服务可能报错。</small>
       </div>
       <div class="field">
-        <label for="timeout-seconds">等待服务响应的最长时间（秒）</label>
+        <label for="tts-timeout-seconds">普通语音合成等待时间（秒）</label>
+        <input id="tts-timeout-seconds" type="number" min="1" max="600" step="1">
+        <small>较长回复可增加等待时间，最长 600 秒。</small>
+        <div class="advice" data-advice="ttsTimeoutMs" hidden></div>
+      </div>
+      <div class="field">
+        <label for="timeout-seconds">实时语音与识别等待时间（秒）</label>
         <input id="timeout-seconds" type="number" min="1" max="25" step="1">
         <div class="advice" data-advice="timeoutMs" hidden></div>
       </div>

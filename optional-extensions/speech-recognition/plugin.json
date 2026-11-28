@@ -1,7 +1,7 @@
 {
   "id": "speech-recognition",
   "name": "语音识别 API",
-  "version": "1.6.0",
+  "version": "1.7.1",
   "apiVersion": 2,
   "host": "wechatagent",
   "author": "WeChatAgent",
@@ -10,6 +10,7 @@
     "audio_read"
   ],
   "requiresHostFeatures": [
+    "audio-segments-v1",
     "actions-v1",
     "voice-input-v1"
   ],
@@ -33,8 +34,8 @@
     "responseMode": "json",
     "responsePath": "text",
     "timeoutMs": 20000,
-    "maxDurationSeconds": 60,
-    "maxTranscriptChars": 4000,
+    "maxDurationSeconds": 300,
+    "maxTranscriptChars": 12000,
     "cacheResults": true,
     "modelsEndpoint": "",
     "modelsResponsePath": "data",
@@ -161,15 +162,15 @@
     },
     "maxDurationSeconds": {
       "type": "integer",
-      "title": "最长语音（秒）",
+      "title": "单条消息最长音轨（秒，超过 60 秒自动分段）",
       "minimum": 1,
-      "maximum": 60
+      "maximum": 300
     },
     "maxTranscriptChars": {
       "type": "integer",
       "title": "转写文本长度上限",
       "minimum": 100,
-      "maximum": 4000
+      "maximum": 12000
     },
     "cacheResults": {
       "type": "boolean",

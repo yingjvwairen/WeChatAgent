@@ -1,0 +1,175 @@
+{
+  "engineRevision": "b4570b876f5c086819ba84e3215472733c6a7b70",
+  "requirements": [
+    "numpy==1.26.4",
+    "scipy==1.17.1",
+    "librosa==0.10.2",
+    "transformers==4.51.3",
+    "sentencepiece==0.2.2",
+    "peft==0.17.1",
+    "cn2an==0.5.24",
+    "pypinyin==0.55.0",
+    "g2p_en==2.1.0",
+    "modelscope==1.40.2",
+    "chardet==7.7.0",
+    "PyYAML==6.0.3",
+    "psutil==7.2.2",
+    "jieba==0.42.1",
+    "split-lang==2.1.1",
+    "fast_langdetect==1.1.0",
+    "wordsegment==1.3.1",
+    "rotary_embedding_torch==0.9.1",
+    "ToJyutping==3.2.0",
+    "ko_pron==1.3",
+    "opencc==1.4.2",
+    "fastapi==0.162.0",
+    "starlette==1.10.0",
+    "uvicorn==0.54.0",
+    "pydantic==2.10.6",
+    "ctranslate2==4.8.3",
+    "av==19.0.2",
+    "tqdm==4.70.1",
+    "onnxruntime==1.31.0",
+    "matplotlib==3.11.2",
+    "ffmpeg-python==0.2.0",
+    "pytorch-lightning==2.6.6",
+    "torchmetrics==1.5.0",
+    "lightning-utilities==0.15.3",
+    "x_transformers==2.31.10",
+    "resampy==0.4.3",
+    "python-multipart==0.0.32",
+    "soundfile==0.14.0",
+    "imageio-ffmpeg==0.6.0"
+  ],
+  "models": [
+    {
+      "path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/s1v3.ckpt",
+      "size": 155284856,
+      "sha256": "87133414860ea14ff6620c483a3db5ed07b44be42e2c3fcdad65523a729a745a"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/v2Pro/s2Gv2ProPlus.pth",
+      "size": 200125741,
+      "sha256": "d42a22bbbf65fb2bbdd45ad6a66841156977db45c7aabe0a6992ff378d9c7d3b"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/chinese-roberta-wwm-ext-large/pytorch_model.bin",
+      "size": 651225145,
+      "sha256": "e53a693acc59ace251d143d068096ae0d7b79e4b1b503fa84c9dcf576448c1d8"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/config.json",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/chinese-roberta-wwm-ext-large/config.json",
+      "size": 963,
+      "sha256": "3d57de2fd7e80d0e5c8ff194f0bbb6baa10df7e43fc262a0cc71298a78b0a3e5"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/chinese-roberta-wwm-ext-large/tokenizer.json",
+      "size": 268962,
+      "sha256": "173796956820ea27bd14f76bf28162607ff4254807e2948253eb5b46f5bb643b"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/chinese-hubert-base/pytorch_model.bin",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/chinese-hubert-base/pytorch_model.bin",
+      "size": 188811417,
+      "sha256": "24164f129c66499d1346e2aa55f183250c223161ec2770c0da3d3b08cf432d3c"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/chinese-hubert-base/config.json",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/chinese-hubert-base/config.json",
+      "size": 1449,
+      "sha256": "c3e5060a1277e0f078cc6be9da4528a605dba6ece93018981fe2c820e5c7b103"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/chinese-hubert-base/preprocessor_config.json",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/chinese-hubert-base/preprocessor_config.json",
+      "size": 212,
+      "sha256": "dcd684124d06722947939d41ea6ae58dbf10968c60a11a29f23ddc602c64a29b"
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt",
+      "url": "https://huggingface.co/lj1995/GPT-SoVITS/resolve/8f8857563c040d542de108a2c18b0425abd6c9c5/sv/pretrained_eres2netv2w24s4ep4.ckpt",
+      "size": 107528697,
+      "sha256": "4f5a0bf73c61eb41b174e1bb54e7ee3c83233892be8e0af1f187024e8e581a35"
+    },
+    {
+      "path": "GPT_SoVITS/dania-e15.ckpt",
+      "url": "https://www.modelscope.cn/models/villia/dania/resolve/3bfd54139e141702c1b4a4a744188d234df6620d/dania-e15.ckpt",
+      "size": 155313312,
+      "sha256": "021de96fd53115fd5acac114d6be2c7cc1201bbf64e62f8985abbc76b35014c6"
+    },
+    {
+      "path": "GPT_SoVITS/dania_e16_s2192.pth",
+      "url": "https://www.modelscope.cn/models/villia/dania/resolve/3bfd54139e141702c1b4a4a744188d234df6620d/dania_e16_s2192.pth",
+      "size": 172765299,
+      "sha256": "668b7ff9d01aeaa36acdff65b1126cb65a5f1ebf8f93c08108130b856b1030cd"
+    },
+    {
+      "path": "output/slicer_opt/output.wav_0009342720_0009558400.wav",
+      "url": "https://www.modelscope.cn/models/villia/dania/resolve/3bfd54139e141702c1b4a4a744188d234df6620d/output.wav_0009342720_0009558400.wav",
+      "size": 431404,
+      "sha256": "98cde6a626505e531d0297b5e9ad99f0aec274077ef6bc9540c83dad89c945c8"
+    }
+  ],
+  "resources": [
+    {
+      "path": "GPT_SoVITS/text/G2PWModel_1.1.zip",
+      "url": "https://www.modelscope.cn/models/kamiorinn/g2pw/resolve/827f4a519b083e3f37c790c938300241e75692d5/G2PWModel_1.1.zip",
+      "size": 588857174,
+      "sha256": "b116f6930a7ee55eef6576a8d8e14bf40c1106583439e8ae924b901512379c64",
+      "extract": "GPT_SoVITS/text/G2PWModel",
+      "prefix": "G2PWModel_1.1/",
+      "limit": 1073741824
+    },
+    {
+      "path": "GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin",
+      "url": "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin",
+      "size": 131266198,
+      "sha256": "7e69ec5451bc261cc7844e49e4792a85d7f09c06789ec800fc4a44aec362764e"
+    },
+    {
+      "path": "runtime/nltk_data/taggers/averaged_perceptron_tagger.zip",
+      "url": "https://raw.githubusercontent.com/nltk/nltk_data/550b6625bcef1f2abff2ff770a5a0d272c9c6b2a/packages/taggers/averaged_perceptron_tagger.zip",
+      "size": 2526731,
+      "sha256": "e1f13cf2532daadfd6f3bc481a49859f0b8ea6432ccdcd83e6a49a5f19008de9",
+      "extract": "runtime/nltk_data/taggers",
+      "limit": 52428800
+    },
+    {
+      "path": "runtime/nltk_data/taggers/averaged_perceptron_tagger_eng.zip",
+      "url": "https://raw.githubusercontent.com/nltk/nltk_data/550b6625bcef1f2abff2ff770a5a0d272c9c6b2a/packages/taggers/averaged_perceptron_tagger_eng.zip",
+      "size": 1539115,
+      "sha256": "6025f530624335c67d6547d44757b357b4e79bae030a0383e9887a92c1718f0b",
+      "extract": "runtime/nltk_data/taggers",
+      "limit": 52428800
+    },
+    {
+      "path": "runtime/nltk_data/corpora/cmudict.zip",
+      "url": "https://raw.githubusercontent.com/nltk/nltk_data/550b6625bcef1f2abff2ff770a5a0d272c9c6b2a/packages/corpora/cmudict.zip",
+      "size": 896069,
+      "sha256": "d07cca47fd72ad32ea9d8ad1219f85301eeaf4568f8b6b73747506a71fb5afd6",
+      "extract": "runtime/nltk_data/corpora",
+      "limit": 52428800
+    }
+  ],
+  "profile": {
+    "name": "达妮娅",
+    "gptWeights": "GPT_SoVITS/dania-e15.ckpt",
+    "sovitsWeights": "GPT_SoVITS/dania_e16_s2192.pth",
+    "refAudio": "output/slicer_opt/output.wav_0009342720_0009558400.wav",
+    "promptText": "怎么啊？如果有你在也不放心，那就干脆给我也装个限制器或者炸弹喽。",
+    "promptLang": "zh",
+    "textLang": "zh",
+    "speed": 1,
+    "temperature": 0.7,
+    "topK": 10,
+    "topP": 0.9,
+    "repetitionPenalty": 1.35,
+    "fragmentInterval": 0.4,
+    "textSplitMethod": "cut2"
+  }
+}

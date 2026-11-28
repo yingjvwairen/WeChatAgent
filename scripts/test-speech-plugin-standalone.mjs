@@ -156,6 +156,7 @@ test('the real ZIP works on a copied unchanged host with no bundled preset modul
       .readdirSync(path.join(source, 'packages/plugin-api'))
       .filter(name => name.endsWith('.mjs') && name !== 'bundled.mjs')
       .map(name => 'packages/plugin-api/' + name),
+    'packages/wechat-identity.mjs',
     'packages/extension-runtime/catalog.mjs',
     'packages/dsh-social-bridge-plugin/deadline.mjs',
     'components/qq-bridge/src/safe-fetch.js',
@@ -222,9 +223,16 @@ test('the real ZIP works on a copied unchanged host with no bundled preset modul
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
   const previousSource = path.join(source, 'optional-extensions/speech-recognition');
+  // Use the real prior release when a compatibility checkout is supplied. The
+  // default test needs an installed predecessor with saved settings, even in
+  // source distributions that only ship the current ZIP.
   const oldFiles = process.env.WECHATAGENT_COMPAT_HOST
     ? packageFiles(previousSource)
-    : unpackZip(fs.readFileSync(path.join(project, 'optional-extensions/packages/speech-recognition-1.3.0.zip')));
+    : entries.map(entry =>
+        entry.name === 'plugin.json'
+          ? { ...entry, data: Buffer.from(JSON.stringify({ ...manifest, version: '0.0.1' })) }
+          : entry,
+      );
   const prior = installer.inspect({ name: 'previous.zip', zip: packZip(oldFiles).toString('base64') });
   installer.install(prior);
   catalog.updatePlugin(workspace, manifest.id, {

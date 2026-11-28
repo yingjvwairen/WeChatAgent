@@ -62,7 +62,7 @@ test('the voice ZIP has its own exact first-party identity and cannot impersonat
     path.join(root, 'optional-extensions/speech-recognition'),
     { recursive: true },
   );
-  const relative = 'optional-extensions/packages/speech-recognition-1.6.0.zip';
+  const relative = 'optional-extensions/packages/speech-recognition-1.7.1.zip';
   assert(SOURCE_PLUGIN_ZIPS.includes(relative));
   const zip = packZip(packageFiles(path.join(root, 'optional-extensions/speech-recognition')));
   assert.equal(verifySourcePluginZip(root, zip, relative).id, 'speech-recognition');

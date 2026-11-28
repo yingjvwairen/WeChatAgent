@@ -1,15 +1,21 @@
-import {maximumWavBytes, normalizeWav} from './wav.mjs';
-import {authHeaders} from './resolve.mjs';
+import { maximumWavBytes, normalizeWav } from './wav.mjs';
+import { authHeaders } from './resolve.mjs';
 
 const speechPath = '/audio/speech';
 const recognitionPath = '/audio/transcriptions';
 const codeError = code => new Error(code);
 // Settings saved before 1.2.0 have no speed; 1 means the provider default.
 const speedOf = settings => settings.speed ?? 1;
-const shortString = (value, length) => typeof value === 'string' && !!value.trim() &&
-  value.length <= length && !/[\x00-\x1f\x7f]/.test(value);
+const shortString = (value, length) =>
+  typeof value === 'string' && !!value.trim() && value.length <= length && !/[\x00-\x1f\x7f]/.test(value);
 
 export const failureMessages = {
+  VOICE_VIDEO_NO_AUDIO: '这段视频没有音轨。',
+  VOICE_INPUT_INVALID_AUDIO: '收到的分段音轨不完整或超出范围，本轮未返回部分转写。',
+  VOICE_REALTIME_INPUT_TOO_LONG: '实时对话不支持分段视频音轨，请启用语音识别后交给 DSH 处理。',
+  VOICE_GPT_SOVITS_ENDPOINT: '请填写本机 GPT-SoVITS 的服务地址，如 http://127.0.0.1:9880。',
+  VOICE_GPT_SOVITS_REFERENCE: '请填写 GPT-SoVITS 服务可读取的本地参考音频路径，并检查参考文本。',
+  VOICE_GPT_SOVITS_CONFIG: '请检查参考音频语言、回复语言和语速。',
   VOICE_TTS_CONFIG: '请检查服务地址、语音模型、音色和语速是否已填写。',
   VOICE_TTS_ENDPOINT: '请填写 HTTP 或 HTTPS API 基础地址，或完整 /audio/speech 地址。',
   VOICE_TTS_AUTH: 'API 密钥没有通过验证，请重新复制平台的密钥；也可能是该密钥没有这个模型的使用权限。',
@@ -18,7 +24,7 @@ export const failureMessages = {
   VOICE_TTS_NETWORK: '连不上语音服务，请核对服务地址和网络（部分海外平台国内无法直接访问）。',
   VOICE_TTS_TIMEOUT: '语音服务响应超时。',
   VOICE_TTS_INVALID_AUDIO: '这个模型没有返回可用的 WAV 音频，请换一个语音模型或平台。',
-  VOICE_TTS_TOO_LONG: '生成的音频超过 60 秒，请缩短文字。',
+  VOICE_TTS_TOO_LONG: '生成的音频超过长语音上限，请缩短文字。',
   VOICE_TTS_TOO_LARGE: '服务返回的数据超过大小上限。',
   VOICE_TTS_MODELS: '服务没有返回可用的模型列表，可以手动填写模型 ID。',
   VOICE_TTS_TRANSCRIPT: '服务未返回可用的转写文本。',
@@ -51,7 +57,8 @@ export const failureMessages = {
   VOICE_PROVIDER_UNSUPPORTED: '所选服务没有接通这项能力。',
   VOICE_PROVIDER_REGION: '请选择或填写有效的区域。',
   VOICE_TENCENT_KEY: '请同时填写腾讯云 SecretId 和 SecretKey。',
-  VOICE_GOOGLE_KEY: '请选择有效的 Google Cloud 服务账号 JSON（type 为 service_account，包含 client_email 和 private_key）。',
+  VOICE_GOOGLE_KEY:
+    '请选择有效的 Google Cloud 服务账号 JSON（type 为 service_account，包含 client_email 和 private_key）。',
   VOICE_AUTH_HEADER: '请填写有效的鉴权请求头名称（字母、数字和短横线）。',
   VOICE_AUTH_HEADER_REALTIME: 'Realtime WebSocket 只支持 Bearer 鉴权或无需鉴权。',
   VOICE_TTS_NOT_CONFIGURED: '尚未配置语音合成服务。',
@@ -65,8 +72,11 @@ export const failureMessages = {
 
 function endpoint(value, models) {
   let url;
-  try { url = new URL(value.trim()); }
-  catch { throw codeError('VOICE_TTS_ENDPOINT'); }
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw codeError('VOICE_TTS_ENDPOINT');
+  }
   if (models && url.protocol === 'wss:') url.protocol = 'https:';
   if (models && url.protocol === 'ws:') url.protocol = 'http:';
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
@@ -77,18 +87,27 @@ function endpoint(value, models) {
     const base = pathname.replace(/\/(audio\/(speech|transcriptions)|realtime)$/, '');
     if (pathname.endsWith('/realtime')) url.searchParams.delete('model');
     url.pathname = (base || (pathname ? '' : '/v1')) + '/models';
-  }
-  else url.pathname = pathname.endsWith(speechPath) ? pathname : (pathname || '/v1') + speechPath;
+  } else url.pathname = pathname.endsWith(speechPath) ? pathname : (pathname || '/v1') + speechPath;
   return url;
 }
 
 export function validateSettings(settings, models = false) {
   const url = endpoint(settings.endpoint, models);
-  if (typeof settings.apiKey !== 'string' || /[\r\n\0]/.test(settings.apiKey) ||
-      !Number.isInteger(settings.timeoutMs) || settings.timeoutMs < 1000 || settings.timeoutMs > 25000 ||
-      !models && (!shortString(settings.model, 200) || !shortString(settings.voice, 200) ||
-        typeof settings.instructions !== 'string' || settings.instructions.length > 4096 || !Number.isFinite(speedOf(settings)) ||
-        speedOf(settings) < 0.25 || speedOf(settings) > 4)) {
+  if (
+    typeof settings.apiKey !== 'string' ||
+    /[\r\n\0]/.test(settings.apiKey) ||
+    !Number.isInteger(settings.timeoutMs) ||
+    settings.timeoutMs < 1000 ||
+    settings.timeoutMs > 600000 ||
+    (!models &&
+      (!shortString(settings.model, 200) ||
+        !shortString(settings.voice, 200) ||
+        typeof settings.instructions !== 'string' ||
+        settings.instructions.length > 4096 ||
+        !Number.isFinite(speedOf(settings)) ||
+        speedOf(settings) < 0.25 ||
+        speedOf(settings) > 4))
+  ) {
     throw codeError('VOICE_TTS_CONFIG');
   }
   return url;
@@ -112,25 +131,47 @@ export async function responseBytes(response, limit) {
 // OpenAI-compatible HTTP routes. service is a resolved capability service
 // (lib/resolve.mjs): service.flat holds the request values, service.key the
 // credential that may go to this address.
-async function request(service, {text, signal, fetchImpl = fetch}) {
-  const settings = service.flat, models = text === undefined;
+async function request(service, { text, signal, fetchImpl = fetch }) {
+  const settings = service.flat,
+    models = text === undefined;
   const url = validateSettings(settings, models);
   const timeout = AbortSignal.timeout(settings.timeoutMs);
   const requestSignal = signal ? AbortSignal.any([timeout, signal]) : timeout;
-  const headers = {...authHeaders(service), Accept: models ? 'application/json' : 'audio/wav, application/octet-stream'};
-  const body = models ? undefined : JSON.stringify({
-    model: settings.model.trim(), input: text, voice: settings.voice.trim(), response_format: 'wav',
-    ...(speedOf(settings) !== 1 ? {speed: speedOf(settings)} : {}),
-    ...(settings.instructions.trim() ? {instructions: settings.instructions.trim()} : {}),
-  });
+  const headers = {
+    ...authHeaders(service),
+    Accept: models ? 'application/json' : 'audio/wav, application/octet-stream',
+  };
+  const body = models
+    ? undefined
+    : JSON.stringify({
+        model: settings.model.trim(),
+        input: text,
+        voice: settings.voice.trim(),
+        response_format: 'wav',
+        ...(speedOf(settings) !== 1 ? { speed: speedOf(settings) } : {}),
+        ...(settings.instructions.trim() ? { instructions: settings.instructions.trim() } : {}),
+      });
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   try {
-    const response = await fetchImpl(url, {method: models ? 'GET' : 'POST', headers, body, redirect: 'error', signal: requestSignal});
+    const response = await fetchImpl(url, {
+      method: models ? 'GET' : 'POST',
+      headers,
+      body,
+      redirect: 'error',
+      signal: requestSignal,
+    });
     if (!response.ok) {
       await response.body?.cancel();
       // A missing /models route only means the list is unavailable; IDs can be typed.
-      throw codeError([401, 403].includes(response.status) ? 'VOICE_TTS_AUTH'
-        : response.status === 404 ? models ? 'VOICE_TTS_MODELS' : 'VOICE_TTS_MODEL' : 'VOICE_TTS_HTTP');
+      throw codeError(
+        [401, 403].includes(response.status)
+          ? 'VOICE_TTS_AUTH'
+          : response.status === 404
+            ? models
+              ? 'VOICE_TTS_MODELS'
+              : 'VOICE_TTS_MODEL'
+            : 'VOICE_TTS_HTTP',
+      );
     }
     return await responseBytes(response, models ? 512 * 1024 : maximumWavBytes);
   } catch (error) {
@@ -141,18 +182,23 @@ async function request(service, {text, signal, fetchImpl = fetch}) {
 }
 
 export async function speechSynthesize(service, text, options = {}) {
-  return normalizeWav(await request(service, {text, ...options}));
+  return normalizeWav(await request(service, { text, ...options }), 16000, { maxSeconds: 1024 });
 }
 
 // Model IDs for the settings page; any audio route or /realtime maps to /models.
 export async function speechModels(service, options = {}) {
-  const bytes = await request({...service, flat: {...service.flat, model: '', voice: ''}}, options);
+  const bytes = await request({ ...service, flat: { ...service.flat, model: '', voice: '' } }, options);
   let data;
-  try { data = JSON.parse(bytes).data; } catch {}
+  try {
+    data = JSON.parse(bytes).data;
+  } catch {}
   if (!Array.isArray(data)) throw codeError('VOICE_TTS_MODELS');
   const key = service.key;
-  return {models: [...new Set(data.map(row => row?.id)
-    .filter(id => shortString(id, 200) && (!key || !id.includes(key))))].slice(0, 200)};
+  return {
+    models: [
+      ...new Set(data.map(row => row?.id).filter(id => shortString(id, 200) && (!key || !id.includes(key)))),
+    ].slice(0, 200),
+  };
 }
 
 // A base address gets /audio/transcriptions; a full route (speech or
@@ -164,7 +210,7 @@ export function transcriptionUrl(value) {
   return url;
 }
 
-export async function transcriptionsTranscribe(service, wav, {signal, fetchImpl = fetch} = {}) {
+export async function transcriptionsTranscribe(service, wav, { signal, fetchImpl = fetch } = {}) {
   const settings = service.flat;
   if (!shortString(settings.model, 200)) throw codeError('VOICE_TTS_CONFIG');
   const url = transcriptionUrl(settings.endpoint);
@@ -172,15 +218,27 @@ export async function transcriptionsTranscribe(service, wav, {signal, fetchImpl 
   const timeout = AbortSignal.timeout(settings.timeoutMs);
   const requestSignal = signal ? AbortSignal.any([timeout, signal]) : timeout;
   const body = new FormData();
-  body.append('file', new Blob([wav], {type: 'audio/wav'}), 'voice.wav');
+  body.append('file', new Blob([wav], { type: 'audio/wav' }), 'voice.wav');
   body.append('model', settings.model.trim());
   try {
-    const response = await fetchImpl(url, {method: 'POST', headers: authHeaders(service), body, redirect: 'error', signal: requestSignal});
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers: authHeaders(service),
+      body,
+      redirect: 'error',
+      signal: requestSignal,
+    });
     if (!response.ok) {
       await response.body?.cancel();
-      throw codeError([401, 403].includes(response.status) ? 'VOICE_TTS_AUTH' : response.status === 404 ? 'VOICE_TTS_MODEL' : 'VOICE_TTS_HTTP');
+      throw codeError(
+        [401, 403].includes(response.status)
+          ? 'VOICE_TTS_AUTH'
+          : response.status === 404
+            ? 'VOICE_TTS_MODEL'
+            : 'VOICE_TTS_HTTP',
+      );
     }
-    const {text} = JSON.parse(await responseBytes(response, 128 * 1024));
+    const { text } = JSON.parse(await responseBytes(response, 128 * 1024));
     if (!shortString(typeof text === 'string' ? text.trim().replace(/[\r\n\t]/g, ' ') : text, 4000)) {
       throw codeError('VOICE_TTS_TRANSCRIPT');
     }

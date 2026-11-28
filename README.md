@@ -150,8 +150,8 @@ Windows 安装器预置语音识别 API 1.6.0 和语音对话 API 1.7.0，两者
 
 | 插件 | 下载 ZIP | 使用说明 |
 | --- | --- | --- |
-| 语音对话 API | [speech-synthesis-1.7.0.zip](optional-extensions/packages/speech-synthesis-1.7.0.zip) | [语音合成、实时和单条转写](docs/VOICE_OUTPUT.md) |
-| 语音识别 API | [speech-recognition-1.6.0.zip](optional-extensions/packages/speech-recognition-1.6.0.zip) | [API 配置与语音转写](docs/VOICE_INPUT.md) |
+| 语音对话 API | [speech-synthesis-1.8.1.zip](optional-extensions/packages/speech-synthesis-1.8.1.zip) | [语音合成、实时和单条转写](docs/VOICE_OUTPUT.md) |
+| 语音识别 API | [speech-recognition-1.7.1.zip](optional-extensions/packages/speech-recognition-1.7.1.zip) | [API 配置与语音转写](docs/VOICE_INPUT.md) |
 | 鱼的记事本 | [fish-notebook-1.1.1.zip](optional-extensions/packages/fish-notebook-1.1.1.zip) | [记事本插件说明](docs/FISH_NOTEBOOK.md) |
 
 每个 ZIP 都附有同名的 `.sha256` 校验文件，位于同一目录。安装时直接导入 ZIP，无需解压。

@@ -15,7 +15,7 @@ import {
 import { safeFetch } from '../../components/qq-bridge/src/safe-fetch.js';
 import { PluginDocuments } from './documents.mjs';
 import { createAudioReader } from './audio.mjs';
-import { boundedTask } from '../dsh-social-bridge-plugin/deadline.mjs';
+import { boundedTask, VOICE_TRANSCRIPTION_TIMEOUT_MS } from '../dsh-social-bridge-plugin/deadline.mjs';
 import { FEATURE_ENTRIES, adapterOwnsPlugin, featureConfigured } from './contract.mjs';
 export { createPluginModelUtility } from './model-utility.mjs';
 export const TOOL_POLICY = Symbol.for('wechatagent.extension-tools.v1');
@@ -243,8 +243,10 @@ export class PluginRuntime {
           !this.accountBound ||
           !turn.voiceIds?.includes(id) ||
           !options ||
-          Object.keys(options).some(key => key !== 'format') ||
-          !['wav', 'silk'].includes(options.format ?? 'wav')
+          Object.keys(options).some(key => !['format', 'segment'].includes(key)) ||
+          !['wav', 'silk'].includes(options.format ?? 'wav') ||
+          (options.segment !== undefined &&
+            (!Number.isInteger(options.segment) || options.segment < 0 || options.segment > 4))
         )
           throw fail('VOICE_REFERENCE_NOT_ALLOWED');
         const result = await this.readAudio(id, turn.conversationKey, record.id, { ...options, signal });
@@ -576,11 +578,22 @@ export class PluginRuntime {
     const [record] = handlers,
       action = record.process.actions.find(action => action.id === entry.action);
     validateValue(args, action.parameters);
-    const result = await this.invoke(record, 'action', action.id, args, turn, options);
+    const result = await this.invoke(record, 'action', action.id, args, turn, {
+      ...options,
+      maxTimeoutMs:
+        feature === 'voice-input-v1' ? VOICE_TRANSCRIPTION_TIMEOUT_MS : feature === 'voice-output-v1' ? 600000 : 35000,
+    });
     if (!this.active(record, turn.conversationKey, entry.permission)) throw fail('PLUGIN_PERMISSION_DENIED');
     return { handled: true, plugin: record.id, generation: record.generation, result };
   }
-  async invoke(record, kind, name, args, turn, { signal, timeoutMs = 35000, requireReply = false } = {}) {
+  async invoke(
+    record,
+    kind,
+    name,
+    args,
+    turn,
+    { signal, timeoutMs = 35000, requireReply = false, maxTimeoutMs = 35000 } = {},
+  ) {
     const controller = new AbortController(),
       abort = () => controller.abort();
     signal?.addEventListener('abort', abort, { once: true });
@@ -593,7 +606,7 @@ export class PluginRuntime {
         args,
         this.context(record, scoped),
         this.service(record, scoped, controller.signal),
-        { signal: controller.signal, timeoutMs: Math.min(35000, timeoutMs) },
+        { signal: controller.signal, timeoutMs: Math.min(maxTimeoutMs, timeoutMs) },
       );
       if (
         !this.active(record, turn.conversationKey) ||

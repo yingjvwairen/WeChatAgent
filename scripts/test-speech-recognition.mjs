@@ -1,3 +1,4 @@
+import { audioSegments } from '../packages/plugin-api/audio.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -46,7 +47,7 @@ function context(config = {}, read = async () => audio) {
     chat: { key },
     signal: new AbortController().signal,
     config: () => ({ ...defaults, apiProtocol: 'custom', ...config }),
-    audio: { read },
+    audio: { read, segments: (id, opts) => audioSegments(read, id, opts) },
   };
 }
 async function server(t, handler) {
@@ -150,6 +151,76 @@ test('JSON templates preserve nested structure, escaping and numeric placeholder
     { id },
   );
   assert.equal(result.text, '你好，测试成功');
+});
+
+test('a five-minute message is transcribed in five authorized chunks and returns one bound transcript', async t => {
+  const reads = [],
+    uploads = [];
+  const endpoint = await server(t, async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    uploads.push(body);
+    res.end(JSON.stringify({ text: 'segment ' + uploads.length }));
+  });
+  const result = await recognize(
+    context({ endpoint, cacheResults: false, maxDurationSeconds: 300 }, async (voice, options) => {
+      assert.equal(voice, id);
+      const segment = options.segment ?? 0;
+      reads.push(segment);
+      return { ...audio, durationSeconds: 60, totalDurationSeconds: 300, segmentCount: 5, segmentIndex: segment };
+    }),
+    { id },
+  );
+  assert.deepEqual(reads, [0, 1, 2, 3, 4]);
+  assert.equal(uploads.length, 5);
+  assert.deepEqual(result, { ok: true, id, text: 'segment 1\nsegment 2\nsegment 3\nsegment 4\nsegment 5' });
+});
+
+test('revoking permission between video chunks prevents the next upload and discards partial text', async t => {
+  let uploads = 0,
+    reads = 0;
+  const endpoint = await server(t, (_req, res) => {
+    uploads++;
+    res.end('{"text":"partial"}');
+  });
+  const result = await recognize(
+    context({ endpoint, cacheResults: false, maxDurationSeconds: 300 }, async () => {
+      if (reads++) throw Error('VOICE_REFERENCE_NOT_ALLOWED');
+      return { ...audio, durationSeconds: 60, totalDurationSeconds: 120, segmentCount: 2, segmentIndex: 0 };
+    }),
+    { id },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'VOICE_REFERENCE_NOT_ALLOWED');
+  assert.equal(result.text, undefined);
+  assert.equal(uploads, 1);
+});
+
+test('audio chunk metadata is validated against the requested index and duration', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-segment-reader-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  atomicJson(path.join(root, 'state/wechat-io-config.json'), {
+    reader_base_url: 'http://127.0.0.1:9999',
+    reader_token: 'fixture',
+  });
+  const body = {
+    ...audio,
+    durationSeconds: 5,
+    segmentIndex: 2,
+    segmentCount: 3,
+    totalDurationSeconds: 125,
+    conversationKey: key,
+    sha256: crypto.createHash('sha256').update(Buffer.from(audio.b64, 'base64')).digest('hex'),
+  };
+  const reader = createAudioReader(root, {
+    fetchImpl: async url => {
+      assert.equal(new URL(url).searchParams.get('segment'), '2');
+      return Response.json(body);
+    },
+  });
+  assert.equal((await reader(id, key, 'speech-recognition', { segment: 2 })).segmentCount, 3);
+  body.segmentIndex = 1;
+  await assert.rejects(reader(id, key, 'speech-recognition', { segment: 2 }), /VOICE_AUDIO_INVALID/);
 });
 
 test('HTTP errors never echo provider bodies or credentials; redirects are not followed', async t => {

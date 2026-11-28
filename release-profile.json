@@ -30,8 +30,8 @@
   "privateRuntimeDataIncluded": false,
   "sourcePluginPackages": [
     "optional-extensions/packages/fish-notebook-1.1.1.zip",
-    "optional-extensions/packages/speech-recognition-1.6.0.zip",
-    "optional-extensions/packages/speech-synthesis-1.7.0.zip"
+    "optional-extensions/packages/speech-recognition-1.7.1.zip",
+    "optional-extensions/packages/speech-synthesis-1.8.1.zip"
   ],
   "hashesExclude": [
     "release-profile.json"
@@ -193,10 +193,10 @@
     "optional-extensions/packages/README.md": "a7a2fc629421ace2e60ab50fc5c6074a488161c122ab3187387cbb75b056e1fa",
     "optional-extensions/packages/fish-notebook-1.1.1.zip": "796b3e69254fd8cf181e0e2408dbb97617a49c8fabcfdd19bc0712c7c6748773",
     "optional-extensions/packages/fish-notebook-1.1.1.zip.sha256": "d923f578a4ef598c3a638e7eb397715f1a2cbb79f09cd308ed20f33bf9c7e28e",
-    "optional-extensions/packages/speech-recognition-1.6.0.zip": "2bce859befabd20c127ace5543f0aba8813acdb3db3b479f13597d97c8b1d376",
-    "optional-extensions/packages/speech-recognition-1.6.0.zip.sha256": "96b63be4cb75fab99da85b61df7e685e33f3a2cb42dea2c047f6a12aa19a2a5f",
-    "optional-extensions/packages/speech-synthesis-1.7.0.zip": "c0e581b30f38f3d54a2ecfb5b325aec3a0e81e5fb39d9d7a3996873d6a25d30b",
-    "optional-extensions/packages/speech-synthesis-1.7.0.zip.sha256": "29959709949960f1c4f3b361fae4e2723ba651c31e7229b008429dd2ec13f42b",
+    "optional-extensions/packages/speech-recognition-1.7.1.zip": "2bce859befabd20c127ace5543f0aba8813acdb3db3b479f13597d97c8b1d376",
+    "optional-extensions/packages/speech-recognition-1.7.1.zip.sha256": "96b63be4cb75fab99da85b61df7e685e33f3a2cb42dea2c047f6a12aa19a2a5f",
+    "optional-extensions/packages/speech-synthesis-1.8.1.zip": "c0e581b30f38f3d54a2ecfb5b325aec3a0e81e5fb39d9d7a3996873d6a25d30b",
+    "optional-extensions/packages/speech-synthesis-1.8.1.zip.sha256": "29959709949960f1c4f3b361fae4e2723ba651c31e7229b008429dd2ec13f42b",
     "optional-extensions/speech-recognition/README.md": "bdb993d11a73c9806e3514064b45b5e5c260a4adb02afa3fc955f58067574333",
     "optional-extensions/speech-recognition/assets/config-test.wav": "2e0f93f20a46b694350d17366fc14df08b48c536c5c8b42d73a3ce10c9febd12",
     "optional-extensions/speech-recognition/index.mjs": "a98fa6b1f690cf0643a5ebba14a935da0edd38a19bc3d42f630e2430b0fea77f",

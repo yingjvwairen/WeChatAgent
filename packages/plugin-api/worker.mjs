@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url';
+import { audioSegments } from './audio.mjs';
 import { API_VERSION, HOOKS, hostContract } from './contract.mjs';
 
 const tools = new Map(),
@@ -19,6 +20,7 @@ const service = (call, method, args) =>
     send({ type: 'service', id, call, method, args });
   });
 function context(call, data, signal) {
+  const readAudio = (id, options) => service(call, 'audio.read', [id, options ?? {}]);
   const storage = scope =>
     Object.freeze(
       Object.fromEntries(
@@ -36,7 +38,8 @@ function context(call, data, signal) {
     storage: storage('chat'),
     actorStorage: storage('actor'),
     audio: Object.freeze({
-      read: (id, options) => service(call, 'audio.read', [id, options ?? {}]),
+      read: readAudio,
+      segments: (id, options) => audioSegments(readAudio, id, options),
       write: base64 => service(call, 'audio.write', [base64]),
     }),
     documents: Object.freeze({

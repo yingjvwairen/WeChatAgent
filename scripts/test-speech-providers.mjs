@@ -1,3 +1,4 @@
+import { audioSegments } from '../packages/plugin-api/audio.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -815,7 +816,8 @@ function plugin() {
           write: async chunk => {
             audio.push(chunk);
           },
-          read: async () => ({ b64: wav16(800).toString('base64') }),
+          segments: (id, options) =>
+            audioSegments(async () => ({ id, durationSeconds: 0.05, b64: wav16(800).toString('base64') }), id, options),
         },
       },
       args,

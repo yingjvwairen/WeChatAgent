@@ -66,7 +66,9 @@
     "test:release-version": "node --test scripts/test-release-version.mjs scripts/test-public-update-check.mjs",
     "test:sessions": "node --test scripts/test-dsh-sessions-cli.mjs",
     "test:hook-41513": "node --test scripts/test-hook-41513.mjs scripts/test-hook-native-apis-41513.mjs",
-    "test:client-pin": "node --test scripts/test-client-pin.mjs"
+    "test:client-pin": "node --test scripts/test-client-pin.mjs",
+    "media:prepare": "python scripts/prepare-local-whisper.py --download",
+    "media:check": "python scripts/prepare-local-whisper.py"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",

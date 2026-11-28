@@ -1,7 +1,7 @@
 {
   "id": "speech-synthesis",
   "name": "语音对话 API",
-  "version": "1.7.0",
+  "version": "1.8.1",
   "apiVersion": 2,
   "host": "wechatagent",
   "author": "WeChatAgent",
@@ -11,6 +11,7 @@
     "audio_synthesize"
   ],
   "requiresHostFeatures": [
+    "audio-segments-v1",
     "actions-v1",
     "voice-input-v1",
     "voice-output-v1",
@@ -31,6 +32,7 @@
     "realtimeProtocol": "auto",
     "instructions": "",
     "timeoutMs": 20000,
+    "ttsTimeoutMs": 20000,
     "services": {},
     "ttsKey": "",
     "realtimeAsrKey": "",
@@ -112,6 +114,12 @@
       "title": "API 超时（毫秒）",
       "minimum": 1000,
       "maximum": 25000
+    },
+    "ttsTimeoutMs": {
+      "type": "integer",
+      "title": "普通语音合成超时（毫秒）",
+      "minimum": 1000,
+      "maximum": 600000
     },
     "services": {
       "type": "object",

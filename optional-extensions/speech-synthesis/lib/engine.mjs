@@ -2,13 +2,14 @@
 // reply text, and recognition of one WeChat voice by the selected method
 // (realtime or single file). Every call resolves its own service, so each
 // capability uses its own provider, address and credential.
-import {resolveService} from './resolve.mjs';
-import {speechModels, speechSynthesize, transcriptionsTranscribe} from './service.mjs';
-import {cloudListable, cloudLists, cloudSynthesize, cloudTranscribe} from './cloud.mjs';
-import {qwenSynthesize, qwenTranscribe} from './qwen.mjs';
-import {openaiTranscribe, qwenAsrTranscribe, tencentTranscribe} from './asr-realtime.mjs';
-import {speak, transcribeRealtime} from './realtime.mjs';
-import {CAPABILITY_IDS, KEY_FIELDS, servicesOf} from '../ui/providers.mjs';
+import { resolveService } from './resolve.mjs';
+import { validateLocalVoice, synthesizeLocalVoice } from './gpt-sovits.mjs';
+import { speechModels, speechSynthesize, transcriptionsTranscribe } from './service.mjs';
+import { cloudListable, cloudLists, cloudSynthesize, cloudTranscribe } from './cloud.mjs';
+import { qwenSynthesize, qwenTranscribe } from './qwen.mjs';
+import { openaiTranscribe, qwenAsrTranscribe, tencentTranscribe } from './asr-realtime.mjs';
+import { speak, transcribeRealtime } from './realtime.mjs';
+import { CAPABILITY_IDS, KEY_FIELDS, servicesOf } from '../ui/providers.mjs';
 
 const fault = code => new Error(code);
 
@@ -16,12 +17,19 @@ const fault = code => new Error(code);
 // other addresses must not run without it.
 export function ready(settings, capability) {
   const service = resolveService(settings, capability);
+  if (service.kind === 'gpt-sovits') {
+    validateLocalVoice(service.profile);
+    return service;
+  }
   if (!service.key) {
     if (service.entry !== 'custom') throw fault('VOICE_PROVIDER_CREDENTIAL');
     if (service.profile.auth !== 'none') {
       const services = service.services;
-      const elsewhere = CAPABILITY_IDS.some(slot => services.owners[slot]?.entry === 'custom' && String(settings[KEY_FIELDS[slot]] ?? '').trim()) ||
-        services.legacy?.entry === 'custom' && String(settings.apiKey ?? '').trim();
+      const elsewhere =
+        CAPABILITY_IDS.some(
+          slot => services.owners[slot]?.entry === 'custom' && String(settings[KEY_FIELDS[slot]] ?? '').trim(),
+        ) ||
+        (services.legacy?.entry === 'custom' && String(settings.apiKey ?? '').trim());
       if (elsewhere) throw fault('VOICE_KEY_ORIGIN');
     }
   }
@@ -31,10 +39,16 @@ export function ready(settings, capability) {
 export async function synthesizeText(settings, text, options = {}) {
   const service = ready(settings, 'tts');
   switch (service.kind) {
-    case 'openai-speech': return speechSynthesize(service, text, options);
-    case 'realtime-speak': return speak(service.flat, text, options);
-    case 'qwen-tts': return qwenSynthesize(service, text, options);
-    default: return cloudSynthesize(service, service.flat, text, options);
+    case 'gpt-sovits':
+      return synthesizeLocalVoice(service, text, options);
+    case 'openai-speech':
+      return speechSynthesize(service, text, options);
+    case 'realtime-speak':
+      return speak(service.flat, text, options);
+    case 'qwen-tts':
+      return qwenSynthesize(service, text, options);
+    default:
+      return cloudSynthesize(service, service.flat, text, options);
   }
 }
 
@@ -46,19 +60,26 @@ export function dialogueSettings(settings) {
 }
 
 // method: 'realtime' or 'file'; defaults to the recognition method the user chose.
-export async function transcribeVoice(settings, wav, {method, signal, onPartial, fetchImpl, WebSocketImpl} = {}) {
+export async function transcribeVoice(settings, wav, { method, signal, onPartial, fetchImpl, WebSocketImpl } = {}) {
   const which = method ?? servicesOf(settings).recognition;
   if (which === 'off') throw fault('VOICE_RECOGNITION_OFF');
   const service = ready(settings, which === 'realtime' ? 'realtimeAsr' : 'fileAsr');
-  const options = {signal, onPartial, WebSocketImpl, ...(fetchImpl ? {fetchImpl} : {})};
+  const options = { signal, onPartial, WebSocketImpl, ...(fetchImpl ? { fetchImpl } : {}) };
   switch (service.kind) {
-    case 'realtime-session': return transcribeRealtime(service.flat, wav, options);
-    case 'qwen-asr-realtime': return qwenAsrTranscribe(service, wav, options);
-    case 'openai-transcription': return openaiTranscribe(service, wav, options);
-    case 'tencent-asr-ws': return tencentTranscribe(service, wav, options);
-    case 'openai-transcriptions': return transcriptionsTranscribe(service, wav, options);
-    case 'qwen-chat-asr': return qwenTranscribe(service, wav, options);
-    default: return cloudTranscribe(service, service.flat, wav, options);
+    case 'realtime-session':
+      return transcribeRealtime(service.flat, wav, options);
+    case 'qwen-asr-realtime':
+      return qwenAsrTranscribe(service, wav, options);
+    case 'openai-transcription':
+      return openaiTranscribe(service, wav, options);
+    case 'tencent-asr-ws':
+      return tencentTranscribe(service, wav, options);
+    case 'openai-transcriptions':
+      return transcriptionsTranscribe(service, wav, options);
+    case 'qwen-chat-asr':
+      return qwenTranscribe(service, wav, options);
+    default:
+      return cloudTranscribe(service, service.flat, wav, options);
   }
 }
 
@@ -66,7 +87,8 @@ export async function transcribeVoice(settings, wav, {method, signal, onPartial,
 export async function listFor(settings, capability, options = {}) {
   const service = resolveService(settings, capability);
   if (service.entry !== 'custom' && !service.key) throw fault('VOICE_PROVIDER_CREDENTIAL');
-  if (['openai-speech', 'openai-transcriptions', 'openai-transcription', 'realtime-speak'].includes(service.kind)) return speechModels(service, options);
+  if (['openai-speech', 'openai-transcriptions', 'openai-transcription', 'realtime-speak'].includes(service.kind))
+    return speechModels(service, options);
   if (cloudListable(service.entry)) return cloudLists(service, service.flat, options);
   throw fault('VOICE_TTS_MODELS');
 }

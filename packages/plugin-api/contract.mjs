@@ -1,7 +1,7 @@
 // Pure shared data: installer, runtime, worker, DSH health and console UI use it.
 export const API_VERSION = 2;
 export const HOST_RUNTIME = 'isolated-v2';
-export const CONTRACT_REVISION = 'wechatagent-plugin-v2.4';
+export const CONTRACT_REVISION = 'wechatagent-plugin-v2.5';
 export const PERMISSION_LABELS = Object.freeze({
   storage: '保存插件数据',
   history_read: '读取当前聊天历史',
@@ -22,6 +22,7 @@ export const FEATURE_LABELS = Object.freeze({
   'model-utility-v1': '独立模型生成',
   'daily-schedule-v1': '每日计划',
   'voice-input-v1': '微信语音输入',
+  'audio-segments-v1': '按消息分段读取音轨',
   'voice-output-v1': '微信语音合成',
   'voice-dialogue-v1': '微信语音对话',
   'diary-question-v1': '微信日记询问',
@@ -169,6 +170,7 @@ export const PLUGIN_HOST_FILES = Object.freeze([
 export const VOICE_CODEC_FILES = Object.freeze([
   'scripts/decode-wechat-voice.py',
   'scripts/decode-wechat-voice.mjs',
+  'scripts/recorded-voice-match.mjs',
   'packages/voice-codec/silk-wasm/package.json',
   'packages/voice-codec/silk-wasm/LICENSE',
   'packages/voice-codec/silk-wasm/PROVENANCE.json',
