@@ -11,6 +11,14 @@ const chunkBytes = 256 * 1024;
 export const maxReplyChars = modelFields.speechLimits.maxReplyChars;
 const fault = (code, status) => Object.assign(new Error(code), { code, status });
 
+function rethrowSynthesisError(error) {
+  if (typeof error.code === 'string' && error.code.startsWith('VOICE_TTS_')) throw error;
+  if (error.message === 'PLUGIN_TIMEOUT') throw fault('VOICE_TTS_TIMEOUT', 504);
+  if (error.message === 'PLUGIN_FEATURE_CONFLICT') throw fault('VOICE_TTS_PLUGIN_CONFLICT', 409);
+  if (error.message === 'PLUGIN_PERMISSION_DENIED') throw fault('VOICE_TTS_PERMISSION_CHANGED', 403);
+  throw fault('VOICE_TTS_PLUGIN_UNAVAILABLE', 503);
+}
+
 export class VoiceSynthesis {
   constructor(root, { fetchImpl = fetch } = {}) {
     this.root = root;
@@ -40,6 +48,7 @@ export class VoiceSynthesis {
     feature = outputFeature,
     voiceAllowed = true,
     textAllowed = true,
+    beforeInvoke,
   }) {
     let runtime = this.runtime;
     if (!runtime || this.account !== accountRef) {
@@ -85,27 +94,21 @@ export class VoiceSynthesis {
       size += bytes.length;
       chunks.push(bytes);
     }
-    let invocation;
-    try {
-      await runtime.sync();
-      if (!allowed()) throw fault('VOICE_TTS_PLUGIN_UNAVAILABLE', 409);
-      const turn = { conversationKey: key, writeVoice, ...(voiceId ? { voiceIds: [voiceId] } : {}) };
-      const args =
-        feature === dialogueFeature
-          ? { ...(voiceId ? { id: voiceId } : { text }), voiceAllowed, textAllowed }
-          : voiceId
-            ? { id: voiceId }
-            : { text };
-      invocation = await runtime.invokeFeature(feature, args, turn, {
+    await runtime.sync().catch(rethrowSynthesisError);
+    if (!allowed()) throw fault('VOICE_TTS_PLUGIN_UNAVAILABLE', 409);
+    const turn = { conversationKey: key, writeVoice, ...(voiceId ? { voiceIds: [voiceId] } : {}) };
+    const args =
+      feature === dialogueFeature
+        ? { ...(voiceId ? { id: voiceId } : { text }), voiceAllowed, textAllowed }
+        : voiceId
+          ? { id: voiceId }
+          : { text };
+    beforeInvoke?.();
+    const invocation = await runtime
+      .invokeFeature(feature, args, turn, {
         timeoutMs: feature === outputFeature ? 600000 : 35000,
-      });
-    } catch (error) {
-      if (typeof error.code === 'string' && error.code.startsWith('VOICE_TTS_')) throw error;
-      if (error.message === 'PLUGIN_TIMEOUT') throw fault('VOICE_TTS_TIMEOUT', 504);
-      if (error.message === 'PLUGIN_FEATURE_CONFLICT') throw fault('VOICE_TTS_PLUGIN_CONFLICT', 409);
-      if (error.message === 'PLUGIN_PERMISSION_DENIED') throw fault('VOICE_TTS_PERMISSION_CHANGED', 403);
-      throw fault('VOICE_TTS_PLUGIN_UNAVAILABLE', 503);
-    }
+      })
+      .catch(rethrowSynthesisError);
     if (
       !invocation.handled ||
       invocation.plugin !== selected.id ||

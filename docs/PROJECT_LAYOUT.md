@@ -29,6 +29,6 @@ Reader 从当前账号读取消息，微信适配器通过本机 WebSocket 将�
 
 在 Git 工作区中安装根目录和 `packages/dsh-social-bridge-plugin` 的 npm 依赖；测试 Python 安装 `scripts/test-requirements.txt`，并通过 `WECHATAGENT_TEST_PYTHON` 指向其解释器。`npm test` 运行 JavaScript 静态检查及 Python、Node 回归，包含布局、编辑框像素和搜索弹窗的合成图像测试。
 
-提交前运行 `npm run check`：它另检查 JS/Python/C# 格式、Git 空白错误、Windows 原生组件构建及合成自检、公开源码清单。C# 格式工具通过 `CLANG_FORMAT` 指定，Python 使用测试环境中的 Ruff，也可通过 `RUFF` 指定。格式范围自动包含相对 `v0.4.5` 的新增和修改源码及未提交的新文件；调整系列基线时设置 `WECHATAGENT_QUALITY_BASE`。
+提交前运行 `npm run check` 检查 JS、Python 和 C# 格式、Git 空白错误、Windows 原生组件构建和自检，以及公开源码清单。C# 格式工具通过 `CLANG_FORMAT` 指定，Python 使用测试环境中的 Ruff，也可通过 `RUFF` 指定。格式检查覆盖桌面发送器和相对 `v0.4.5` 修改或新增的源码，包括工作区新文件。浅检出缺少 `v0.4.5` 的提交对象时，请先获取发布基线，或运行 `npm run check -- --base <本地可用的基线提交>`。
 
-`npm run check:integration` 还要求 `WECHATAGENT_DSH_SDK_ROOT` 指向包含实际 DSH SDK `node_modules` 的目录。真实 Whisper 回归由 `WECHATAGENT_TEST_WHISPER_MODEL` 指向已准备的模型；NSIS 夹具需要已缓存的构建工具。条件跳过会在测试结果中单独报告。原生合成自检不操作微信；实际收发、显示适配和完整安装部署需另行验收。
+`npm run check:integration` 使用 `WECHATAGENT_DSH_SDK_ROOT` 指定的 SDK 和 `WECHATAGENT_TEST_DSH` 指定的本机 DSH 可执行文件。真实 Whisper 回归由 `WECHATAGENT_TEST_WHISPER_MODEL` 指向已准备的模型。NSIS 夹具使用已缓存的构建工具。条件跳过会在测试结果中单独报告。实际收发、显示适配和完整安装部署需另行验收。

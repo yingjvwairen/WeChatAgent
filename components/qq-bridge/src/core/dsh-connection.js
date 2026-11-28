@@ -4,6 +4,8 @@ export const acceptsReaderMessage = (connection, message) =>
 
 // A reconnect boundary acknowledges old inputs without deleting their history.
 export class DshConnectionGuard {
+  #controller = new AbortController();
+
   constructor({ buffer, probe, now = Date.now, log = () => {}, pollMs = 2000 }) {
     Object.assign(this, { buffer, probe, now, log, pollMs });
     this.saved = buffer.dshConnection;
@@ -15,8 +17,11 @@ export class DshConnectionGuard {
     this.lastCheck = -Infinity;
     this.stopped = false;
   }
+  get signal() {
+    return this.#controller.signal;
+  }
   current(epoch) {
-    return !this.stopped && this.ready && epoch === this.epoch;
+    return !this.stopped && this.ready && epoch === this.epoch && !this.signal.aborted;
   }
   skips(message) {
     return !this.ready || Number(message.timestamp) * 1000 < this.cutoff;
@@ -40,20 +45,24 @@ export class DshConnectionGuard {
       const previous = this.initialized ? this.buffer.dshConnection : this.saved;
       const online = health?.ready === true,
         id = online ? health.instanceId || 'legacy' : (previous?.instanceId ?? '');
-      const boundary = !this.initialized
-        ? !previous || previous.ready !== online || (online && previous.instanceId !== id)
-        : this.ready !== online || (online && this.instanceId !== id);
+      const boundary =
+        this.boundaryPending || !previous || previous.ready !== online || (online && previous.instanceId !== id);
       this.ready = online;
       this.initialized = true;
       this.lastCheck = this.now();
       if (boundary) {
-        this.epoch++;
+        this.boundaryPending = true;
+        this.#controller.abort(Object.assign(Error('DSH_CONNECTION_CHANGED'), { code: 'DSH_CONNECTION_CHANGED' }));
         const started = Number(health?.startedAt);
         const newInstance = online && previous && previous.instanceId !== id;
         const resumedAt =
           newInstance && Number.isFinite(started) && started > 0 && started <= this.now() + 1000
             ? Math.min(started, requestedAt)
             : requestedAt;
+        // Withdraw desktop input before committing the connection boundary.
+        // A failed local write must leave the boundary eligible for retry.
+        this.onBoundary?.({ online, epoch: this.epoch + 1 });
+        this.epoch++;
         if (online) this.cutoff = Math.max(this.cutoff, Math.floor(resumedAt / 1000) * 1000);
         this.instanceId = id;
         this.buffer.dshConnection = {
@@ -66,8 +75,9 @@ export class DshConnectionGuard {
         };
         // Initial migration and confirmed offline periods never replay old inputs.
         const skipped = this.buffer.skipOfflineInputs({ reason: online ? 'dsh_reconnected' : 'dsh_offline' });
-        this.onBoundary?.({ online, epoch: this.epoch });
         this.buffer.saveMedia();
+        this.#controller = new AbortController();
+        this.boundaryPending = false;
         this.log(
           '[DSH] connection=' +
             (online ? 'ready' : 'offline') +
@@ -99,6 +109,7 @@ export class DshConnectionGuard {
   stop() {
     this.stopped = true;
     this.ready = false;
+    this.#controller.abort(Object.assign(Error('DSH_CONNECTION_CHANGED'), { code: 'DSH_CONNECTION_CHANGED' }));
     clearInterval(this.timer);
   }
 }

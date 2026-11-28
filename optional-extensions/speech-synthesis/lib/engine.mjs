@@ -60,11 +60,15 @@ export function dialogueSettings(settings) {
 }
 
 // method: 'realtime' or 'file'; defaults to the recognition method the user chose.
-export async function transcribeVoice(settings, wav, { method, signal, onPartial, fetchImpl, WebSocketImpl } = {}) {
+export async function transcribeVoice(
+  settings,
+  wav,
+  { method, signal, onPartial, fetchImpl, WebSocketImpl, allowEmpty = false } = {},
+) {
   const which = method ?? servicesOf(settings).recognition;
   if (which === 'off') throw fault('VOICE_RECOGNITION_OFF');
   const service = ready(settings, which === 'realtime' ? 'realtimeAsr' : 'fileAsr');
-  const options = { signal, onPartial, WebSocketImpl, ...(fetchImpl ? { fetchImpl } : {}) };
+  const options = { signal, onPartial, WebSocketImpl, allowEmpty, ...(fetchImpl ? { fetchImpl } : {}) };
   switch (service.kind) {
     case 'realtime-session':
       return transcribeRealtime(service.flat, wav, options);

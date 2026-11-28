@@ -4,16 +4,19 @@ Only image codec and verified local key lookup are retained. This module has
 no export UI, remote fetching, process-memory access, or persistent secrets.
 Original license: components/weflow-cli/LICENSE.
 """
+
 import os
 import re
 import struct
 import hashlib
 import json
+import time
 from pathlib import Path
+
 MAX_EMBED_SIZE = 8 * 1024 * 1024
 MAX_IMAGE_SOURCE_SIZE = 32 * 1024 * 1024
 IMAGE_SOURCE_VERSION = 2
-V2_MAGIC = b"\x07\x08V2\x08\x07"
+V2_MAGIC = b'\x07\x08V2\x08\x07'
 V2_CIPHERTEXT_START = 15
 
 
@@ -24,7 +27,18 @@ def clean_account_wxid(value):
         return parts[0]
     return value
 
-def resolve_v2_media_key(account_dir, own_wxid='', kvcomm_dir=''):
+
+def configured_image_keys(settings, read_secret):
+    try:
+        saved = read_secret(str(settings.get('imageAesKey') or ''))
+        aes = bytes.fromhex(saved) if re.fullmatch(r'[a-fA-F0-9]{32}', saved) else saved.encode('ascii')
+        xor = int(read_secret(str(settings.get('imageXorKey') or '0')), 0) & 255
+        return [(xor, aes)] if len(aes) == 16 else []
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return []
+
+
+def resolve_v2_media_key(account_dir, own_wxid='', kvcomm_dir='', *, deadline=None):
     """Derive and verify the local WeChat V2 image key without persisting it."""
     if not account_dir:
         return None
@@ -32,11 +46,13 @@ def resolve_v2_media_key(account_dir, own_wxid='', kvcomm_dir=''):
         appdata = os.environ.get('APPDATA', '')
         kvcomm_dir = os.path.join(appdata, 'Tencent', 'xwechat', 'net', 'kvcomm')
     try:
-        codes = sorted({
-            int(match.group(1))
-            for name in os.listdir(kvcomm_dir)
-            if (match := re.fullmatch(r'key_(\d+)_.+\.statistic', name, re.IGNORECASE))
-        })
+        codes = sorted(
+            {
+                int(match.group(1))
+                for name in os.listdir(kvcomm_dir)
+                if (match := re.fullmatch(r'key_(\d+)_.+\.statistic', name, re.IGNORECASE))
+            }
+        )
     except (OSError, ValueError):
         return None
     if not codes:
@@ -48,7 +64,11 @@ def resolve_v2_media_key(account_dir, own_wxid='', kvcomm_dir=''):
         if not os.path.isdir(search_root):
             continue
         for current_root, _, files in os.walk(search_root):
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             for name in files:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
                 if not name.lower().endswith('_t.dat'):
                     continue
                 path = os.path.join(current_root, name)
@@ -56,7 +76,7 @@ def resolve_v2_media_key(account_dir, own_wxid='', kvcomm_dir=''):
                     with open(path, 'rb') as stream:
                         header = stream.read(V2_CIPHERTEXT_START + 16)
                     if header.startswith(V2_MAGIC) and len(header) >= V2_CIPHERTEXT_START + 16:
-                        templates.append(header[V2_CIPHERTEXT_START:V2_CIPHERTEXT_START + 16])
+                        templates.append(header[V2_CIPHERTEXT_START : V2_CIPHERTEXT_START + 16])
                 except OSError:
                     continue
                 if len(templates) >= 32:
@@ -68,29 +88,40 @@ def resolve_v2_media_key(account_dir, own_wxid='', kvcomm_dir=''):
     if not templates:
         return None
 
-    wxids = list(dict.fromkeys(filter(None, (
-        clean_account_wxid(own_wxid),
-        clean_account_wxid(Path(account_dir).name),
-    ))))
+    wxids = list(
+        dict.fromkeys(
+            filter(
+                None,
+                (
+                    clean_account_wxid(own_wxid),
+                    clean_account_wxid(Path(account_dir).name),
+                ),
+            )
+        )
+    )
     try:
         from Crypto.Cipher import AES
     except ImportError:
         return None
     for wxid in wxids:
         for code in codes:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             aes_key = hashlib.md5(f'{code}{wxid}'.encode()).hexdigest()[:16].encode('ascii')
             try:
                 plaintext = AES.new(aes_key, AES.MODE_ECB).decrypt(templates[0])
             except (TypeError, ValueError):
                 continue
             if detect_mime_from_bytes(plaintext) or plaintext.startswith((b'wxgf', b'WXGF')):
-                return code & 0xff, aes_key
+                return code & 0xFF, aes_key
     return None
+
 
 def decode_wechat_v2(filepath, xor_key, aes_key, max_size=MAX_EMBED_SIZE):
     try:
         from Crypto.Cipher import AES
         from Crypto.Util import Padding
+
         with open(filepath, 'rb') as stream:
             data = stream.read(max_size + 1)
         if len(data) > max_size or not data.startswith(V2_MAGIC):
@@ -99,9 +130,9 @@ def decode_wechat_v2(filepath, xor_key, aes_key, max_size=MAX_EMBED_SIZE):
         if signature != V2_MAGIC:
             return None
         encrypted_size = aes_size + 16 - aes_size % 16
-        encrypted = data[V2_CIPHERTEXT_START:V2_CIPHERTEXT_START + encrypted_size]
+        encrypted = data[V2_CIPHERTEXT_START : V2_CIPHERTEXT_START + encrypted_size]
         decrypted = Padding.unpad(AES.new(aes_key, AES.MODE_ECB).decrypt(encrypted), 16)
-        remainder = data[V2_CIPHERTEXT_START + encrypted_size:]
+        remainder = data[V2_CIPHERTEXT_START + encrypted_size :]
         if xor_size:
             if xor_size > len(remainder):
                 return None
@@ -170,9 +201,11 @@ def image_cache_current(account, talker, cached):
     candidates = local_image_candidates(account, talker, ids)
     return source.get('fingerprint') == image_source_fingerprint(account, candidates)
 
+
 def extract_media_md5s(value):
     matches = re.findall(r'(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])', str(value or ''), re.IGNORECASE)
     return list(dict.fromkeys(match.lower() for match in matches))
+
 
 def extract_blob_md5s(value, known_md5s=None):
     if value is None:
@@ -191,12 +224,12 @@ def extract_blob_md5s(value, known_md5s=None):
     # Index those candidates; get_cached_image will retain only candidates
     # that resolve to an actual local media file.
     for offset in range(0, max(0, len(data) - 15)):
-        candidate = data[offset:offset + 16]
+        candidate = data[offset : offset + 16]
         candidate_hex = candidate.hex()
-        if (candidate not in (b'\x00' * 16, b'\xff' * 16)
-                and (known_md5s is None or candidate_hex in known_md5s)):
+        if candidate not in (b'\x00' * 16, b'\xff' * 16) and (known_md5s is None or candidate_hex in known_md5s):
             result.append(candidate_hex)
     return list(dict.fromkeys(result))
+
 
 def detect_mime_from_bytes(header_bytes):
     """Detect MIME type from byte header."""

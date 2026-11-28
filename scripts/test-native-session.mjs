@@ -1062,11 +1062,15 @@ test('voice input routes the installed API plugin through bound audio without cr
   const f = await fixture(t),
     id = 'a'.repeat(64),
     account = 'c'.repeat(64);
+  const group = 'wechat:group:voice_fixture@chatroom',
+    grant = crypto.randomUUID();
   fs.mkdirSync(path.join(f.dir, 'config'), { recursive: true });
   const config = {
     wechat: {
-      whitelist: { private: ['wxid_fixture'], groups: [] },
+      whitelist: { private: ['wxid_fixture'], groups: ['voice_fixture@chatroom'] },
       assistant: { administrators: ['wxid_voice_admin'] },
+      workModes: { [group]: 'assistant' },
+      rosterGrants: { [group]: grant },
     },
   };
   const configFile = path.join(f.dir, 'config/wechatagent.json');
@@ -1081,13 +1085,14 @@ test('voice input routes the installed API plugin through bound audio without cr
     reads++;
     assert.equal(req.headers.authorization, 'Bearer reader-fixture');
     const url = new URL(req.url, 'http://localhost');
-    assert.equal(url.searchParams.get('conversationKey'), key);
+    const conversationKey = url.searchParams.get('conversationKey');
+    assert([key, group].includes(conversationKey));
     assert.equal(url.searchParams.get('pluginId'), 'speech-recognition');
     res.setHeader('content-type', 'application/json');
     res.end(
       JSON.stringify({
-        id,
-        conversationKey: key,
+        id: url.pathname.split('/').at(-1),
+        conversationKey,
         b64: bytes.toString('base64'),
         sha256,
         mime: 'audio/silk',
@@ -1129,7 +1134,7 @@ test('voice input routes the installed API plugin through bound audio without cr
         'speech-recognition': {
           enabled: true,
           permissions: ['audio_read'],
-          chatScopes: { [account]: { [key]: 'legacy' } },
+          chatScopes: { [account]: { [key]: 'legacy', [group]: grant } },
           settings,
           generation: 'voice-fixture',
         },
@@ -1141,6 +1146,7 @@ test('voice input routes the installed API plugin through bound audio without cr
   const result = await r.request('/voice-input', { conversationKey: key, id, senderWxid: 'wxid_voice_admin' });
   assert.equal(result.text, '本机模拟服务转写');
   assert.equal(result.plugin, 'speech-recognition');
+  assert.equal(result.generation, 'voice-fixture');
   assert.equal(reads, 1);
   assert.equal(uploads, 1);
   assert.equal(r.calls.create.length, 0);
@@ -1152,10 +1158,18 @@ test('voice input routes the installed API plugin through bound audio without cr
   });
   assert.equal(unbound.ok, false);
   assert.equal(reads, 1);
-  config.wechat.workModes = { [key]: 'assistant' };
+  config.wechat.workModes[key] = 'assistant';
   fs.writeFileSync(configFile, JSON.stringify(config));
   await r.request('/voice-input', { conversationKey: key, id, senderWxid: 'wxid_stranger' }, 403);
   assert.equal(uploads, 1);
+  const memberVoice = { conversationKey: group, id: 'd'.repeat(64), senderWxid: 'wxid_member' };
+  await r.request('/voice-input', { ...memberVoice, rosterGrant: 'withdrawn' }, 403);
+  assert.equal(uploads, 1);
+  const memberResult = await r.request('/voice-input', { ...memberVoice, rosterGrant: grant });
+  assert.equal(memberResult.text, '本机模拟服务转写');
+  assert.equal(memberResult.generation, 'voice-fixture');
+  assert.equal(uploads, 2);
+  assert.equal(r.calls.create.length, 0);
 });
 
 async function fixture(t) {
@@ -1857,8 +1871,9 @@ test('moving between real workspace directories inherits every event, keeps the 
   });
   assert.equal(unchanged.sessionId, first.sessionId);
   assert.equal(unchanged.historyCopied, false);
-  const target = path.join(f.dir, '目标 工作区');
-  fs.mkdirSync(target);
+  const workDirectory = path.join(f.dir, '目标 工作区');
+  fs.mkdirSync(workDirectory);
+  const target = fs.realpathSync.native(workDirectory);
   const listed = await r.request('/session-groups');
   const created = await r.request('/session-groups/create', { title: '日常', path: target, revision: listed.revision }),
     group = created.groups.find(item => item.path === target);
@@ -1959,7 +1974,7 @@ test('an uninitialized allowed chat can select its workspace before its first na
     'SESSION_GROUP_NOT_EMPTY',
   );
   const first = await r.request('/followup', { ...info, message: '首次消息' });
-  assert.equal(f.store.get(first.sessionId).header.cwd, directory);
+  assert.equal(f.store.get(first.sessionId).header.cwd, fs.realpathSync.native(directory));
   assert.equal((await r.request('/sessions')).sessions[0].groupId, group.id);
 });
 

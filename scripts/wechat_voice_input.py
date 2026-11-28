@@ -1,7 +1,7 @@
 """Exact-message, account-scoped voice references. Never downloads audio."""
 
 from wechat_identity import parse_chat_key, conversation_grant, plugin_chat_allowed
-from reader_intake import cache_evictions
+from reader_intake import cache_evictions, touch_media_record
 import base64
 import hashlib
 import json
@@ -131,7 +131,7 @@ class VoiceCatalog:
             'grant': grant,
         }
         with self.lock:
-            self.records[voice_id] = record
+            touch_media_record(self.records, voice_id, record)
             for expired in cache_evictions(self.records, self.pinned_media):
                 self.records.pop(expired)
             self.file.parent.mkdir(parents=True, exist_ok=True)

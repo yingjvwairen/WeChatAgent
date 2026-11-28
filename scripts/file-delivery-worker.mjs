@@ -1,9 +1,18 @@
 import { validChatId } from '../packages/wechat-identity.mjs';
+import { boundedTask } from '../packages/dsh-social-bridge-plugin/deadline.mjs';
+import {
+  desktopDeliveryStatus,
+  desktopQueueFull,
+  matchesDesktopDelivery,
+  TERMINAL_DELIVERY_STATES,
+} from '../packages/delivery-contract.mjs';
 import {
   FileTransfers,
   fileDeliveryFinished,
+  hasNoFileSendIntent,
   awaitsFileReceipt,
 } from '../packages/dsh-social-bridge-plugin/file-transfers.mjs';
+const archivedReceiptIntervalMs = 10000;
 const validId = value => /^[1-9]\d{0,31}$/.test(String(value ?? ''));
 const safeError = error =>
   /^[A-Z][A-Z0-9_]{2,80}$/.test(error?.code ?? error?.message) ? (error.code ?? error.message) : 'FILE_DELIVERY_FAILED';
@@ -14,8 +23,13 @@ export class FileDeliveryWorker {
     this.log = log;
     this.now = now;
     this.running = new Set();
+    this.admissions = new Set();
+    this.receiptChecks = new Set();
+    this.archiveChecks = new Set();
+    this.archiveTargets = new Set();
+    this.archiveAbort = new AbortController();
     this.targets = new Set();
-    this.lastScheduled = null;
+    this.lastScheduled = { admission: null, receipt: null, archive: null };
     this.stopped = false;
   }
   save(job, options) {
@@ -24,24 +38,47 @@ export class FileDeliveryWorker {
     return true;
   }
   tick() {
-    if (this.stopped || this.running.size >= 2) return;
-    const active = this.store.list().sort((a, b) => a.createdAt - b.createdAt);
+    if (this.stopped) return;
+    const account = this.store.account();
+    const active = this.store.list({ account }).sort((a, b) => a.createdAt - b.createdAt);
     const heads = new Map();
     const now = this.now();
-    for (const job of [...active, ...this.store.history.due(now)])
-      if (!(job.queuePaused && now < job.deadlineAt) && !heads.has(job.key)) heads.set(job.key, job);
+    for (const job of active) {
+      if (heads.has(job.key)) continue;
+      if (job.queuePaused && now < job.deadlineAt && !this.store.allowedJob(job)) continue;
+      heads.set(job.key, job);
+    }
+    for (const [key, job] of heads) if (job.queuePaused && now < job.deadlineAt) heads.delete(key);
     const jobs = [...heads.values()];
-    // Pick up after the previous chat so waiting jobs cannot occupy every tick.
-    const offset = jobs.findIndex(job => job.key === this.lastScheduled) + 1;
+    const checking = job => job.nativeAdmitted === true && !job.dispatchPending;
+    this.schedule(
+      jobs.filter(job => !checking(job)),
+      'admission',
+      now,
+    );
+    this.schedule(jobs.filter(checking), 'receipt', now);
+    // Read-only archived lookups have a separate pool and don't own the active chat queue.
+    if (this.archiveChecks.size < 2)
+      this.schedule(this.store.history.due(account, now, [...this.archiveTargets]), 'archive', now);
+  }
+
+  schedule(jobs, phase, now) {
+    // Each pool resumes after its own previous chat.
+    const offset = jobs.findIndex(job => job.key === this.lastScheduled[phase]) + 1;
+    const archived = phase === 'archive';
+    const pool = archived ? this.archiveChecks : phase === 'receipt' ? this.receiptChecks : this.admissions;
+    const targets = archived ? this.archiveTargets : this.targets;
     for (const job of [...jobs.slice(offset), ...jobs.slice(0, offset)]) {
-      if (this.running.size >= 2) break;
-      if (this.running.has(job.id) || this.targets.has(job.key)) continue;
-      if (awaitsFileReceipt(job)) this.store.history.defer(job.id, now + 10000);
-      this.lastScheduled = job.key;
+      if (pool.size >= 2) break;
+      if (this.running.has(job.id) || targets.has(job.key)) continue;
+      if (archived && this.store.history.defer(job.id, now + archivedReceiptIntervalMs) === false) continue;
+      this.lastScheduled[phase] = job.key;
       this.running.add(job.id);
-      this.targets.add(job.key);
+      pool.add(job.id);
+      targets.add(job.key);
       void this.run(job)
         .catch(error => {
+          if (archived && this.stopped) return;
           try {
             this.recordWait(job, safeError(error));
           } catch {
@@ -49,8 +86,9 @@ export class FileDeliveryWorker {
           }
         })
         .finally(() => {
+          pool.delete(job.id);
           this.running.delete(job.id);
-          this.targets.delete(job.key);
+          targets.delete(job.key);
         });
     }
   }
@@ -63,18 +101,27 @@ export class FileDeliveryWorker {
   async run(job) {
     const adapter = this.adapter;
     if (awaitsFileReceipt(job)) {
-      if (!this.store.allowedJob(job) || job.accountRef !== adapter.accountRef) return;
+      if (job.accountRef !== adapter.accountRef || job.accountScope !== this.store.account()) return;
       const [, kind, target] = job.key.split(':');
-      const result = await adapter.desktopSender.request('lookup', {
-        account: job.account,
-        accountRef: job.accountRef,
-        kind,
-        target,
-        rosterGrant: job.rosterGrant,
-        deliveryId: job.id,
-        observeOnly: true,
-      });
-      if (result?.confirmed) this.applyNative(job, result);
+      const result = await boundedTask(
+        () =>
+          adapter.desktopSender.request('lookup', {
+            account: job.account,
+            accountRef: job.accountRef,
+            kind,
+            target,
+            rosterGrant: job.rosterGrant,
+            deliveryId: job.id,
+            observeOnly: true,
+          }),
+        {
+          timeoutMs: archivedReceiptIntervalMs,
+          signal: this.archiveAbort.signal,
+          code: 'FILE_RECEIPT_TIMEOUT',
+        },
+      );
+      const status = desktopDeliveryStatus(result);
+      if (status === 'confirmed' || status === 'rejected') this.applyNative(job, result);
       else if (result?.reviewed || result?.recovery?.recovered) {
         job.nativeReviewed = true;
         this.save(job);
@@ -82,7 +129,7 @@ export class FileDeliveryWorker {
       return;
     }
     if (fileDeliveryFinished(job.state) || (job.queuePaused && this.now() < job.deadlineAt)) return;
-    const beforeIntent = job.state === 'queued' && !job.nativeAdmitted;
+    const beforeIntent = hasNoFileSendIntent(job);
     if (beforeIntent && this.now() >= job.deadlineAt) {
       this.finish(job, 'expired', 'FILE_DELIVERY_TIMEOUT');
       return;
@@ -94,9 +141,27 @@ export class FileDeliveryWorker {
     const [, kind, target] = job.key.split(':');
     if (!validChatId(kind, target))
       return this.finish(job, beforeIntent ? 'failed' : 'unconfirmed', 'FILE_JOB_INVALID');
-    let identity;
+    const scopeFor = identity => ({
+      account: identity.account,
+      accountRef: identity.accountRef ?? adapter.accountRef,
+      kind,
+      target,
+      rosterGrant: job.rosterGrant,
+      deliveryId: job.id,
+    });
+    const accountChanged = scope =>
+      scope.accountRef !== adapter.accountRef ||
+      (job.account && job.account !== scope.account) ||
+      (job.accountRef && job.accountRef !== scope.accountRef);
+    let scope;
     try {
-      identity = await adapter.checkNative();
+      if (!beforeIntent) {
+        scope = scopeFor(adapter.receiptAccount());
+        if (accountChanged(scope)) return this.finish(job, 'unconfirmed', 'FILE_ACCOUNT_CHANGED');
+        const lookup = job.dispatchPending ? { ...scope, observeOnly: true } : scope;
+        if (!(await this.awaitingAdmission(job, lookup))) return;
+      }
+      scope = scopeFor(await adapter.checkNative());
       await adapter.lookupTarget(kind, target);
     } catch (error) {
       // Readiness and target discovery are observations. Losing the Reader does
@@ -104,18 +169,8 @@ export class FileDeliveryWorker {
       this.recordWait(job, safeError(error));
       return;
     }
-    if ((job.account && job.account !== identity.account) || (job.accountRef && job.accountRef !== adapter.accountRef))
-      return this.finish(job, beforeIntent ? 'failed' : 'unconfirmed', 'FILE_ACCOUNT_CHANGED');
+    if (accountChanged(scope)) return this.finish(job, beforeIntent ? 'failed' : 'unconfirmed', 'FILE_ACCOUNT_CHANGED');
 
-    const scope = {
-      account: identity.account,
-      accountRef: adapter.accountRef,
-      kind,
-      target,
-      rosterGrant: job.rosterGrant,
-      deliveryId: job.id,
-    };
-    if ((job.nativeAdmitted || job.state !== 'queued') && !(await this.awaitingAdmission(job, scope))) return;
     if (this.stopped || adapter.status.paused) return;
     if (adapter.status.file_send !== true) {
       this.recordWait(job, 'FILE_NATIVE_SENDER_NOT_READY');
@@ -168,8 +223,18 @@ export class FileDeliveryWorker {
           size: job.size,
         },
         scope.account,
+        { admissionOnly: true },
       );
     } catch (error) {
+      if (desktopQueueFull(error)) {
+        // No desktop job exists. Resume the same local job and restore its queue controls.
+        job.state = 'queued';
+        job.error = 'DESKTOP_STORAGE_LIMIT';
+        delete job.nativeAdmitted;
+        delete job.dispatchPending;
+        this.save(job);
+        return;
+      }
       if (error.attempted === false) {
         const expired = error.senderCode === 'DESKTOP_INPUT_EXPIRED';
         this.finish(job, expired ? 'expired' : 'failed', expired ? 'FILE_DELIVERY_TIMEOUT' : safeError(error));
@@ -180,7 +245,6 @@ export class FileDeliveryWorker {
       job.state = 'submitted';
       job.error = 'FILE_SUBMISSION_UNCERTAIN';
       this.save(job);
-      if (!this.stopped) await this.awaitingAdmission(job, scope);
       return;
     }
     try {
@@ -213,23 +277,28 @@ export class FileDeliveryWorker {
   }
 
   applyNative(job, result) {
-    if (
-      result?.admitted !== true ||
-      result.deliveryId !== job.id ||
-      typeof result.state !== 'string' ||
-      (result.state === 'confirmed') !== (result.confirmed === true)
-    )
-      throw Error('FILE_NATIVE_RESULT_INVALID');
+    if (!matchesDesktopDelivery(result, job.id, 'file')) throw Error('FILE_NATIVE_RESULT_INVALID');
+    const status = desktopDeliveryStatus(result);
     let receipt;
-    if (result.confirmed === true) {
+    if (status === 'confirmed') {
       const r = result.receipt;
-      if (!validId(r?.localId) || !validId(r?.serverId) || r.fileName !== job.name || r.fileSize !== job.size)
+      if (
+        r?.source !== 'wechat-server-id' ||
+        !validId(r?.localId) ||
+        !validId(r?.serverId) ||
+        (job.receipt?.fileContentMd5Matched === true && String(r.serverId) !== job.receipt.serverId) ||
+        r.fileName !== job.name ||
+        r.fileSize !== job.size ||
+        typeof r.fileContentMd5Matched !== 'boolean' ||
+        (r.fileContentMd5Matched ? r.fileMd5 !== job.md5 : !!r.fileMd5)
+      )
         throw Error('FILE_NATIVE_RECEIPT_INVALID');
       receipt = {
         messageId: String(r.localId),
         serverId: String(r.serverId),
         type: 'wechat-file',
         serverConfirmed: true,
+        fileContentMd5Matched: r.fileContentMd5Matched,
       };
     }
     delete job.dispatchPending;
@@ -245,8 +314,10 @@ export class FileDeliveryWorker {
     job.state =
       result.state === 'cancelled' && result.reason === 'DESKTOP_INPUT_EXPIRED'
         ? 'expired'
-        : ['cancelled', 'failed', 'unconfirmed'].includes(result.state)
-          ? result.state
+        : TERMINAL_DELIVERY_STATES.has(result.state)
+          ? result.state === 'confirmed'
+            ? 'unconfirmed'
+            : result.state
           : result.submitted === true || ['attempted', 'submitted', 'unknown'].includes(result.submission)
             ? 'submitted'
             : 'queued';
@@ -256,5 +327,6 @@ export class FileDeliveryWorker {
   }
   stop() {
     this.stopped = true;
+    this.archiveAbort.abort(Error('FILE_WORKER_STOPPED'));
   }
 }

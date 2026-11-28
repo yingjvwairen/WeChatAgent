@@ -16,6 +16,26 @@ import { clipboardFailureDiagnostic, clipboardOutcome } from './qt-diagnostics.m
 import { isDeepStrictEqual } from 'node:util';
 import { validateAccountEvidence } from './account-probe.mjs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { linesIn, readImage } from './qt-quote-ocr.mjs';
+
+export function fileDialogSendButton(ocr, bounds, fileName, titleSha256) {
+  const lines = linesIn(ocr, bounds);
+  if (!lines || !hash(titleSha256)) return null;
+  const single = predicate => {
+    const matches = lines.filter(line => line.texts.some(predicate));
+    return matches.length === 1 && matches[0].confident ? matches[0] : null;
+  };
+  const file = single(text => text === fileName);
+  const target = single(text => {
+    const title = text.replace(/^(?:发送给|发送至|傳送給|Send to)\s*[:：]?\s*/u, '');
+    return [text, title].some(value => createHash('sha256').update(value).digest('hex') === titleSha256);
+  });
+  const send = single(text => ['发送', '傳送', 'Send'].includes(text));
+  if (!file || !target || !send || file === target || send.box.top < Math.max(file.box.bottom, target.box.bottom))
+    return null;
+  return send.box;
+}
 
 // Stateless operations over the driver's shared window and input session.
 class QtAttachmentSession {
@@ -27,6 +47,44 @@ class QtAttachmentSession {
     this.#input = input;
     this.#frames = frames;
     this.#focus = focus;
+  }
+  observeFileDialog(job) {
+    const current = this.#input.current;
+    if (
+      job.mode !== 'file' ||
+      current?.jobId !== job.id ||
+      current.imageApplied !== job.id ||
+      current.account !== job.account ||
+      current.target !== job.target ||
+      !current.fileDialogProof
+    )
+      return null;
+    return {
+      ready: true,
+      account: current.account,
+      target: current.target,
+      foreground: true,
+      idleMs: current.fileDialogIdleMs,
+      appliedImageId: job.id,
+      editorToken: current.editorToken,
+      activityRevision: current.revision,
+    };
+  }
+  rememberFileDialog(job, current, frame, proof) {
+    if (
+      !object(proof) ||
+      Object.keys(proof).length !== 2 ||
+      !/^[a-f0-9]{32}$/.test(proof.id) ||
+      proof.sha256 !== job.image.sha256
+    )
+      throw fault('UI_QT_FILE_DIALOG_PROOF_INVALID');
+    this.#input.rememberImageDraft(current, {
+      imageApplied: job.id,
+      imageSha256: job.image.sha256,
+      fileDialogProof: structuredClone(proof),
+      fileDialogIdleMs: frame.idleMs,
+    });
+    this.#frames.invalidateFrame();
   }
   canResumeImage(job) {
     if (!object(job) || !hash(job.id)) return false;
@@ -157,20 +215,7 @@ class QtAttachmentSession {
       )
         throw fault('UI_QT_FILE_PASTE_UNCONFIRMED');
       if (ordinaryFile && result.fileDialogProof) {
-        const proof = result.fileDialogProof;
-        if (
-          !object(proof) ||
-          Object.keys(proof).length !== 2 ||
-          !/^[a-f0-9]{32}$/.test(proof.id) ||
-          proof.sha256 !== job.image.sha256
-        )
-          throw fault('UI_QT_FILE_DIALOG_PROOF_INVALID');
-        this.#input.rememberImageDraft(current, {
-          imageApplied: job.id,
-          imageSha256: job.image.sha256,
-          fileDialogProof: structuredClone(proof),
-        });
-        this.#frames.invalidateFrame();
+        this.rememberFileDialog(job, current, frame, result.fileDialogProof);
         return { performed: true, attempted: true, imageApplied: true, ...clipboardOutcome(result) };
       }
       if (
@@ -209,62 +254,82 @@ class QtAttachmentSession {
       throw error;
     }
   }
-  async submitUiaImage(job, guard, current) {
-    try {
-      if (job.mode === 'file' && current.fileDialogProof) {
-        if (guard.signal?.aborted || !guard.canSubmit()) return { performed: false, attempted: false };
-        this.#input.beginImageSubmission(job);
-        const result = await this.#input.requestNative('submitUiaFileDialog', {
-          proofId: current.fileDialogProof.id,
-          sha256: job.image.sha256,
-        });
-        if (
-          result.performed !== true ||
-          result.attempted !== true ||
-          result.inputQueued !== true ||
-          result.revision !== current.revision
-        )
-          throw fault('UI_QT_FILE_SUBMIT_UNCONFIRMED');
-        this.#input.discardDraft();
-        return { performed: true, attempted: true };
+  async #submitFileDialog(job, guard, current) {
+    this.#input.active();
+    if (guard.signal?.aborted || !guard.canSubmit()) return { performed: false, attempted: false };
+    const proof = { proofId: current.fileDialogProof.id, sha256: job.image.sha256 };
+    let buttonRect;
+    if (this.#frames.config.layoutMode !== 'uia-v1') {
+      const capture = await this.#input.requestNative('captureOcrFileDialog', proof).catch(() => null);
+      if (capture) {
+        const { image, width, height } = capture;
+        const ocr = await readImage(this.#input, image, width, height, undefined, guard.signal).catch(() => null);
+        buttonRect = fileDialogSendButton(
+          ocr,
+          { left: 0, top: 0, right: width, bottom: height },
+          path.basename(job.image.path),
+          current.fileTitleSha256,
+        );
       }
-      if (!validUiaImageProof(current.uiaImageProof, job.image) || this.#frames.frame !== current.uiaImageFrame)
-        throw fault('UI_QT_IMAGE_APPLICATION_UNKNOWN');
-      const frame = this.acceptUiaImageFrame(this.#frames.frame, current),
-        lease = this.#focus.preparationLease(),
-        proof = structuredClone(current.uiaImageProof);
-      await this.#input.verifyControlBinding(job, frame, 'image-submit', guard.signal);
-      this.#input.active();
-      if (
-        this.#input.current !== current ||
-        this.#frames.frame !== frame ||
-        this.#focus.preparationLease() !== lease ||
-        !isDeepStrictEqual(current.uiaImageProof, proof)
-      )
-        throw fault('UI_QT_CONTROLS_BINDING_CHANGED');
-      if (guard.signal?.aborted || guard.canSubmit() !== true)
-        return { performed: false, attempted: false, reason: 'UI_TARGET_NOT_ALLOWED' };
-      this.#input.beginImageSubmission(job);
-      const result = await this.#input.requestNative('submitUiaImage', {
-        token: frame.token,
-        epoch: frame.epoch,
-        revision: frame.revision,
-        idleMs: this.#frames.config.idleMs,
-        imagePasteProofId: proof.id,
-        imageSha256: proof.imageSha256,
-      });
-      const queued =
-        result?.inputQueued === true &&
-        result.submitted === false &&
-        result.submissionConfirmed === false &&
-        validUiaPointerDelivery(result.pointerDelivery, 'image-submit');
-      if (result?.performed !== true || result.attempted !== true || !queued || result.revision !== current.revision)
-        throw fault('UI_QT_IMAGE_SUBMIT_UNCONFIRMED');
-      this.#input.discardDraft();
-      return { performed: true, attempted: true };
-    } finally {
-      await this.#focus.releaseTextFocus();
+      if (!buttonRect) return { performed: false, attempted: false, reason: 'UI_QT_FILE_DIALOG_UNVERIFIED' };
     }
+    this.#input.active();
+    if (this.#input.current !== current || guard.signal?.aborted || !guard.canSubmit())
+      return { performed: false, attempted: false, reason: 'UI_TARGET_NOT_ALLOWED' };
+    this.#input.beginImageSubmission(job);
+    const result = await this.#input.requestNative('submitFileDialog', {
+      ...proof,
+      ...(buttonRect ? { buttonRect } : {}),
+    });
+    if (
+      result.performed !== true ||
+      result.attempted !== true ||
+      result.inputQueued !== true ||
+      result.revision !== current.revision
+    )
+      throw fault('UI_QT_FILE_SUBMIT_UNCONFIRMED');
+    this.#input.discardDraft();
+    return { performed: true, attempted: true, inputReleased: result.dialogClosed === true };
+  }
+  async #submitUiaImage(job, guard, current) {
+    if (!validUiaImageProof(current.uiaImageProof, job.image) || this.#frames.frame !== current.uiaImageFrame)
+      throw fault('UI_QT_IMAGE_APPLICATION_UNKNOWN');
+    const frame = this.acceptUiaImageFrame(this.#frames.frame, current),
+      lease = this.#focus.preparationLease(),
+      proof = structuredClone(current.uiaImageProof);
+    await this.#input.verifyControlBinding(job, frame, 'image-submit', guard.signal);
+    this.#input.active();
+    if (
+      this.#input.current !== current ||
+      this.#frames.frame !== frame ||
+      this.#focus.preparationLease() !== lease ||
+      !isDeepStrictEqual(current.uiaImageProof, proof)
+    )
+      throw fault('UI_QT_CONTROLS_BINDING_CHANGED');
+    if (guard.signal?.aborted || guard.canSubmit() !== true)
+      return { performed: false, attempted: false, reason: 'UI_TARGET_NOT_ALLOWED' };
+    this.#input.beginImageSubmission(job);
+    const result = await this.#input.requestNative('submitUiaImage', {
+      token: frame.token,
+      epoch: frame.epoch,
+      revision: frame.revision,
+      idleMs: this.#frames.config.idleMs,
+      imagePasteProofId: proof.id,
+      imageSha256: proof.imageSha256,
+    });
+    const queued =
+      result?.inputQueued === true &&
+      result.submitted === false &&
+      result.submissionConfirmed === false &&
+      validUiaPointerDelivery(result.pointerDelivery, 'image-submit');
+    if (result?.performed !== true || result.attempted !== true || !queued || result.revision !== current.revision)
+      throw fault('UI_QT_IMAGE_SUBMIT_UNCONFIRMED');
+    this.#input.discardDraft();
+    return {
+      performed: true,
+      attempted: true,
+      ...(result.inputReleased === true ? { inputReleased: true } : {}),
+    };
   }
   async resumeImage(job, { signal, canInput } = {}) {
     this.#input.checkJob(job);
@@ -452,7 +517,12 @@ class QtAttachmentSession {
         return { performed: false, attempted: false, reason: 'UI_TARGET_NOT_ALLOWED' };
       entered = true;
       const result = await this.#input.requestNative(job.mode === 'file' ? 'pasteFile' : 'pasteImage', {
-        ...(job.mode === 'file' ? { deliveryId: job.id } : {}),
+        ...(job.mode === 'file'
+          ? {
+              deliveryId: job.id,
+              ...(current.fileTitleSha256 ? { titleSha256: current.fileTitleSha256 } : {}),
+            }
+          : {}),
         sendRect: this.#frames.config.layout.send,
         allowClipboardReplacement: this.#input.allowClipboardReplacement,
         token: frame.token,
@@ -485,6 +555,10 @@ class QtAttachmentSession {
         throw fault('UI_QT_FILE_PASTE_UNCONFIRMED');
       if (gif && (result.imageFormat !== 'gif' || result.originalFilePasted !== true))
         throw fault('UI_QT_IMAGE_PASTE_UNCONFIRMED');
+      if (ordinaryFile && result.fileDialogProof) {
+        this.rememberFileDialog(job, current, frame, result.fileDialogProof);
+        return { performed: true, attempted: true, imageApplied: true, ...clipboardOutcome(result) };
+      }
       // The animation is intentionally excluded from stable pixel anchors.
       // Native input still binds the account/window, header and activity epoch.
       this.#frames.invalidateFrame();
@@ -522,9 +596,8 @@ class QtAttachmentSession {
     guard = { ...guard, ...(typeof local.canSubmit === 'function' ? { canSubmit: local.canSubmit } : {}) };
     this.#input.checkJob(job);
     const current = this.#input.current;
+    if (this.#input.imageSubmitAttempted === job.id) throw fault('UI_QT_IMAGE_SUBMIT_UNCONFIRMED');
     if (!this.#input.allowSubmit) return { performed: false, attempted: false, reason: 'UI_SUBMIT_DISABLED' };
-    if (this.#input.imageSubmitAttempted === job.id)
-      return { performed: false, attempted: false, reason: 'UI_QT_IMAGE_SUBMIT_UNCONFIRMED' };
     if (
       !current ||
       current.imageApplied !== job.id ||
@@ -535,8 +608,15 @@ class QtAttachmentSession {
       guard.canSubmit() !== true
     )
       return { performed: false, attempted: false, reason: 'UI_QT_IMAGE_APPLICATION_UNKNOWN' };
-    if (this.#frames.config.layoutMode === 'uia-v1') return this.submitUiaImage(job, guard, current);
+    const action =
+      job.mode === 'file' && current.fileDialogProof
+        ? 'submitFileDialog'
+        : this.#frames.config.layoutMode === 'uia-v1'
+          ? 'submitUiaImage'
+          : 'submitOcrMedia';
     try {
+      if (action === 'submitFileDialog') return await this.#submitFileDialog(job, guard, current);
+      if (action === 'submitUiaImage') return await this.#submitUiaImage(job, guard, current);
       const frame = await this.#frames.capture([
         'header',
         ['gif', 'file'].includes(current.imageFormat) ? 'send' : 'editor',
@@ -550,7 +630,7 @@ class QtAttachmentSession {
       // Images are inline attachments on this client; click its current send
       // control. A changed focus never grants a second keyboard submission.
       this.#input.beginImageSubmission(job);
-      const result = await this.#input.requestNative('submitOcrMedia', {
+      const result = await this.#input.requestNative(action, {
         token: frame.token,
         epoch: frame.epoch,
         revision: frame.revision,
@@ -559,9 +639,20 @@ class QtAttachmentSession {
       });
       if (result.performed !== true || result.attempted !== true) throw fault('UI_QT_IMAGE_SUBMIT_UNCONFIRMED');
       this.#input.discardDraft();
-      return { performed: true, attempted: true };
+      return {
+        performed: true,
+        attempted: true,
+        ...(job.mode === 'image' && !current.imageFormat && result.controlConsumed === true
+          ? { inputReleased: true }
+          : {}),
+      };
+    } catch (error) {
+      // The native client binds this proof to the command that received the error.
+      if (error?.nativeAction !== action || error.attempted !== false) throw error;
+      this.#input.refuseImageSubmission(job);
+      return { performed: false, attempted: false, reason: codeFor(error) };
     } finally {
-      await this.#focus.releaseTextFocus();
+      if (local.deferFocusRelease !== true) await this.#focus.releaseTextFocus();
     }
   }
 }

@@ -1,6 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { launcherAssemblyInfo, releaseIdentity } from './release-version.mjs';
+
+test('the component manifest agrees with the project and desktop release versions', () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL('../components.json', import.meta.url), 'utf8'));
+  const project = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const desktop = JSON.parse(fs.readFileSync(new URL('../apps/console-desktop/package.json', import.meta.url), 'utf8'));
+  assert.equal(manifest.version, releaseIdentity(project).version);
+  assert.equal(
+    manifest.components.find(entry => entry.directory === 'apps/console-desktop')?.version,
+    releaseIdentity(desktop).version,
+  );
+});
 
 test('a plus release has an exact public label, valid package alias and numeric Windows build version', () => {
   assert.deepEqual(releaseIdentity({ version: '0.4.1+plus', releaseVersion: '0.4.1+' }), {

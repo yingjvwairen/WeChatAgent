@@ -187,7 +187,7 @@ async function install(f, bytes) {
   });
   assert.equal(result.status, 200);
 }
-const zip = () => fs.readFileSync('optional-extensions/packages/speech-recognition-1.7.1.zip');
+const zip = () => fs.readFileSync('optional-extensions/packages/speech-recognition-1.7.2.zip');
 
 test('Qwen enrollment accepts an ordinary recording through the settings route and returns only the voice ID, status and bound model', async t => {
   const f = await fixture(t);

@@ -27,6 +27,7 @@ import {
 } from '../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 import { migrateDshSettings } from '../packages/dsh-social-bridge-plugin/dsh-migration.mjs';
 import { DESKTOP_BACKEND, desktopSettings } from './desktop-settings.mjs';
+import { localSpeechPort } from './local-speech-owned.mjs';
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
 const write = (file, value) => {
@@ -64,7 +65,7 @@ function pluginRevision(root, moduleDir) {
   return revision.digest('hex').slice(0, 16);
 }
 
-export function validateConfig(config) {
+export function validateConfig(config, { consolePort } = {}) {
   validateFishNotebook(config.wechat?.fishNotebook);
   validateHistorySettings(config.wechat?.history);
   validateMemberMemory(config.wechat?.memberMemory);
@@ -75,6 +76,7 @@ export function validateConfig(config) {
   validateProactiveSettings(config.wechat?.proactive);
   validateContextSettings(config.wechat?.context);
   validateWebReaderSettings(config.wechat?.webReader);
+  const speechPorts = [];
   if (config.runtime?.localSpeech !== undefined) {
     const services = config.runtime.localSpeech;
     if (!services || typeof services !== 'object' || Array.isArray(services)) throw Error('本机语音服务配置无效。');
@@ -94,6 +96,7 @@ export function validateConfig(config) {
       ) {
         throw Error('请先选择本机语音解释器、模型位置及所需的方案文件。');
       }
+      if (service.enabled) speechPorts.push(localSpeechPort(kind, service));
     }
   }
   if (config.version !== 2) throw new Error('请使用新版配置并重新选择微信聊天。');
@@ -103,10 +106,12 @@ export function validateConfig(config) {
   if ((config.runtime.weflowMode ?? 'nt') !== 'nt') throw new Error('Desktop sending requires the NT reader');
   desktopSettings(config, projectRoot, { requireClient: false });
   const ports = Object.values(config.ports ?? {});
-  if (ports.length !== 4 || ports.some(p => !Number.isInteger(p) || p < 1024 || p > 65535) || new Set(ports).size !== 4)
-    throw new Error('Configure four distinct service ports between 1024 and 65535');
+  if (ports.length !== 4 || ports.some(p => !Number.isInteger(p) || p < 1024 || p > 65535))
+    throw new Error('Configure four service ports between 1024 and 65535');
   if (!['weflow', 'onebot', 'adapter', 'dshPlugin'].every(key => Number.isInteger(config.ports[key])))
     throw new Error('Required ports: weflow, onebot, adapter, dshPlugin');
+  const listeners = [...ports, ...speechPorts, ...(consolePort ? [consolePort] : [])];
+  if (new Set(listeners).size !== listeners.length) throw Error('Configure distinct service ports');
   if (!config.runtime?.python || !Array.isArray(config.account?.nicknames) || !config.account.nicknames.length)
     throw new Error('Python and account nicknames are required');
   for (const kind of ['groups', 'private']) {

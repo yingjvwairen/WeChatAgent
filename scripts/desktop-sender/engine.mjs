@@ -3,7 +3,13 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createDeliveryQueues } from './engine-queues.mjs';
-import { canonicalJob, deliverySnapshot, TERMINAL_STATES } from './contract.mjs';
+import {
+  canonicalJob,
+  deliverySnapshot,
+  TERMINAL_STATES,
+  voicePartNeedsReceipt,
+  withDeliveryReview,
+} from './contract.mjs';
 import { installVoice, voiceRequest, pcmByteLength, pcmWave } from './engine-voice.mjs';
 import { deliveryRecovery, reviewedRecovery, snapshotOperations } from './operations.mjs';
 import { cancelIdleVoice, readNativeVoiceJob } from './native-voice-outbox.mjs';
@@ -13,13 +19,50 @@ import { ownsDesktop, selectDelivery } from './scheduler.mjs';
 import { ReplyDeliveryControls } from '../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 import { FILE_LIMIT, safeFileName } from '../../packages/wechat-file-reference.mjs';
 import { normalizeDesktopText, validDesktopText, canTypeDesktopText } from './text-contract.mjs';
-import { listChatDeliveries, saveDeliveryControl } from './delivery-list.mjs';
+import {
+  canRefreshReleasedReceipt,
+  canSettleStoredVoiceReceipt,
+  currentDeliveryResult,
+  listChatDeliveries,
+  refreshStoredVoiceReceipts,
+  saveDeliveryControl,
+  savedChatDeliveries,
+  savedReceiptView,
+  storedDelivery,
+  withDeliveryReceipt,
+} from './delivery-list.mjs';
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const fault = code => Object.assign(Error(code), { code });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const routeId = payload => hash(JSON.stringify([payload.account, payload.deliveryId]));
+const voicePreflightWaitMs = 30000;
+const awaitsVoiceReceipt = state => state?.segments?.some(voicePartNeedsReceipt);
+const admissionRefusalCodes = new Set([
+  'CONVERSATION_NOT_ALLOWED',
+  'DESKTOP_TARGET_CHANGED',
+  'DESKTOP_TARGET_AMBIGUOUS',
+  'DESKTOP_LOCAL_MEDIA_CHANGED',
+  'DESKTOP_MEDIA_CHANGED',
+  'DESKTOP_MEDIA_INVALID',
+  'DESKTOP_IMAGE_FINGERPRINT_UNAVAILABLE',
+  'DESKTOP_FILE_NAME_INVALID',
+  'DESKTOP_JOB_INVALID',
+  'DESKTOP_PERMISSION_REQUIRED',
+  'DESKTOP_STORAGE_LIMIT',
+  'DESKTOP_ADMISSION_EXPIRED',
+]);
+const receiptLookupWaitCodes = new Set([
+  'INPUT_WECHAT_NOT_RUNNING',
+  'INPUT_ACCOUNT_UNVERIFIED',
+  'DESKTOP_NOT_READY',
+  'DESKTOP_CONFIGURATION_BUSY',
+  'DESKTOP_ACCOUNT_RECOVERY_REQUIRED',
+  'READER_NOT_LISTENING',
+  'READER_CONNECTION_RESET',
+  'READER_HEALTH_FAILED',
+]);
 function waitingVoicePreflight(error) {
   if (
     error?.attempted !== false ||
@@ -88,6 +131,7 @@ export class DesktopSenderEngine {
     probeAccount,
     receipt,
     ensureAccessibility,
+    fingerprintImage,
     driverFactory,
     now = Date.now,
   } = {}) {
@@ -105,6 +149,7 @@ export class DesktopSenderEngine {
       probeAccount,
       receipt,
       ensureAccessibility,
+      fingerprintImage,
       driverFactory,
       now,
     });
@@ -137,6 +182,7 @@ export class DesktopSenderEngine {
           'idleMs',
           'receiptTimeoutMs',
           'voiceSend',
+          'voiceCable',
         ].map(key => [key, settings[key]]),
       ),
     );
@@ -289,15 +335,16 @@ export class DesktopSenderEngine {
     for (const row of [...context.metadata.values()]) {
       const outcome = this.snapshot(context, row);
       if (
-        this.isReviewed(context, row.job.id) ||
+        outcome.reviewed ||
         (!outcome.recovery &&
           !outcome.focusRecoveryRequired &&
           (outcome.confirmed ||
+            (outcome.state === 'unconfirmed' && outcome.inputReleased) ||
             (['cancelled', 'failed'].includes(outcome.state) &&
               (!outcome.inputStarted || (row.job.operation === 'voice' && !ownsDesktop(outcome))))))
       ) {
         if (['file', 'image', 'sticker'].includes(row.job.operation)) context.images.releaseAsset(row.job.id);
-        context.store.retire(row, { ...outcome, reviewed: this.isReviewed(context, row.job.id) });
+        context.store.retire(row, outcome);
       }
     }
   }
@@ -305,7 +352,7 @@ export class DesktopSenderEngine {
     const base = this.metadata(context, native.id).job;
     return { ...base, ...(native.segment ? { segment: structuredClone(native.segment) } : {}) };
   }
-  async admit(operation, payload) {
+  async admit(operation, payload, admissionDeadlineAt) {
     if (!['text', 'voice', 'image', 'sticker', 'file'].includes(operation))
       throw fault('DESKTOP_OPERATION_UNSUPPORTED');
     if (operation === 'text') {
@@ -330,14 +377,16 @@ export class DesktopSenderEngine {
       return { context, row: prior };
     }
     try {
-      return await this.admitNew(context, id, fingerprint, operation, payload);
+      if (admissionDeadlineAt !== undefined && this.now() >= admissionDeadlineAt)
+        throw fault('DESKTOP_ADMISSION_EXPIRED');
+      return await this.admitNew(context, id, fingerprint, operation, payload, admissionDeadlineAt);
     } catch (error) {
-      // Only a failed *new* admission with no durable row proves that this ID never acquired the desktop.
-      if (!context.store.find(id)) error.attempted = false;
+      // A refusal with no durable job proves input did not start.
+      if (admissionRefusalCodes.has(error?.code ?? error?.message) && !context.store.find(id)) error.attempted = false;
       throw error;
     }
   }
-  async admitNew(context, id, fingerprint, operation, payload) {
+  async admitNew(context, id, fingerprint, operation, payload, admissionDeadlineAt) {
     const recipient = await this.resolveTarget(payload.kind, payload.target);
     if (!recipient || recipient.wxid !== payload.target) throw fault('DESKTOP_TARGET_CHANGED');
     payload = { ...payload };
@@ -367,6 +416,8 @@ export class DesktopSenderEngine {
       payload.sha256 = hash(bytes);
       if (payload.expectedSha256 !== undefined && payload.expectedSha256 !== payload.sha256)
         throw fault('DESKTOP_MEDIA_CHANGED');
+      if (operation === 'image' && this.fingerprintImage && !/\.gif$/iu.test(payload.path))
+        payload.imageFingerprint = await this.fingerprintImage(payload.path, payload.sha256);
       if (operation === 'file') {
         payload.fileName ??= path.basename(payload.path);
         if (!safeFileName(payload.fileName)) throw fault('DESKTOP_FILE_NAME_INVALID');
@@ -408,6 +459,9 @@ export class DesktopSenderEngine {
     const audio = operation === 'voice' ? pcmWave(pcmBase64) : undefined;
     if (audio) row.voiceAudioSha256 = hash(audio);
     try {
+      // Apply the caller's cutoff only before a new job enters the native queue.
+      if (admissionDeadlineAt !== undefined && this.now() >= admissionDeadlineAt)
+        throw fault('DESKTOP_ADMISSION_EXPIRED');
       context.store.save(row, audio);
     } finally {
       audio?.fill(0);
@@ -464,22 +518,27 @@ export class DesktopSenderEngine {
     return deliveryRecovery(this.root, row, state, this.activeJob);
   }
   snapshot(context, row) {
-    if (row.outcome) return row.outcome;
-    const state = this.state(context, row);
-    return deliverySnapshot(row, state, this.recovery(row, state));
+    let outcome = row.outcome;
+    if (!outcome) {
+      const state = this.state(context, row);
+      outcome = deliverySnapshot(row, state, this.recovery(row, state));
+    }
+    const reviewed = !row.outcome && !outcome.recovery && this.isReviewed(context, row.job.id);
+    return withDeliveryReview(currentDeliveryResult(this.root, row.job, outcome), reviewed);
   }
   blocks(context, row) {
     if (this.isReviewed(context, row.job.id)) return false;
     const state = this.state(context, row),
       recovery = this.recovery(row, state);
     if (recovery) return !recovery.recovered;
+    if (state?.inputReleased) return false; // Only read-only receipt checks remain.
     if (row.cancelled && (!state || !this.snapshot(context, row).inputStarted)) return false;
     return !state || !TERMINAL_STATES.has(state.state);
   }
   inputExpired(row) {
     return row.inputRefusal || (row.job.inputDeadlineAt !== undefined && this.now() >= row.job.inputDeadlineAt);
   }
-  async retireRevoked(context, row, reason = 'DESKTOP_PERMISSION_CHANGED') {
+  async retireInput(context, row, reason = 'DESKTOP_PERMISSION_CHANGED') {
     const current = this.snapshot(context, row);
     row.revoked = true;
     row.reason = reason;
@@ -547,7 +606,6 @@ export class DesktopSenderEngine {
     const work = this.contextTail
       .then(async () => {
         if (!this.configurationSafe()) return;
-        const hadContext = this.contexts.size > 0;
         for (const context of this.contexts.values()) {
           context.text.stop();
           context.images.stop();
@@ -558,16 +616,12 @@ export class DesktopSenderEngine {
           await context.driver.close();
         }
         this.contexts.clear();
-        if (hadContext) {
-          const context = await this.createContext({});
-          // A save can land while the driver is being built. Leave the request
-          // pending so the next pass applies the newest configuration.
-          if (context.configurationKey !== this.configurationKey()) return;
-          await context.driver.applySettings?.();
-        }
-        this.configurationPending = [...this.contexts.values()].some(
-          context => context.configurationKey !== this.configurationKey(),
-        );
+        const context = await this.createContext({});
+        // A save can land while the driver is being built. Leave the request
+        // pending so the next pass applies the newest configuration.
+        if (context.configurationKey !== this.configurationKey()) return;
+        await context.driver.applySettings?.();
+        this.configurationPending = context.configurationKey !== this.configurationKey();
         this.configurationError = null;
         this.pumpFailure = null;
       })
@@ -621,31 +675,75 @@ export class DesktopSenderEngine {
         if (this.recheckRequested) this.kick();
       });
   }
+  scheduleReceiptCheck() {
+    if (this.closed || this.receiptTimer) return;
+    this.receiptTimer = setTimeout(() => {
+      this.receiptTimer = null;
+      this.kick();
+    }, 10000);
+    this.receiptTimer.unref();
+  }
+  async reconcileVoice(context, row) {
+    if (this.closed || context.text.stopped) return null;
+    const voice = await installVoice(this, context);
+    if (this.closed || context.text.stopped || this.authorizeCurrent(row.job, false) !== true) return null;
+    try {
+      return await voice.query(voiceRequest(row));
+    } catch (error) {
+      if (error?.code !== 'NATIVE_VOICE_BUSY') throw error;
+      return null;
+    }
+  }
+  async settleSavedVoice({ context, row, state }) {
+    const checkpoint = this.state(context, row);
+    if (
+      this.authorizeCurrent(row.job, false) !== true ||
+      !(await canSettleStoredVoiceReceipt(this.root, context.directory, row, checkpoint, state))
+    )
+      return false;
+    const settled = await this.reconcileVoice(context, row);
+    if (!settled) this.scheduleReceiptCheck();
+    if (!settled || settled.focusRecoveryRequired || awaitsVoiceReceipt(settled)) return false;
+    if (
+      !state.segments.filter(voicePartNeedsReceipt).every(part => {
+        const updated = settled.segments[part.index];
+        return updated?.state === 'confirmed' && updated.id === part.attemptId;
+      })
+    )
+      return false;
+    this.recovery(row, settled);
+    return true;
+  }
   async pump() {
     const waiting = new Set();
     while (!this.closed) {
       if (this.configurationPending && this.configurationSafe()) return;
-      const selected = selectDelivery(
-        [...this.contexts.values()].flatMap(context => {
-          const holds = context.chatControls.heldChats();
-          return [...context.metadata.values()]
-            .filter(row => this.blocks(context, row))
-            .map(row => {
-              const state = this.snapshot(context, row);
-              const receiptOnly = row.job.operation !== 'voice' && ['submitted', 'submitting'].includes(state.state);
-              return {
-                context,
-                row,
-                state,
-                holdReason: receiptOnly ? null : this.holdReason(context, row, holds),
-                revoked:
-                  !row.revoked &&
-                  (!this.authorized(context, row.job, !receiptOnly) || (!receiptOnly && this.inputExpired(row))),
-              };
-            });
-        }),
-        waiting,
+      const candidates = [...this.contexts.values()].flatMap(context => {
+        const holds = context.chatControls.heldChats();
+        return [...context.metadata.values()]
+          .filter(row => this.blocks(context, row))
+          .map(row => {
+            const state = this.snapshot(context, row);
+            const receiptOnly =
+              row.job.operation !== 'voice' && ['submitted', 'submitting', 'unconfirmed'].includes(state.state);
+            return {
+              context,
+              row,
+              state,
+              receiptOnly,
+              holdReason: receiptOnly ? null : this.holdReason(context, row, holds),
+              revoked:
+                !row.revoked &&
+                (!this.authorized(context, row.job, !receiptOnly) || (!receiptOnly && this.inputExpired(row))),
+            };
+          });
+      });
+      const voiceReceipt = candidates.find(
+        ({ row, state }) => row.job.operation === 'voice' && awaitsVoiceReceipt(state),
       );
+      if (voiceReceipt && (await this.settleSavedVoice(voiceReceipt))) continue;
+      if (this.closed) return;
+      const selected = selectDelivery(candidates, waiting, this.settings().paused);
       if (!selected) {
         if (!waiting.size) return;
         waiting.clear();
@@ -662,27 +760,23 @@ export class DesktopSenderEngine {
       ) {
         const reconciled = await this.queue(context, row).reconcileReceipt(row.job.id);
         if (reconciled?.state === 'confirmed') continue;
-        if (!this.closed && !this.receiptTimer) {
-          this.receiptTimer = setTimeout(() => {
-            this.receiptTimer = null;
-            this.kick();
-          }, 10000);
-          this.receiptTimer.unref();
-        }
+        this.scheduleReceiptCheck();
       }
-      const receiptOnly = row.job.operation !== 'voice' && ['submitted', 'submitting'].includes(state?.state);
-      if (this.settings().paused && !receiptOnly) return;
+      const receiptOnly =
+        row.job.operation !== 'voice' && ['submitted', 'submitting', 'unconfirmed'].includes(state?.state);
       if (!row.revoked && !this.authorized(context, row.job, !receiptOnly)) {
-        if (await this.retireRevoked(context, row)) continue;
+        if (await this.retireInput(context, row)) continue;
         return;
       }
       // A deadline prevents further input, but never suppresses an already
       // submitted attempt's read-only receipt lookup. Partial drafts retain
       // the same operator recovery barrier as withdrawn authorization.
       if (!row.revoked && this.inputExpired(row) && !receiptOnly) {
-        if (await this.retireRevoked(context, row, row.inputRefusal || 'DESKTOP_INPUT_EXPIRED')) continue;
+        if (await this.retireInput(context, row, row.inputRefusal || 'DESKTOP_INPUT_EXPIRED')) continue;
         return;
       }
+      if (!receiptOnly && (this.settings().paused || [...this.contexts.values()].some(item => item.focusReturnFailed)))
+        return;
       if (selected.holdReason) {
         if (row.job.operation !== 'voice' && selected.state.inputStarted) await this.queue(context, row).releaseFocus();
         return;
@@ -710,15 +804,26 @@ export class DesktopSenderEngine {
           }
           ready ??= { ready: false, reason: 'DESKTOP_VOICE_PREFLIGHT_REQUIRED' };
           if (!ready.ready) {
-            if (row.reason !== ready.reason) {
+            if (!this.allowed(context, { id: row.job.id })) continue;
+            const now = this.now();
+            const needsCalibration = ready.reason === 'UI_QT_VOICE_CALIBRATION_REQUIRED';
+            if (needsCalibration || now >= (row.voicePreflightDeadline ?? Infinity)) {
+              await this.retireInput(context, row, needsCalibration ? ready.reason : 'DESKTOP_VOICE_PREFLIGHT_TIMEOUT');
+              waiting.delete(row.job.id);
+              continue;
+            }
+            // Keep the first wait's deadline across polls and restarts.
+            if (row.voicePreflightDeadline === undefined || row.reason !== ready.reason) {
+              row.voicePreflightDeadline ??= now + voicePreflightWaitMs;
               row.reason = ready.reason;
               context.store.save(row);
             }
             waiting.add(row.job.id);
             continue;
           }
-          if (row.reason) {
+          if (row.reason || row.voicePreflightDeadline !== undefined) {
             delete row.reason;
+            delete row.voicePreflightDeadline;
             context.store.save(row);
           }
           const voice = await installVoice(this, context);
@@ -737,6 +842,8 @@ export class DesktopSenderEngine {
         }
       } finally {
         this.activeJob = null;
+        // A cancelled input can still return proof that it never reached the desktop.
+        if (row.cancelled && row.job.operation !== 'voice') this.recovery(row, this.state(context, row));
       }
       await delay(25);
     }
@@ -786,10 +893,10 @@ export class DesktopSenderEngine {
   sendVoice(payload) {
     return this.send('voice', payload);
   }
-  async send(operation, payload, { admissionOnly = false } = {}) {
-    if (this.applying) await this.applying;
+  async send(operation, payload, { admissionOnly = false, admissionDeadlineAt } = {}) {
+    // Register the admission before context() can block on a settings change.
     this.admitting++;
-    const admission = this.tail.then(() => this.admit(operation, payload));
+    const admission = this.tail.then(() => this.admit(operation, payload, admissionDeadlineAt));
     this.tail = admission.catch(() => {});
     let admitted;
     try {
@@ -804,6 +911,7 @@ export class DesktopSenderEngine {
     const end = this.now() + (this.settings().operationTimeoutMs ?? 20000);
     do {
       const result = this.snapshot(context, row);
+      if (result.state === 'submitted' && result.inputReleased) return this.observe(context, row, true);
       if (
         TERMINAL_STATES.has(result.state) ||
         result.state === 'conflict' ||
@@ -819,22 +927,105 @@ export class DesktopSenderEngine {
   }
   async lookup({ account, accountRef, kind, target, rosterGrant, deliveryId, observeOnly = false }) {
     if (!account || !digest(accountRef) || !deliveryId) throw fault('DESKTOP_LOOKUP_SCOPE_INVALID');
-    await this.tail;
-    const context = await this.context({ account, accountRef });
-    if (context.account.accountRef !== accountRef) throw fault('DESKTOP_ACCOUNT_CHANGED');
-    const row = context.store.find(routeId({ account, deliveryId }));
+    const directory = path.join(this.directory, accountRef);
+    const id = routeId({ account, deliveryId });
+    const findSaved = context => {
+      if (context && context.account.accountRef !== accountRef) throw fault('DESKTOP_ACCOUNT_CHANGED');
+      const store = context?.store ?? new DeliveryStore(directory, { readOnly: true });
+      return store.find(id);
+    };
+    const verifyScope = ({ job }) => {
+      if (
+        job.accountRef !== accountRef ||
+        job.account !== account ||
+        job.kind !== kind ||
+        job.target !== target ||
+        job.rosterGrant !== rosterGrant
+      )
+        throw fault('DESKTOP_DELIVERY_ID_CONFLICT');
+      if (this.authorizeCurrent(job, false) !== true) throw fault('DESKTOP_RECEIPT_PERMISSION_CHANGED');
+    };
+    let context = this.contexts.get(accountRef);
+    let row = findSaved(context);
+    // An existing record can be observed immediately. An absent record has to
+    // be checked after in-flight admissions have had a chance to persist it.
+    if (!row) {
+      await this.tail;
+      context = this.contexts.get(accountRef);
+      row = findSaved(context);
+      if (!row && !observeOnly) {
+        context = await this.context({ account, accountRef });
+        row = findSaved(context);
+      }
+    }
     if (!row) return null;
+    verifyScope(row);
+    if (context) return this.observe(context, row, observeOnly);
+
     const job = row.job;
-    if (job.kind !== kind || job.target !== target || job.rosterGrant !== rosterGrant)
-      throw fault('DESKTOP_DELIVERY_ID_CONFLICT');
-    return this.observe(context, row, observeOnly);
+    const { state, view } = storedDelivery(directory, row);
+    // Existing receipts are available even before the native context can be opened.
+    if (!observeOnly && !row.outcome && !view.receipt && !view.reviewed && this.authorizeCurrent(job, true) === true) {
+      try {
+        context = await this.context({ account, accountRef });
+      } catch (error) {
+        if (!receiptLookupWaitCodes.has(error?.code ?? error?.message)) throw error;
+        verifyScope(row);
+      }
+      if (context) {
+        const current = findSaved(context);
+        if (!current) throw fault('DESKTOP_STATE_INVALID');
+        verifyScope(current);
+        return this.observe(context, current, false);
+      }
+    }
+    if (job.operation === 'voice') return view.receipt ? view : this.observeVoiceReceipt(directory, row, state, view);
+    const mayHaveSubmitted =
+      !row.outcome && !view.reviewed && ['submitting', 'submitted', 'unconfirmed'].includes(state?.state);
+    if (!view.receipt && (mayHaveSubmitted || canRefreshReleasedReceipt(job, view))) {
+      try {
+        const result = await this.receipt(job, { phase: 'query' });
+        if (result?.confirmed === true) return withDeliveryReceipt(job, view, result.receipt);
+      } catch {
+        // The Reader may be offline. Keep the original outcome until it can confirm a receipt.
+      }
+    }
+    return view;
   }
   async query(id, observeOnly = false) {
     const { context, row } = await this.find(id);
     return this.observe(context, row, observeOnly);
   }
+  receiptView(context, row, view = this.snapshot(context, row)) {
+    const voice = row.job.operation === 'voice' ? this.state(context, row) : null;
+    return savedReceiptView(this.root, context.directory, row.job, voice, view);
+  }
+  async observeVoiceReceipt(directory, row, state, view) {
+    const observed = await refreshStoredVoiceReceipts(this.root, directory, row, state, view, (job, request) =>
+      this.receipt(job, request),
+    );
+    if (this.authorizeCurrent(row.job, false) !== true) throw fault('DESKTOP_RECEIPT_PERMISSION_CHANGED');
+    return observed;
+  }
   async observe(context, row, observeOnly) {
-    if (row.outcome) return row.outcome;
+    const saved = this.snapshot(context, row);
+    const observed = this.receiptView(context, row, saved);
+    const voiceDelivery = row.job.operation === 'voice';
+    if (observed.receipt && (observeOnly || voiceDelivery || observed !== saved)) return observed;
+    if (voiceDelivery && (row.outcome || saved.reviewed)) {
+      if (this.authorizeCurrent(row.job, false) !== true) return observed;
+      return this.observeVoiceReceipt(context.directory, row, this.state(context, row), observed);
+    }
+    if (canRefreshReleasedReceipt(row.job, saved) && this.authorizeCurrent(row.job, false) === true) {
+      try {
+        const result = await this.receipt(row.job, { phase: 'query' });
+        if (result?.confirmed === true) return withDeliveryReceipt(row.job, saved, result.receipt);
+      } catch {
+        // A temporary read failure cannot withdraw existing receipt evidence.
+        if (!saved.receipt) return saved;
+      }
+    }
+    if (row.outcome || (observeOnly && observed !== saved)) return observed;
     if (
       row.job.operation !== 'voice' &&
       ['submitting', 'submitted', 'unconfirmed'].includes(this.state(context, row)?.state) &&
@@ -843,19 +1034,15 @@ export class DesktopSenderEngine {
     ) {
       await this.queue(context, row).reconcileReceipt(row.job.id);
     }
-    if (
-      row.job.operation === 'voice' &&
-      this.state(context, row)?.segments?.some(part =>
-        ['record-intent', 'submitted', 'unknown'].includes(part.state),
-      ) &&
-      !this.pumping &&
-      !this.isReviewed(context, row.job.id)
-    ) {
-      const voice = await installVoice(this, context);
-      await voice.query(voiceRequest(row));
+    if (voiceDelivery && awaitsVoiceReceipt(saved) && this.authorizeCurrent(row.job, false) === true) {
+      if (this.pumping || !(await this.reconcileVoice(context, row))) {
+        const refreshed = await this.observeVoiceReceipt(context.directory, row, this.state(context, row), observed);
+        if (!observeOnly) this.kick();
+        return refreshed;
+      }
     }
     if (!observeOnly) this.kick();
-    return this.snapshot(context, row);
+    return this.receiptView(context, row);
   }
   controllable(context, row, holds) {
     const state = this.snapshot(context, row),
@@ -866,7 +1053,7 @@ export class DesktopSenderEngine {
         !(row.job.operation === 'voice' && this.activeJob === row.job.id && context.voice?.running);
     const holdReason = active && this.holdReason(context, row, holds);
     return {
-      ...state,
+      ...this.receiptView(context, row, state),
       ...(holdReason ? { state: 'paused', reason: holdReason } : {}),
       canPause: !holdReason && active && !row.paused && !this.state(context, row)?.manualPause,
       canResume:
@@ -878,7 +1065,14 @@ export class DesktopSenderEngine {
   }
   listDeliveries({ accountRef, kind, target, rosterGrant } = {}) {
     const context = this.contexts.get(accountRef);
-    if (!context) return [];
+    if (!context) {
+      return savedChatDeliveries(this.root, accountRef, 'wechat:' + kind + ':' + target, rosterGrant).map(job => ({
+        ...job,
+        canPause: false,
+        canResume: false,
+        canCancel: false,
+      }));
+    }
     const holds = context.chatControls.heldChats();
     return listChatDeliveries(context.store, { kind, target, rosterGrant }, row =>
       this.controllable(context, row, holds),
@@ -893,16 +1087,24 @@ export class DesktopSenderEngine {
       const context = await this.context(payload);
       return context.driver.restoreWindow();
     }
-    const { context, row } = await this.find(payload.deliveryId ?? payload.id, payload),
-      current = this.controllable(context, row);
-    if (
-      payload.accountRef !== undefined &&
-      (row.job.accountRef !== payload.accountRef ||
+    const id = payload.deliveryId ?? payload.id;
+    let context, row;
+    if (payload.accountRef === undefined) {
+      ({ context, row } = await this.find(id, payload));
+    } else {
+      // The console targets the exact job it listed. It can become stale while a context is being rebuilt.
+      context = this.contexts.get(payload.accountRef);
+      row = context?.metadata.get(id);
+      if (!row || this.closed || context.text.stopped) throw fault('DESKTOP_CONTROL_CHANGED');
+      if (
+        row.job.accountRef !== payload.accountRef ||
         row.job.kind !== payload.kind ||
         row.job.target !== payload.target ||
-        row.job.rosterGrant !== payload.rosterGrant)
-    )
-      throw fault('DESKTOP_CONTROL_SCOPE_CHANGED');
+        row.job.rosterGrant !== payload.rosterGrant
+      )
+        throw fault('DESKTOP_CONTROL_SCOPE_CHANGED');
+    }
+    const current = this.controllable(context, row);
     if (payload.revision !== undefined && payload.revision !== current.revision) throw fault('DESKTOP_CONTROL_CHANGED');
     const capability = { pause: 'canPause', resume: 'canResume', cancel: 'canCancel' }[payload.action];
     if (!capability || !current[capability]) throw fault('DESKTOP_CONTROL_CHANGED');

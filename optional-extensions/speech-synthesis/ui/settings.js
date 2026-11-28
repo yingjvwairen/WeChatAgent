@@ -746,9 +746,23 @@ function renderEditor(capability) {
           'endpoint',
           endpointLabel(entry, definition),
           wrap,
-          custom && !websocket ? '只填基础地址时自动补上接口路径；带网关前缀或完整接口路径的地址按原样使用。' : '',
+          has('endpointMode') ? '可以填写带网关前缀的基础地址，或使用下方选项指定完整合成地址。' : '',
         ),
       );
+    }
+    if (has('endpointMode')) {
+      const control = el(
+        'select',
+        { id: 'f-endpointMode' },
+        el('option', { value: 'base', textContent: '基础地址或 /audio/speech' }),
+        el('option', { value: 'exact', textContent: '完整合成地址' }),
+      );
+      control.value = values.endpointMode === 'exact' ? 'exact' : 'base';
+      control.addEventListener('change', () => {
+        values.endpointMode = control.value;
+        onFieldChange(capability, 'endpointMode');
+      });
+      basic.push(row('endpointMode', '合成地址用法', control, '使用完整自定义路径时，请手动填写模型和音色。'));
     }
     if (item.keyKind !== 'none' && (!custom || values.auth !== 'none')) basic.push(keyRow(capability, item));
     if (has('refAudio')) {

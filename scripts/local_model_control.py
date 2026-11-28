@@ -11,10 +11,18 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 
-def profile_revision(file, profiles):
-    data = Path(file).read_bytes() if file else json.dumps(profiles, sort_keys=True, default=str).encode()
-    if len(data) > 262144:
+def profile_data(file, fallback=None, *, limit=262144):
+    if file:
+        with Path(file).open('rb') as source:
+            data = source.read(limit + 1)
+    else:
+        data = json.dumps(fallback, sort_keys=True, ensure_ascii=False, separators=(',', ':'), default=str).encode()
+    if len(data) > limit:
         raise ValueError('Profile configuration is too large')
+    return data
+
+
+def profile_revision(data):
     return hashlib.sha256(data).hexdigest()
 
 
@@ -39,9 +47,10 @@ def save_selection(file, name):
         temporary.unlink(missing_ok=True)
 
 
-def control_routes(service, key, lock, reload_profiles, revision, selection_file=None):
+def control_routes(service, key, lock, reload_profiles, revision, loaded_revision, selection_file=None):
     if not key:
         return []
+    applying = False
 
     def authorize(request):
         supplied = request.headers.get('authorization', '').encode('latin-1')
@@ -53,14 +62,15 @@ def control_routes(service, key, lock, reload_profiles, revision, selection_file
         return JSONResponse(
             {
                 'version': 1,
-                'phase': service.phase,
+                'phase': 'loading' if applying else service.phase,
                 'selectedProfile': service.selected,
                 'loadedProfile': service.current,
-                'revision': revision(),
+                'revision': loaded_revision,
             }
         )
 
     async def use(request):
+        nonlocal applying, loaded_revision
         authorize(request)
         length = request.headers.get('content-length', '')
         if (
@@ -83,26 +93,44 @@ def control_routes(service, key, lock, reload_profiles, revision, selection_file
             if body['revision'] != requested_revision:
                 raise HTTPException(409, 'Profile settings changed')
             previous_profiles = service.profiles
+            previous_model = (service.current, service.loaded_signature)
+            previous_phase = service.phase
+
+            def rollback(*, disconnected=False):
+                service.profiles = previous_profiles
+                if (service.current, service.loaded_signature) != previous_model:
+                    service.unload()
+                    service.phase = 'failed'
+                else:
+                    service.phase = previous_phase if disconnected else 'failed'
+
             try:
-                profiles = reload_profiles()
+                profiles, snapshot_revision = reload_profiles()
+                if snapshot_revision != requested_revision:
+                    raise HTTPException(409, 'Profile settings changed')
                 if body['profile'] not in profiles:
                     raise HTTPException(404)
+                applying = True
                 service.phase = 'loading'
                 service.profiles = profiles
                 await run_in_threadpool(service.preload, body['profile'])
+                if await request.is_disconnected():
+                    raise HTTPException(408)
                 if revision() != requested_revision:
-                    service.phase = 'failed'
                     raise HTTPException(409, 'Profile settings changed during loading')
                 save_selection(selection_file, body['profile'])
                 service.selected = body['profile']
+                loaded_revision = requested_revision
                 service.phase = 'ready'
-            except HTTPException:
-                service.profiles = previous_profiles
+            except HTTPException as error:
+                if applying:
+                    rollback(disconnected=error.status_code == 408)
                 raise
             except Exception:
-                service.profiles = previous_profiles
-                service.phase = 'failed'
+                rollback()
                 raise HTTPException(503, 'Local model could not be loaded') from None
+            finally:
+                applying = False
             return JSONResponse(
                 {
                     'version': 1,

@@ -1,8 +1,15 @@
-import { validChatId, validUserId } from '../../../../../packages/wechat-identity.mjs';
+import { validChatId, validUserId, validReaderOrder } from '../../../../../packages/wechat-identity.mjs';
+import { imageContentMatched, replyDeliveryStatus } from '../../../../../packages/delivery-contract.mjs';
+import { voiceFallbackId } from '../../../../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 import crypto from 'node:crypto';
 import { BaseAdapter } from '../base-adapter.js';
 import { ReverseOneBotServer } from '../../onebot/reverse-ws-server.js';
 import { normalizeOneBotEvent } from '../../onebot/normalize.js';
+
+const sentTiming = data =>
+  Number.isSafeInteger(data?.sentAt)
+    ? { sentAt: data.sentAt, ...(validReaderOrder(data.readerOrder) ? { readerOrder: data.readerOrder } : {}) }
+    : {};
 
 export class WechatOneBotAdapter extends BaseAdapter {
   constructor(config = {}, log = () => {}) {
@@ -18,6 +25,7 @@ export class WechatOneBotAdapter extends BaseAdapter {
     });
     this.server.on('close', () => {
       this.stats.connected = false;
+      this.selfId = '';
       this.emit('close');
     });
     this.server.on('error', error => {
@@ -117,23 +125,24 @@ export class WechatOneBotAdapter extends BaseAdapter {
     };
     if (part.stickerId) {
       const result = await this.sendSticker({ ...scope, id: part.stickerId });
-      return result.pending ? 'pending' : result.data?.receipt === 'wechat-server-id' ? 'confirmed' : 'unconfirmed';
+      if (replyDeliveryStatus(result) === 'pending') return { status: 'pending' };
+      return {
+        status: replyDeliveryStatus(result),
+        mediaType: result.data?.media_type,
+        ...sentTiming(result),
+      };
     }
     if (part.voiceText && !part.voiceFallback) {
       const result = await this.sendVoiceText({ ...scope, text: part.voiceText });
-      return result.status;
+      return { status: result.status, ...sentTiming(result) };
     }
-    if (part.voiceFallback)
-      scope.deliveryId = crypto
-        .createHash('sha256')
-        .update(part.deliveryId + '\0voice-fallback')
-        .digest('hex');
+    if (part.voiceFallback) scope.deliveryId = voiceFallbackId(part.deliveryId);
     const result = await this.sendText({
       ...scope,
       text: part.text ?? part.voiceText,
       quoteEventId: part.quoteEventId,
     });
-    return result.confirmed ? 'confirmed' : result.pending ? 'pending' : 'unconfirmed';
+    return { status: replyDeliveryStatus(result), ...sentTiming(result) };
   }
   async sendText({
     kind,
@@ -185,7 +194,13 @@ export class WechatOneBotAdapter extends BaseAdapter {
       return { accepted: false, attempted: true, confirmed: false, delivered: 'unconfirmed', deliveryId };
     }
     if (result.data?.pending === true && result.data.delivery_id === deliveryId) {
-      return { pending: true, confirmed: false, delivered: 'unconfirmed', deliveryId };
+      return {
+        pending: true,
+        confirmed: false,
+        delivered: 'unconfirmed',
+        deliveryId,
+        ...(result.data.admitted === true ? { admitted: true } : {}),
+      };
     }
     // The I/O service acknowledges only after a new matching server receipt.
     if (result.data?.receipt !== 'wechat-server-id')
@@ -193,7 +208,14 @@ export class WechatOneBotAdapter extends BaseAdapter {
     this.#prune(Date.now());
     this.recentOutgoing.set(this.#fingerprint(kind, target, content), Date.now() + this.antiLoopTtlMs);
     this.stats.sends++;
-    return { accepted: true, confirmed: true, response: result, delivered: 'database-confirmed', deliveryId };
+    return {
+      accepted: true,
+      confirmed: true,
+      response: result,
+      delivered: 'database-confirmed',
+      deliveryId,
+      ...sentTiming(result.data),
+    };
   }
   // Whether WCA can send a native voice reply to this chat right now.
   async voiceCapability({ kind, target, rosterGrant }) {
@@ -225,7 +247,9 @@ export class WechatOneBotAdapter extends BaseAdapter {
     return {
       status: data.status,
       fallback: data.fallback === true,
+      ...(data.admitted === true ? { admitted: true } : {}),
       ...(typeof data.error === 'string' ? { error: data.error } : {}),
+      ...(data.status === 'confirmed' ? sentTiming(data) : {}),
     };
   }
   async stickerChoices({ kind, target, query }) {
@@ -243,8 +267,8 @@ export class WechatOneBotAdapter extends BaseAdapter {
     deliveryId,
     rosterGrant,
     receiptOnly = false,
-    deferReceipt = false,
     deadlineAt,
+    admissionDeadlineAt,
     abandon = false,
     observeOnly = false,
   }) {
@@ -257,10 +281,10 @@ export class WechatOneBotAdapter extends BaseAdapter {
         ...(deliveryId ? { wechatagent_delivery_id: deliveryId } : {}),
         ...(rosterGrant === undefined ? {} : { wechatagent_roster_grant: rosterGrant }),
         ...(receiptOnly ? { wechatagent_receipt_only: true } : {}),
-        ...(deferReceipt ? { wechatagent_defer_receipt: true } : {}),
         ...(abandon ? { wechatagent_abandon_delivery: true } : {}),
         ...(observeOnly ? { wechatagent_observe_only: true } : {}),
         ...(deadlineAt !== undefined ? { wechatagent_deadline_at: deadlineAt } : {}),
+        ...(admissionDeadlineAt !== undefined ? { wechatagent_admission_deadline_at: admissionDeadlineAt } : {}),
       });
     } catch (error) {
       if (error.code !== 'STICKER_DELIVERY_UNCONFIRMED' || error.data?.attempted !== true) throw error;
@@ -269,15 +293,28 @@ export class WechatOneBotAdapter extends BaseAdapter {
     }
     if (abandon && result.data?.released === true) return result.data;
     if (result.data?.pending === true && result.data.delivery_id === deliveryId) {
-      return { pending: true, confirmed: false, delivered: 'unconfirmed', deliveryId };
+      return {
+        pending: true,
+        confirmed: false,
+        delivered: 'unconfirmed',
+        deliveryId,
+        ...(result.data.admitted === true ? { admitted: true } : {}),
+      };
     }
     if (
       result.data?.receipt !== 'wechat-server-id' ||
       !['wechat-sticker', 'wechat-image'].includes(result.data?.media_type)
     )
       throw new Error('Sticker send has no server receipt');
-    this.stats.sends++;
-    return result;
+    if (result.data.media_type === 'wechat-image' && !imageContentMatched(result.data))
+      return { accepted: false, attempted: true, delivered: 'unconfirmed', deliveryId };
+    const status = replyDeliveryStatus({ ...result, delivered: result.data.delivered });
+    if (status === 'confirmed') this.stats.sends++;
+    return {
+      ...result,
+      delivered: status === 'confirmed' ? 'database-confirmed' : status,
+      ...(status === 'confirmed' ? sentTiming(result.data) : {}),
+    };
   }
   async stickerLabels({ kind, target, ids }) {
     return (await this.server.action('get_sticker_labels', { kind, target: String(target), ids })).data?.labels ?? [];

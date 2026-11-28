@@ -289,6 +289,7 @@ export class UiaOffscreenClient {
   }
 }
 
+/** @param {{root?: string, createHost?: (options: {root: string}) => UiaOffscreenClient, createInspector?: (options: {root: string, config: object, enableInput: boolean}) => QtActionsClient}} [options] */
 export function createUiaOffscreenManager({
   root,
   createHost = options => new UiaOffscreenClient(options),
@@ -305,7 +306,53 @@ export function createUiaOffscreenManager({
     active(signal);
     if (closed) throw fault('UIA_OFFSCREEN_CLOSED');
   };
+  async function parkVerifiedWindow({ executable, binding: observed, signal }) {
+    ensureActive(signal);
+    if (!binding(observed) || !path.isAbsolute(executable ?? '')) throw fault('UIA_OFFSCREEN_BINDING_CHANGED');
+    const expected = {
+      version: 1,
+      hwnd: observed.hwnd,
+      pid: observed.pid,
+      processCreatedFileTimeUtc: observed.processCreatedFileTimeUtc,
+      executable,
+    };
+    host ??= createHost({ root });
+    const state = await host.request('park-explicit', { binding: expected }, { signal });
+    ensureActive(signal);
+    if (
+      !binding(state.binding) ||
+      !['hwnd', 'pid', 'processCreatedFileTimeUtc'].every(key => state.binding[key] === expected[key])
+    )
+      throw fault('UIA_OFFSCREEN_BINDING_CHANGED');
+    if (
+      state.state === 'deferred' &&
+      state.released === true &&
+      state.parked === false &&
+      state.windowMoved === false &&
+      state.inputSent === false &&
+      state.clipboardAccessed === false &&
+      state.foregroundChanged === false &&
+      ['OFFSCREEN_KEYS_HELD', 'OFFSCREEN_USER_ACTIVITY_CHANGED'].includes(state.reason) &&
+      state.binding.dpi === observed.dpi &&
+      isDeepStrictEqual(state.binding.clientRect, observed.clientRect) &&
+      isDeepStrictEqual(state.binding.captureRect, observed.captureRect)
+    ) {
+      lastState = state;
+      const error = fault(state.reason);
+      noMoveRefusals.add(error);
+      throw error;
+    }
+    if (
+      !state.parked &&
+      !(state.state === 'deferred' && state.reason === 'OFFSCREEN_ALREADY_OUTSIDE' && state.released === true)
+    )
+      throw fault('UIA_OFFSCREEN_MOVE_UNCONFIRMED');
+    lastState = state;
+    suppressPark = false;
+    return structuredClone(state);
+  }
   return {
+    parkVerifiedWindow,
     async setEnabled({ enabled, config, signal } = {}) {
       ensureActive(signal);
       if (typeof enabled !== 'boolean') throw fault('UIA_OFFSCREEN_SETTINGS_INVALID');
@@ -351,47 +398,7 @@ export function createUiaOffscreenManager({
         inspection.executableSha256 !== config.executableSha256
       )
         throw fault('UIA_OFFSCREEN_BINDING_CHANGED');
-      const expected = {
-        version: 1,
-        hwnd: inspection.binding.hwnd,
-        pid: inspection.binding.pid,
-        processCreatedFileTimeUtc: inspection.binding.processCreatedFileTimeUtc,
-        executable: config.executable,
-      };
-      host ??= createHost({ root });
-      const state = await host.request('park-explicit', { binding: expected }, { signal });
-      ensureActive(signal);
-      if (
-        !binding(state.binding) ||
-        !['hwnd', 'pid', 'processCreatedFileTimeUtc'].every(key => state.binding[key] === expected[key])
-      )
-        throw fault('UIA_OFFSCREEN_BINDING_CHANGED');
-      if (
-        state.state === 'deferred' &&
-        state.released === true &&
-        state.parked === false &&
-        state.windowMoved === false &&
-        state.inputSent === false &&
-        state.clipboardAccessed === false &&
-        state.foregroundChanged === false &&
-        ['OFFSCREEN_KEYS_HELD', 'OFFSCREEN_USER_ACTIVITY_CHANGED'].includes(state.reason) &&
-        state.binding.dpi === inspection.binding.dpi &&
-        isDeepStrictEqual(state.binding.clientRect, inspection.binding.clientRect) &&
-        isDeepStrictEqual(state.binding.captureRect, inspection.binding.captureRect)
-      ) {
-        lastState = state;
-        const error = fault(state.reason);
-        noMoveRefusals.add(error);
-        throw error;
-      }
-      if (
-        !state.parked &&
-        !(state.state === 'deferred' && state.reason === 'OFFSCREEN_ALREADY_OUTSIDE' && state.released === true)
-      )
-        throw fault('UIA_OFFSCREEN_MOVE_UNCONFIRMED');
-      lastState = state;
-      suppressPark = false;
-      return structuredClone(state);
+      return parkVerifiedWindow({ executable: config.executable, binding: inspection.binding, signal });
     },
     async prepareWindow({ config, signal, releaseInput }) {
       ensureActive(signal);

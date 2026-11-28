@@ -10,7 +10,7 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
     name,
     description:
       name === 'wechat_file_receive'
-        ? '将本轮微信文件按附件 ID 复制到当前 DSH 工作区，返回实际相对路径；电脑微信尚未下载时立即说明，不等待或猜测内容。'
+        ? '将本轮微信文件按附件 ID 核验并复制到当前 DSH 工作区，返回相对路径。缺少原消息摘要时，提供原附件 ID 和本机确认提示。'
         : name === 'wechat_file_send'
           ? '将当前工作区中的现有文件作为真正微信文件附件发送到当前聊天。仅相对路径；后台队列独立运行，未取得确认前不得声称送达。'
           : '查询自己提交的文件传输状态；管理员可查询当前聊天的已知传输 ID。',

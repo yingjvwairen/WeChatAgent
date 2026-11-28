@@ -22,6 +22,7 @@ export const CAPABILITY_SECTIONS = { catalog: '能力目录', network: '联网�
 export const LIVE_WECHAT_SECTIONS = [
   'whitelist',
   'rosterGrants',
+  'rosterStarts',
   'fishNotebook',
   'replyLayout',
   'stickers',
@@ -30,13 +31,14 @@ export const LIVE_WECHAT_SECTIONS = [
   'proactive',
   'context',
   'chatModes',
+  'groupWakeEpochs',
   'dshAccess',
   'memeLibrary',
   'assistant',
 ];
 // The sender reads these preferences for each desktop request. A change does
 // not require a service restart or change the entry mode halfway through text.
-export const LIVE_INPUT_FIELDS = ['paused', 'controlMode', 'typeText', 'offscreen'];
+export const LIVE_INPUT_FIELDS = ['paused', 'controlMode', 'typeText', 'offscreen', 'voiceCable'];
 export const requiresRestart = path =>
   !LIVE_INPUT_FIELDS.some(field => path === 'input.' + field) &&
   !LIVE_WECHAT_SECTIONS.some(section => path === 'wechat.' + section || path.startsWith('wechat.' + section + '.'));

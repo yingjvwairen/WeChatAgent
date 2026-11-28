@@ -227,6 +227,69 @@ test('uncertain submission returns focus and stays receipt-only', async t => {
   assert.equal(f.submissions.length, 1);
 });
 
+for (const sent of [false, true]) {
+  test('submit evidence is durable before focus return, sent=' + sent, async t => {
+    const f = fixture(t);
+    appliedPaste(f);
+    f.enqueue();
+    if (sent) {
+      const submit = f.driver.submit;
+      f.driver.submit = async (...args) => {
+        await submit(...args);
+        return { performed: true, attempted: true, inputReleased: true };
+      };
+    } else {
+      f.controls.beforeSubmit = () => ({ performed: false, attempted: false, reason: 'UI_USER_ACTIVE' });
+    }
+    const entered = Promise.withResolvers();
+    const gate = Promise.withResolvers();
+    f.driver.releaseTextFocus = async () => {
+      entered.resolve();
+      await gate.promise;
+      throw Error('return failed');
+    };
+    let receiptQueries = 0;
+    const readReceipt = f.driver.receipt;
+    f.driver.receipt = async job => {
+      receiptQueries++;
+      return readReceipt(job);
+    };
+    const failed = assert.rejects(f.queue.tick(), { code: 'UI_FOCUS_RETURN_UNCONFIRMED' });
+    const state = sent ? 'submitted' : 'paused';
+    try {
+      await entered.promise;
+      const saved = f.queue.get(firstId);
+      assert.equal(saved.state, state);
+      if (sent) assert.equal(saved.inputReleased, true);
+      else {
+        assert.equal(saved.submittedAt, undefined);
+        assert.equal(saved.deadlineAt, undefined);
+        assert.equal(saved.reason, 'UI_USER_ACTIVE');
+      }
+      f.controls.confirmed = sent;
+      assert.equal((await f.queue.reconcileReceipt(firstId)).state, sent ? 'confirmed' : 'paused');
+      assert.equal(receiptQueries, sent ? 1 : 0);
+    } finally {
+      gate.resolve();
+      await failed;
+    }
+
+    if (sent) {
+      assert.equal((await f.queue.reconcileReceipt(firstId)).state, 'confirmed');
+    } else {
+      await assert.rejects(f.queue.tick(), { code: 'UI_FOCUS_RETURN_UNCONFIRMED' });
+      assert.equal(f.submissions.length, 0);
+      f.driver.releaseTextFocus = async () => {};
+      f.controls.beforeSubmit = null;
+      f.controls.confirmed = true;
+      f.create();
+      assert.equal((await f.run()).state, 'confirmed');
+    }
+    assert.deepEqual(f.inputs, ['测试']);
+    assert.deepEqual(f.submissions, [firstId]);
+  });
+}
+
 test('failed focus cleanup allows only a submitted DB receipt and still makes drain fail', async t => {
   for (const failOnReturn of [1, 2]) {
     const f = fixture(t);
@@ -258,15 +321,16 @@ test('failed focus cleanup allows only a submitted DB receipt and still makes dr
       }
     }
     assert.equal(error?.code, 'UI_FOCUS_RETURN_UNCONFIRMED');
-    assert.equal(f.queue.get(firstId).state, failOnReturn === 1 ? 'submitting' : 'submitted');
+    assert.equal(f.queue.get(firstId).state, 'submitted');
     const inputCount = f.inputs.length,
-      observationCount = observations;
+      observationCount = observations,
+      receiptCount = receipts;
     // A separately scheduled cleanup is allowed to settle, but its known
     // failure must not suppress or overwrite a later read-only receipt.
     f.queue.pause();
     f.controls.confirmed = true;
     assert.equal((await f.queue.tick()).state, 'confirmed');
-    assert.equal(receipts, 1);
+    assert.equal(receipts, receiptCount + 1);
     assert.equal(f.inputs.length, inputCount);
     assert.equal(observations, observationCount);
     assert.equal(returns, failOnReturn);
@@ -281,6 +345,9 @@ test('failed focus cleanup allows only a submitted DB receipt and still makes dr
 
 test('failed focus cleanup can expire an unknown submission without ever resending', async t => {
   const f = fixture(t);
+  f.controls.afterSubmit = () => {
+    throw Error('native submit response lost');
+  };
   f.driver.releaseTextFocus = async () => {
     throw Error('return failed');
   };
@@ -793,6 +860,26 @@ test('lost same-tick submit response stays receipt-only after restart', async t 
   assert.equal((await f.queue.tick()).state, 'confirmed');
   assert.deepEqual(f.inputs, ['测试']);
   assert.equal(f.submissions.length, 1);
+});
+test('a live submit can report no input before external observers query for receipts', async t => {
+  const f = fixture(t);
+  appliedPaste(f);
+  f.enqueue();
+  const started = Promise.withResolvers();
+  const result = Promise.withResolvers();
+  f.controls.beforeSubmit = () => {
+    started.resolve();
+    return result.promise;
+  };
+  f.driver.receipt = () => assert.fail('queried during a live submission');
+  const tick = f.queue.tick();
+  await started.promise;
+  try {
+    assert.equal((await f.queue.reconcileReceipt(firstId)).state, 'submitting');
+  } finally {
+    result.resolve({ performed: false, attempted: false, reason: 'UI_USER_ACTIVE' });
+    assert.equal((await tick).state, 'paused');
+  }
 });
 test('an incomplete applied-paste acknowledgement never takes the same-tick submit shortcut', async t => {
   for (const acknowledgement of [

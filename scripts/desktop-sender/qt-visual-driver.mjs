@@ -145,6 +145,10 @@ class QtVisualDriver {
     if (this.#current?.jobId !== job.id) throw fault('UI_QT_IMAGE_APPLICATION_UNKNOWN');
     this.#imageSubmitAttempted = job.id;
   }
+  refuseImageSubmission(job) {
+    if (this.#imageSubmitAttempted !== job.id) throw fault('UI_QT_IMAGE_APPLICATION_UNKNOWN');
+    this.#imageSubmitAttempted = null;
+  }
   async #releaseClientForVoice() {
     await this.#native.releaseForVoice();
     this.resetInputSession();
@@ -915,7 +919,7 @@ class QtVisualDriver {
     return false;
   }
   async #finishPreparation(job, conversation, textEntryMode, signal) {
-    const { verified, privateChatProof, continuationFingerprint, recovering } = conversation;
+    const { verified, privateChatProof, continuationFingerprint, recovering, fileTitleSha256 } = conversation;
     await this.#editor.verifyNew(job, verified, signal);
     const { quoteToken, quoteNavigation } = await this.#quotes.prepare(job, verified, signal);
     this.#current = {
@@ -936,6 +940,7 @@ class QtVisualDriver {
       editorToken: crypto.randomUUID(),
       verifiedAt: this.now(),
       privateChatProof,
+      fileTitleSha256,
       shared: true,
       textEntryMode,
       ...{
@@ -1149,13 +1154,8 @@ class QtVisualDriver {
         reason: 'UI_QT_PREPARATION_REQUIRED',
       };
     try {
-      if (current.fileDialogProof && current.imageApplied === job.id && job.mode === 'file')
-        return {
-          ready: true,
-          appliedImageId: job.id,
-          editorToken: current.editorToken,
-          activityRevision: current.revision,
-        };
+      const dialog = this.#attachments.observeFileDialog(job);
+      if (dialog) return dialog;
       if (current.imageApplied === job.id) {
         if (this.config.layoutMode === 'uia-v1') {
           if (
@@ -1556,7 +1556,7 @@ class QtVisualDriver {
         },
       );
     } finally {
-      await this.#focus.releaseTextFocus();
+      if (local.deferFocusRelease !== true) await this.#focus.releaseTextFocus();
     }
   }
   /** Admission check only: keep a queued reply waiting while the user is active,

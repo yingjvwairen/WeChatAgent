@@ -42,12 +42,13 @@ export class QtConversationPreparation {
     // before borrowing focus. An existing continuation does not re-query.
     if (
       !targetLookup &&
-      !(job.index > 0) &&
-      !job.pendingInput &&
-      (!previous ||
-        previous.account !== job.account ||
-        previous.target !== job.target ||
-        (job.target.endsWith('@chatroom') && previous.jobId !== job.id))
+      (job.mode === 'file' ||
+        (!(job.index > 0) &&
+          !job.pendingInput &&
+          (!previous ||
+            previous.account !== job.account ||
+            previous.target !== job.target ||
+            (job.target.endsWith('@chatroom') && previous.jobId !== job.id))))
     ) {
       targetLookup = await this.#navigation.lookupTarget(job, {
         signal,
@@ -381,6 +382,12 @@ export class QtConversationPreparation {
     }
     await this.#input.verifyControlBinding(job, verified.frame, 'prepare', signal);
 
-    return { verified, privateChatProof, continuationFingerprint, recovering };
+    return {
+      verified,
+      privateChatProof,
+      continuationFingerprint,
+      recovering,
+      fileTitleSha256: targetLookup?.fileTitleSha256,
+    };
   }
 }

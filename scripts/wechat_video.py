@@ -64,6 +64,8 @@ def video_metadata(text):
             return None
         declared = video.get('playlength')
         seconds = float(declared) if declared else None
+        if seconds == 0:
+            seconds = None  # The container records the duration of sub-second clips.
         hashes = [video.attrib.get(key, '').lower() for key in ('newmd5', 'md5', 'rawmd5')]
         hashes = list(dict.fromkeys(value for value in hashes if re.fullmatch('[0-9a-f]{32}', value)))
         if not hashes or (seconds is not None and not 0 < seconds <= MAX_AUDIO_SECONDS):
@@ -71,7 +73,6 @@ def video_metadata(text):
         return {
             'durationSeconds': seconds,
             'hashes': hashes,
-            'frames': frame_count(seconds) if seconds is not None else 1,
         }
     except (ValueError, ElementTree.ParseError):
         return None
@@ -141,14 +142,16 @@ def decode(raw, count, *, audio=False, metadata_only=False):
         video = movie.streams.video[0]
         if not 0 < video.width <= 3840 or not 0 < video.height <= 3840 or video.width * video.height > 3840 * 2160:
             raise ValueError('VIDEO_DIMENSIONS_UNSUPPORTED')
+        playback = {'durationSeconds': seconds, 'audioPresent': bool(movie.streams.audio)}
         if metadata_only:
-            return {'durationSeconds': seconds, 'audioPresent': bool(movie.streams.audio)}
+            return playback
         if audio:
             if not movie.streams.audio:
                 raise VideoWithoutAudio()
             if len(movie.streams.audio) != 1:
                 raise ValueError('VOICE_VIDEO_AUDIO_UNAVAILABLE')
             return decode_audio(movie)
+        count = min(count, frame_count(seconds))
         results = []
         for n in range(count):
             target = seconds * (n + 0.5) / count
@@ -175,7 +178,7 @@ def decode(raw, count, *, audio=False, metadata_only=False):
                 break
             else:
                 raise ValueError('VIDEO_FRAME_UNAVAILABLE')
-        return results
+        return {'frames': results, 'playback': playback}
 
 
 def decode_audio(movie):
@@ -223,11 +226,10 @@ def decode_isolated(raw, count, *, audio=False, kind='video'):
 class VideoPreviews:
     def __init__(self, reader):
         self.reader = reader
-        self.lock = threading.Lock()
-        self.cache_key = self.frames = None
-        self.audio_key = self.audio = None
+        self.preview_slots = threading.BoundedSemaphore(2)
+        self.preview_cache = self.audio_cache = (None, None)
 
-    def read(self, record, *, audio=False, metadata_only=False):
+    def read(self, record, *, audio=False, metadata_only=False, max_frames=4):
         from reader_message_binding import MessageBinding
 
         reader, talker = self.reader, record['talker']
@@ -242,6 +244,7 @@ class VideoPreviews:
         source = binding.row['fullText']
         part = record.get('forwardPart')
         original = None
+        original_names = set()
         if part:
             from wechat_forwarded import parse_forwarded_record
 
@@ -254,16 +257,22 @@ class VideoPreviews:
             ):
                 raise ValueError('FORWARD_MESSAGE_CHANGED')
             kind = part['kind']
-            meta = {'hashes': part['hashes'], 'frames': 1}
-            from wechat_reference_media import forwarded_original_row
+            meta = {'hashes': part['hashes']}
+            from wechat_reference_media import forwarded_original_row, forwarded_quote_hashes
 
             original = forwarded_original_row(reader, talker, part)
+            if part.get('reference'):
+                original_names = reader.resource_names(original)
+                meta['hashes'] = forwarded_quote_hashes(original, part, original_names)
         else:
             kind = 'video'
             meta = video_metadata(source)
         if not meta or not part and meta != record['video']:
             raise ValueError('VIDEO_MESSAGE_CHANGED')
-        if not self.lock.acquire(timeout=0 if metadata_only else 5):
+        # Voice requests already hold a Reader voice slot. Keep their decoding
+        # independent of the two preview slots and of intake metadata probes.
+        preview = not audio and not metadata_only
+        if preview and not self.preview_slots.acquire(blocking=False):
             raise ValueError('VIDEO_PROCESS_BUSY')
         try:
             active()
@@ -271,7 +280,7 @@ class VideoPreviews:
             def resource_hints():
                 names = reader.resource_names(record)
                 if original:
-                    names = names.union(reader.resource_names(original))
+                    names = names.union(original_names if part.get('reference') else reader.resource_names(original))
                 return names
 
             if part and kind in ('image', 'sticker'):
@@ -283,24 +292,25 @@ class VideoPreviews:
                     meta['hashes'],
                     reader.own_wxid,
                     resource_names=resource_hints(),
-                    thumbnails=part.get('thumbnailHashes', ()),
+                    thumbnails=set(part.get('thumbnailHashes', ())).intersection(meta['hashes']),
                 )
             else:
                 raw = bound_bytes(reader.account, talker, meta['hashes'], kind, resource_names=resource_hints())
-            count = record.get('frameCount', meta['frames'])
+            count = max_frames if kind == 'video' and not audio else 1
             key = (str(reader.account), talker, record['serverId'], hashlib.sha256(raw).digest(), kind, count)
             if metadata_only:
                 result = decode_isolated(raw, 1, kind='duration')
             elif audio:
-                if key != self.audio_key:
-                    self.audio = decode_isolated(raw, count, audio=True, kind=kind)
-                    self.audio_key = key
-                result = self.audio
+                cached_key, result = self.audio_cache
+                if key != cached_key:
+                    result = decode_isolated(raw, count, audio=True, kind=kind)
+                    self.audio_cache = (key, result)
             else:
-                if key != self.cache_key:
-                    self.frames = decode_isolated(raw, count, kind=kind)
-                    self.cache_key = key
-                result = dict(self.frames[record['frame']])
+                cached_key, frames = self.preview_cache
+                if key != cached_key:
+                    frames = decode_isolated(raw, count, kind=kind)
+                    self.preview_cache = (key, frames)
+                result = dict(frames if kind == 'video' else frames[0])
                 if part:
                     result['forwardItem'] = part['index'] + 1
                     if 'thumbnailHashes' in part and hashlib.md5(raw).hexdigest() in part['thumbnailHashes']:
@@ -309,9 +319,17 @@ class VideoPreviews:
             binding.verify()
             if original is not None and forwarded_original_row(reader, talker, part) != original:
                 raise ValueError('FORWARD_REFERENCE_CHANGED')
+            if (
+                part
+                and part.get('reference')
+                and hashlib.md5(raw).hexdigest()
+                not in forwarded_quote_hashes(original, part, reader.resource_names(original))
+            ):
+                raise ValueError('FORWARD_REFERENCE_CONTENT_CHANGED')
             return result
         finally:
-            self.lock.release()
+            if preview:
+                self.preview_slots.release()
 
 
 if __name__ == '__main__':

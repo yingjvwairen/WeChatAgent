@@ -66,7 +66,7 @@ Windows 安装包已包含 Node.js、Python、OCR 运行环境和桌面发送组
 
 ### 4. 添加第一个聊天
 
-如果之前使用数字聊天 ID，请在新的安装根目录开始配置，并在这里重新选择好友或群。旧会话、授权和待发任务不会迁入新版。
+从旧 fork 或使用数字聊天 ID 的版本切换时，请在新的安装根目录开始配置，并在这里重新选择好友或群。
 
 1. 进入“聊天”，添加一个用于测试的好友。
 2. 点击“设置此聊天”。
@@ -134,8 +134,8 @@ Windows 安装包已包含 Node.js、Python、OCR 运行环境和桌面发送组
 
 | 插件 | 下载 ZIP | 使用说明 |
 | --- | --- | --- |
-| 语音对话 API | [speech-synthesis-1.8.1.zip](optional-extensions/packages/speech-synthesis-1.8.1.zip) | [语音合成、实时和单条转写](docs/VOICE_OUTPUT.md) |
-| 语音识别 API | [speech-recognition-1.7.1.zip](optional-extensions/packages/speech-recognition-1.7.1.zip) | [API 配置与语音转写](docs/VOICE_INPUT.md) |
+| 语音对话 API | [speech-synthesis-1.8.2.zip](optional-extensions/packages/speech-synthesis-1.8.2.zip) | [语音合成、实时和单条转写](docs/VOICE_OUTPUT.md) |
+| 语音识别 API | [speech-recognition-1.7.2.zip](optional-extensions/packages/speech-recognition-1.7.2.zip) | [API 配置与语音转写](docs/VOICE_INPUT.md) |
 | 鱼的记事本 | [fish-notebook-1.1.1.zip](optional-extensions/packages/fish-notebook-1.1.1.zip) | [记事本插件说明](docs/FISH_NOTEBOOK.md) |
 
 每个 ZIP 都附有同名的 `.sha256` 校验文件，位于同一目录。安装时直接导入 ZIP，无需解压。
@@ -200,7 +200,7 @@ WeChatAgent 插件与 DSH 插件分别管理，安装包不通用。
 
 ### 升级会丢失数据吗？
 
-升级前先核对发送队列并备份数据目录。原配置已经使用桌面发送时，同位置升级沿用已有数据。如果启动时提示数据目录使用其他发送后端，请保留原目录，在新的空数据目录完成首次配置。[数据位置与迁移](docs/DATA_STORAGE.md)
+升级前先核对发送队列并备份数据目录。「WeChatAgent Desktop」同位置升级沿用其数据。从旧 fork 切换时，使用新的安装根目录和空数据目录完成首次配置。[数据位置与迁移](docs/DATA_STORAGE.md)
 
 ### 为什么看不到表情包
 

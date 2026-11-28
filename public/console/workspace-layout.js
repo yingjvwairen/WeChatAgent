@@ -7,17 +7,13 @@ import {
   chatSearchText,
   effectiveChatFeature,
 } from './layout-model.mjs';
+import { deliveryInHistory } from '../../packages/delivery-contract.mjs';
 
 export function deliveryPages(rows, page = 0) {
   const pending = [],
     history = [];
   for (const row of rows.toSorted((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id))) {
-    if (
-      row.reviewed ||
-      (!row.recovery &&
-        !row.focusRecoveryRequired &&
-        ['confirmed', 'cancelled', 'expired', 'failed'].includes(row.state))
-    ) {
+    if (deliveryInHistory(row)) {
       if (history.length < 128) history.push(row);
     } else pending.push(row);
   }
@@ -222,13 +218,23 @@ export function createWorkspaceLayout({
                 : '';
             const text = String(job.preview ?? job.name ?? '');
             const draftNotice =
-              job.reason === 'UI_QT_EXISTING_DRAFT' ? '<p>微信输入框已有草稿。处理后点击继续。</p>' : '';
+              job.reason === 'UI_QT_EXISTING_DRAFT'
+                ? '<p>微信输入框已有草稿。处理后点击继续。</p>'
+                : job.reason === 'UI_QT_FILE_DIALOG_UNVERIFIED'
+                  ? '<p>文件确认框尚未通过核验。请核对微信里的收件人、文件名和发送结果。</p>'
+                  : '';
             const preview =
               text.length > 280
                 ? `<details class="delivery-preview"><summary>${esc(text.slice(0, 120))}…</summary><p>${esc(text)}</p></details>`
                 : `<p class="delivery-preview">${esc(text)}</p>`;
+            const status =
+              job.reason === 'DESKTOP_IMAGE_CONTENT_UNVERIFIED'
+                ? '图片送达待核实'
+                : job.state === 'confirmed' && job.receipt?.fileContentMd5Matched === false
+                  ? '已确认送达，文件摘要未核实'
+                  : (labels[job.state] ?? job.state);
             return (
-              `<article><strong>${esc(job.name)}</strong> <span class="status-tag">${esc(job.reason === 'DESKTOP_IMAGE_CONTENT_UNVERIFIED' ? '已观察到出站图片，内容待核实' : (labels[job.state] ?? job.state))}</span>` +
+              `<article><strong>${esc(job.name)}</strong> <span class="status-tag">${esc(status)}</span>` +
               `<small>${esc(new Date(job.createdAt).toLocaleString())}${job.size === undefined ? '' : ' · ' + esc(String(job.size)) + ' B'}${expiry}</small>${preview}${draftNotice}${buttons}${job.recovery ? '<p><a href="#settings/connections">检查草稿或录音并解除占用</a></p>' : ''}</article>`
             );
           })
@@ -271,6 +277,8 @@ export function createWorkspaceLayout({
     const files = state.draft.wechat.assistant?.fileTransferChats?.[row.key] === true;
     let body = `<div class="notice plain"><span>微信文件收发${files ? '已开启' : '未开启'}。${files ? '单个文件最多 50 MB；电脑微信需已下载完整文件，成果保存在当前 DSH 工作区。' : '可在此聊天的“能力与权限”中开启。'}</span></div>`;
     if (!saved) return body + '<p class="subtle">请先保存新增聊天，再查看任务。</p>';
+    if (files)
+      body += `<div class="button-row"><button class="button" data-file-confirm="${esc(row.key)}">确认收到的附件</button></div>`;
     try {
       const data = await api('/api/assistant-task/list', { key: row.key }),
         tasks = data.tasks ?? [];
@@ -296,10 +304,16 @@ export function createWorkspaceLayout({
     const stamp = seconds => esc(new Date(seconds * 1000).toLocaleString());
     const pending = chats.reduce((sum, chat) => sum + chat.pending, 0);
     return `<p>共 ${pending} 条消息待桥接确认</p>${chats
-      .map(
-        chat =>
-          `<div class="tool-row"><div><h3>${esc(state.names?.get(chat.key) || chat.key)}</h3><p>已扫描至 ${stamp(chat.scannedThrough)} · 待确认 ${chat.pending}${chat.scannedThrough < chat.catchUpThrough ? ' · 待补读至 ' + stamp(chat.catchUpThrough) : ''}</p></div></div>`,
-      )
+      .map(chat => {
+        const progress = chat.scannedThrough == null ? '尚未完成首次扫描' : `已扫描至 ${stamp(chat.scannedThrough)}`;
+        const detail =
+          chat.error === 'READER_CLOCK_MOVED_BACKWARD'
+            ? '系统时间已回拨。校准后将从原进度继续。'
+            : chat.error
+              ? `读取异常（${esc(chat.error)}）。将从原进度重试。`
+              : '';
+        return `<div class="tool-row"><div><h3>${esc(state.names?.get(chat.key) || chat.key)}</h3><p>${progress} · 待确认 ${chat.pending}${chat.scannedThrough != null && chat.scannedThrough < chat.catchUpThrough ? ' · 待补读至 ' + stamp(chat.catchUpThrough) : ''}</p>${detail ? `<p role="status">${detail}</p>` : ''}</div></div>`;
+      })
       .join('')}`;
   }
   function diagnostics() {

@@ -39,7 +39,12 @@ test('the unified picker saves same-named friends and groups together while pres
       return { config, revision: 'r1', account: 'a', targets: [{ kind: 'private', id: 'friend' }] };
     if (route.startsWith('/api/contacts?'))
       return {
-        contacts: [{ id: route.includes('kind=private') ? 'friend' : 'room@chatroom', name: '同名聊天' }],
+        contacts: route.includes('kind=private')
+          ? [
+              { id: 'friend', name: '同名聊天' },
+              { id: 'ambiguous-friend', name: '同名聊天', canSend: false },
+            ]
+          : [{ id: 'room@chatroom', name: '同名聊天' }],
       };
     if (route === '/api/chat-targets' && body) {
       const saved = structuredClone(config);
@@ -65,13 +70,19 @@ test('the unified picker saves same-named friends and groups together while pres
   const results = element('#target-results');
   assert.match(results.innerHTML, /wechat:private:friend/);
   assert.match(results.innerHTML, /wechat:group:room@chatroom/);
+  assert.match(results.innerHTML, /可读取。请设置唯一备注以发送/);
+  results.handlers.change({ target: { dataset: { targetChoice: 'wechat:private:ambiguous-friend' }, checked: true } });
   results.handlers.change({ target: { dataset: { targetChoice: 'wechat:group:room@chatroom' }, checked: true } });
   await element('#target-save').handlers.click();
   assert.deepEqual(calls.at(-1).body.targets, [
     { id: 'friend', kind: 'private' },
+    { id: 'ambiguous-friend', kind: 'private' },
     { id: 'room@chatroom', kind: 'group' },
   ]);
-  assert.deepEqual(state.config.wechat.whitelist, { private: ['friend'], groups: ['room@chatroom'] });
+  assert.deepEqual(state.config.wechat.whitelist, {
+    private: ['friend', 'ambiguous-friend'],
+    groups: ['room@chatroom'],
+  });
   assert.equal(state.draft.input.controlMode, 'uia');
   assert.equal(state.config.input.controlMode, 'ocr');
   assert.equal(state.revision, 'r2');

@@ -65,16 +65,22 @@ export function normalizeOneBotEvent(platform, adapter, event) {
           return Number.isFinite(data.duration) && data.duration > 0 && data.duration <= (video ? 300 : 60);
         })
       : null;
+  const quoteReply = platform === 'wechat' ? normalizeQuoteReply(event.wechatagent?.quoteReply) : null;
+  const forwardedRecord = platform === 'wechat' ? normalizeForwardedRecord(event.wechatagent?.forwardedRecord) : null;
   const images = segments
     .filter(
       segment =>
         segment?.type === 'image' &&
         /^[a-f0-9]{64}$/.test(segment.data?.media_id ?? '') &&
-        segment.data?.file === 'wechatagent://image/' + segment.data.media_id,
+        segment.data?.file === 'wechatagent://image/' + segment.data.media_id &&
+        (segment.data.forwardItem === undefined ||
+          (Number.isInteger(segment.data.forwardItem) && forwardedRecord?.items[segment.data.forwardItem - 1])),
     )
     .map(segment => ({
       id: segment.data.media_id,
       ...(platform === 'wechat' && segment.data.media_kind === 'sticker' ? { kind: 'sticker' } : {}),
+      ...(quoteReply && segment.data.media_quoted === true ? { quoted: true } : {}),
+      ...(segment.data.forwardItem !== undefined ? { forwardItem: segment.data.forwardItem } : {}),
     }));
   const files =
     platform === 'wechat'
@@ -90,8 +96,6 @@ export function normalizeOneBotEvent(platform, adapter, event) {
   const unavailableFile = platform === 'wechat' && messageType === 'file' && files.length === 0;
   const mentionTarget = platform === 'wechat' && kind === 'group' ? oneBotMentionTarget(segments, event.self_id) : null;
   const timestamp = Number(event.time ?? Date.now() / 1000);
-  const quoteReply = platform === 'wechat' ? normalizeQuoteReply(event.wechatagent?.quoteReply) : null;
-  const forwardedRecord = platform === 'wechat' ? normalizeForwardedRecord(event.wechatagent?.forwardedRecord) : null;
   const forwardedVoices = forwardedRecord
     ? segments
         .filter(

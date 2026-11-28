@@ -3,7 +3,9 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
-const { pathToFileURL } = require('node:url');
+const { fileURLToPath, pathToFileURL } = require('node:url');
+const { Composer, CST, Parser, visit } = require('yaml');
+const dshPatchFile = 'cordis.patch.yml';
 const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 const within = (base, file) =>
   same(base, file) ||
@@ -23,8 +25,15 @@ const existsConfig = home =>
 const atomic = (file, data) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temp = file + '.' + crypto.randomUUID() + '.tmp';
-  fs.writeFileSync(temp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
-  fs.renameSync(temp, file);
+  try {
+    fs.writeFileSync(temp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(temp, file);
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {}
+    throw error;
+  }
 };
 function windowsEnv() {
   const env = { ...process.env };
@@ -194,6 +203,55 @@ async function copyVerified(
   } else throw Error('旧数据包含不支持的文件类型，原数据保留。');
   return records;
 }
+function rebaseYamlValue(value, mappings) {
+  let url;
+  let source = value;
+  if (/^file:/i.test(value)) {
+    try {
+      url = new URL(value);
+      source = fileURLToPath(url);
+    } catch {
+      return value;
+    }
+  }
+  if (!path.isAbsolute(source)) return value;
+  let target = rebasePath(source, mappings);
+  if (target === source) return value;
+  const trailingSeparator = /[\\/]$/.exec(source)?.[0];
+  if (trailingSeparator && !/[\\/]$/.test(target)) target += trailingSeparator;
+  if (!url) return value.includes('\\') ? target : target.replaceAll('\\', '/');
+  const rebased = pathToFileURL(target);
+  rebased.search = url.search;
+  rebased.hash = url.hash;
+  return rebased.href;
+}
+function rebaseYamlPaths(text, mappings) {
+  const tokens = [...new Parser().parse(text)];
+  const documents = [...new Composer({ keepSourceTokens: true, prettyErrors: false }).compose(tokens)];
+  if (documents.length !== 1 || documents[0].errors.length) return text;
+  const orderedMappings = [...mappings].sort(([a], [b]) => b.length - a.length);
+  let changed = false;
+  // Only replace path scalars. Keep the surrounding document, including comments and anchors, intact.
+  visit(documents[0], {
+    Scalar(key, node, ancestors) {
+      if (typeof node.value !== 'string' || !node.srcToken) return;
+      const next = rebaseYamlValue(node.value, orderedMappings);
+      if (next === node.value) return;
+      CST.setScalarValue(node.srcToken, next, {
+        afterKey: key === 'value',
+        implicitKey: key === 'key',
+        inFlow: ancestors.some(parent => parent.flow),
+      });
+      changed = true;
+    },
+  });
+  return changed ? tokens.map(token => CST.stringify(token)).join('') : text;
+}
+async function rewriteYamlFile(file, mappings) {
+  const text = fs.readFileSync(file, 'utf8');
+  const next = rebaseYamlPaths(text, mappings);
+  if (next !== text) await fs.promises.writeFile(file, next);
+}
 async function rewriteTree(directory, mappings, { yaml = false, databaseBase = mappings[0][0] } = {}) {
   if (!fs.existsSync(directory)) return;
   for (const entry of await fs.promises.readdir(directory, { withFileTypes: true })) {
@@ -203,25 +261,14 @@ async function rewriteTree(directory, mappings, { yaml = false, databaseBase = m
       const before = json(file),
         after = rebaseJson(before, mappings, '', databaseBase);
       if (JSON.stringify(before) !== JSON.stringify(after)) atomic(file, after);
-    } else if (yaml && /\.ya?ml$/.test(entry.name)) {
-      let text = fs.readFileSync(file, 'utf8');
-      for (const [from, to] of mappings)
-        for (const [a, b] of [
-          [from, to],
-          [from.replaceAll('\\', '/'), to.replaceAll('\\', '/')],
-          [JSON.stringify(from).slice(1, -1), JSON.stringify(to).slice(1, -1)],
-          [pathToFileURL(from).href, pathToFileURL(to).href],
-        ])
-          text = text.split(a).join(b);
-      await fs.promises.writeFile(file, text);
-    }
+    } else if (yaml && /\.ya?ml$/.test(entry.name)) await rewriteYamlFile(file, mappings);
   }
 }
 async function assertMigrationIdle({ source, config, oldDshHome, dshRetained }) {
   if (process.platform !== 'win32') return;
   const exe = path.join(process.env.SystemRoot || 'C:/Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
   const code =
-    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);@(Get-CimInstance Win32_Process -ErrorAction Stop|Where-Object {$_.Name -in @('WeChatAgent.exe','Weixin.exe','node.exe','python.exe','DeepSeek Harness.exe')}|Select-Object Name,ProcessId,ExecutablePath,CommandLine)|ConvertTo-Json -Compress";
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);@(Get-CimInstance Win32_Process -ErrorAction Stop|Where-Object {$_.Name -in @('WeChatAgent.exe','WeChatAgentDesktop.exe','Weixin.exe','node.exe','python.exe','DeepSeek Harness.exe')}|Select-Object Name,ProcessId,ExecutablePath,CommandLine)|ConvertTo-Json -Compress";
   const output = await new Promise((resolve, reject) =>
     execFile(
       exe,
@@ -249,7 +296,8 @@ async function assertMigrationIdle({ source, config, oldDshHome, dshRetained }) 
   for (const item of Array.isArray(items) ? items : [items]) {
     if (item.ProcessId === process.pid) continue;
     const command = (item.CommandLine || '').toLowerCase();
-    const oldDesktop = desktopPids.has(item.ProcessId) && item.Name === 'WeChatAgent.exe';
+    const oldDesktop =
+      desktopPids.has(item.ProcessId) && ['WeChatAgent.exe', 'WeChatAgentDesktop.exe'].includes(item.Name);
     const isDsh =
       item.Name === 'DeepSeek Harness.exe' || (dsh && item.ExecutablePath && same(item.ExecutablePath, dsh));
     const oldService =
@@ -276,7 +324,8 @@ function migrationPlan(location, { legacyDshHome = process.env.DSH_HOME || path.
     (!location.legacyHome || !same(location.legacyHome, dataHome))
   )
     throw Error('目标已有未确认的数据，不能合并覆盖。请重新选择空的数据目录。');
-  if (!source || same(source, dataHome) || !existsConfig(source)) return { ...location, needed: false };
+  if (!source || same(source, dataHome)) return { ...location, needed: false };
+  if (!existsConfig(source)) throw Error('无法读取旧数据目录的配置，请确认来源可用后重试迁移。');
   if (within(source, dataHome) || within(dataHome, source)) throw Error('新旧数据目录不能互相包含。');
   if (fs.existsSync(path.join(dataHome, 'workspace')))
     throw Error('目标已有未确认的数据，不能合并覆盖。请重新选择空的数据目录。');
@@ -351,6 +400,7 @@ async function prepareDataHome(
     target = path.join(stage, 'workspace'),
     records = [],
     backupLinks = [],
+    publishedDesktop = [],
     published = [];
   let committed = false;
   const removeStage = async () => {
@@ -430,7 +480,11 @@ async function prepareDataHome(
     if (!plan.migrateDsh) mappings.unshift([plan.oldDshHome, plan.oldDshHome]);
     if (plan.migrateDsh) mappings.push([plan.oldDshHome, path.join(home, 'dsh')]);
     await rewriteTree(target, mappings, { databaseBase: sourceRoot });
-    if (plan.migrateDsh) await rewriteTree(path.join(stage, 'dsh/profiles'), mappings, { yaml: true });
+    if (plan.migrateDsh) {
+      const homePatch = path.join(stage, 'dsh', dshPatchFile);
+      if (fs.lstatSync(homePatch, { throwIfNoEntry: false })?.isFile()) await rewriteYamlFile(homePatch, mappings);
+      await rewriteTree(path.join(stage, 'dsh/profiles'), mappings, { yaml: true });
+    }
     const backupLinkFile = backupLinks.length
       ? 'backups/migration-link-references-' + path.basename(stage).slice('.migration-'.length) + '.json'
       : undefined;
@@ -471,10 +525,17 @@ async function prepareDataHome(
       const source = [path.join(plan.source, 'desktop', name), path.join(home, 'workspace/state/desktop', name)].find(
         file => fs.existsSync(file),
       );
-      if (source && !fs.existsSync(path.join(home, 'desktop', name))) {
-        await fs.promises.mkdir(path.join(home, 'desktop'), { recursive: true });
-        await fs.promises.copyFile(source, path.join(home, 'desktop', name));
+      const destination = path.join(home, 'desktop', name);
+      if (!source || fs.existsSync(destination)) continue;
+      noLinks(destination);
+      await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+      try {
+        await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+      } catch (error) {
+        if (error.code === 'EEXIST') continue;
+        throw error;
       }
+      publishedDesktop.push({ file: destination, copied: fs.lstatSync(destination) });
     }
     const report = {
       version: 1,
@@ -501,6 +562,23 @@ async function prepareDataHome(
   } catch (error) {
     if (!committed) {
       let recovered = true;
+      for (const { file, copied } of publishedDesktop.reverse()) {
+        try {
+          noLinks(file);
+          const current = fs.lstatSync(file, { throwIfNoEntry: false });
+          if (
+            current &&
+            current.dev === copied.dev &&
+            current.ino === copied.ino &&
+            current.size === copied.size &&
+            current.mtimeMs === copied.mtimeMs &&
+            current.ctimeMs === copied.ctimeMs
+          )
+            fs.unlinkSync(file);
+        } catch {
+          recovered = false;
+        }
+      }
       for (const folder of published.reverse())
         if (within(home, folder) && !same(home, folder))
           await moveMigrationDirectory(folder, path.join(stage, path.basename(folder))).catch(() => {
@@ -514,47 +592,79 @@ async function prepareDataHome(
     await fs.promises.unlink(lock).catch(() => {});
   }
 }
+async function stageDshConfig(file, bytes, mode, publish) {
+  const temporary = file + '.' + crypto.randomUUID() + '.tmp';
+  try {
+    await fs.promises.writeFile(temporary, bytes, { flag: 'wx', mode, flush: true });
+    return await publish(temporary);
+  } finally {
+    await fs.promises.rm(temporary, { force: true }).catch(() => {});
+  }
+}
+function replaceDshProfile(file, bytes, expected) {
+  noLinks(file);
+  const { mode } = fs.lstatSync(file);
+  return stageDshConfig(file, bytes, mode, temporary => {
+    noLinks(file);
+    if (!fs.readFileSync(file).equals(expected)) return false;
+    fs.renameSync(temporary, file);
+    return true;
+  });
+}
+async function saveDshBackup(file, bytes) {
+  if (fs.existsSync(file)) return;
+  await fs.promises.mkdir(path.dirname(file), { recursive: true });
+  await stageDshConfig(file, bytes, 0o600, temporary =>
+    fs.promises.copyFile(temporary, file, fs.constants.COPYFILE_EXCL),
+  );
+}
 async function rebindExternalDsh(report, newRoot, dataHome) {
   if (!report?.source || report.dshRetained || report.managedDsh || !report.oldDshHome) return;
   const profiles = path.join(report.oldDshHome, 'profiles');
-  if (!fs.existsSync(profiles)) return;
+  const backupDirectory = path.join(dataHome, 'backups/external-dsh');
+  const homePatch = path.join(report.oldDshHome, dshPatchFile);
+  const configs = [];
+  if (fs.lstatSync(homePatch, { throwIfNoEntry: false })?.isFile())
+    configs.push([homePatch, path.join(backupDirectory, dshPatchFile)]);
+  if (fs.existsSync(profiles))
+    for (const entry of await fs.promises.readdir(profiles, { withFileTypes: true }))
+      if (entry.isDirectory())
+        for (const name of ['cordis.yml', dshPatchFile])
+          configs.push([path.join(profiles, entry.name, name), path.join(backupDirectory, entry.name, name)]);
+
+  const mappings = [[path.join(report.source, 'workspace'), newRoot]];
   const updates = [];
-  for (const entry of await fs.promises.readdir(profiles, { withFileTypes: true }))
-    if (entry.isDirectory())
-      for (const name of ['cordis.yml', 'cordis.patch.yml']) {
-        const file = path.join(profiles, entry.name, name);
-        if (!fs.existsSync(file)) continue;
-        noLinks(file);
-        const bytes = await fs.promises.readFile(file),
-          text = bytes.toString('utf8');
-        let next = text;
-        const from = path.join(report.source, 'workspace');
-        for (const [a, b] of [
-          [from, newRoot],
-          [from.replaceAll('\\', '/'), newRoot.replaceAll('\\', '/')],
-          [JSON.stringify(from).slice(1, -1), JSON.stringify(newRoot).slice(1, -1)],
-          [pathToFileURL(from).href, pathToFileURL(newRoot).href],
-        ])
-          next = next.split(a).join(b);
-        if (next !== text) {
-          const backup = path.join(dataHome, 'backups/external-dsh', entry.name, name);
-          if (!fs.existsSync(backup)) {
-            await fs.promises.mkdir(path.dirname(backup), { recursive: true });
-            await fs.promises.writeFile(backup, bytes, { flag: 'wx', mode: 0o600 });
-          }
-          updates.push({ file, bytes, next });
-        }
-      }
+  for (const [file, backup] of configs) {
+    if (!fs.existsSync(file)) continue;
+    noLinks(file);
+    const bytes = await fs.promises.readFile(file),
+      text = bytes.toString('utf8');
+    const next = rebaseYamlPaths(text, mappings);
+    if (next !== text) {
+      await saveDshBackup(backup, bytes);
+      updates.push({ file, bytes, next: Buffer.from(next) });
+    }
+  }
   const written = [];
   try {
     for (const item of updates) {
-      if (!(await fs.promises.readFile(item.file)).equals(item.bytes))
+      if (!(await replaceDshProfile(item.file, item.next, item.bytes)))
         throw Error('DSH 配置在迁移后发生变化，请先退出 DSH 再重试。');
-      await fs.promises.writeFile(item.file, item.next);
       written.push(item);
     }
   } catch (error) {
-    for (const item of written.reverse()) await fs.promises.writeFile(item.file, item.bytes);
+    let restored = true;
+    for (const item of written.reverse()) {
+      try {
+        if (!(await replaceDshProfile(item.file, item.bytes, item.next))) restored = false;
+      } catch {
+        restored = false;
+      }
+    }
+    if (!restored)
+      throw Error(error.message + ' 部分 DSH 配置未回滚。原始配置备份在 ' + backupDirectory + '。', {
+        cause: error,
+      });
     throw error;
   }
 }

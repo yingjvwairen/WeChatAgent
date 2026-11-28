@@ -11,8 +11,9 @@ import { NativeVoiceTransport } from './native-voice-transport.mjs';
 import { createUiaOffscreenManager, recoverUiaOffscreenWindow } from './uia-offscreen.mjs';
 const execute = promisify(execFile);
 const fault = code => Object.assign(Error(code), { code });
+const failureCode = (error, fallback) => (/^[A-Z][A-Z0-9_]{1,79}$/.test(error.code ?? '') ? error.code : fallback);
 
-export async function readCableEndpoints(root, { executeImpl = execute } = {}) {
+export async function inspectCableEndpoints(root, { executeImpl = execute } = {}) {
   const result = await executeImpl(path.join(root, 'state/ui-host/AudioRouteProbe.exe'), ['--list'], {
     windowsHide: true,
     shell: false,
@@ -30,14 +31,28 @@ export async function readCableEndpoints(root, { executeImpl = execute } = {}) {
     throw fault('DESKTOP_AUDIO_PROBE_INVALID');
   const select = flow => {
     const matches = report.devices.filter(d => d.flow === flow && d.eligible === true && typeof d.id === 'string');
-    if (matches.length !== 1) throw fault('DESKTOP_CABLE_ENDPOINT_REQUIRED');
-    return matches[0].id;
+    return matches.length === 1 ? matches[0].id : null;
   };
   const renderId = select('render'),
     captureId = select('capture');
-  if (['console', 'multimedia', 'communications'].some(role => report.defaultCapture?.[role]?.device?.id !== captureId))
-    throw fault('AUDIO_DEFAULT_CAPTURE_NOT_CABLE');
-  return { renderId, captureId };
+  const pair = renderId && captureId && renderId !== captureId ? { renderId, captureId } : null;
+  return {
+    pair,
+    defaultsReady:
+      pair !== null &&
+      ['console', 'multimedia', 'communications'].every(
+        role => report.defaultCapture?.[role]?.device?.id === captureId,
+      ),
+  };
+}
+
+export async function readCableEndpoints(root, { binding, executeImpl } = {}) {
+  const { pair, defaultsReady } = await inspectCableEndpoints(root, { executeImpl });
+  if (!pair) throw fault('DESKTOP_CABLE_ENDPOINT_REQUIRED');
+  if (binding && (binding.renderId !== pair.renderId || binding.captureId !== pair.captureId))
+    throw fault('DESKTOP_CABLE_BINDING_CHANGED');
+  if (!defaultsReady) throw fault('AUDIO_DEFAULT_CAPTURE_NOT_CABLE');
+  return pair;
 }
 
 /** Adapts mature desktop primitives only; it owns no Reader or voice model. */
@@ -134,7 +149,7 @@ export async function createDesktopRuntimeDriver({
       offscreenEnabled = normalized.offscreen;
       return { applied: true, windowState };
     },
-    health: async () => {
+    health: async ({ verifyLayout = false } = {}) => {
       const components = ['WechatQtActions.exe', 'WechatAccountProbe.exe', 'WechatVisualProbe.exe'];
       if (normalized.controlMode === 'uia')
         components.push('WechatBackgroundControls.exe', 'WechatAccessibilityGate42053.exe');
@@ -149,11 +164,23 @@ export async function createDesktopRuntimeDriver({
           for (const name of ['WechatVoicePreview.exe', 'AudioRouteProbe.exe'])
             if (!fs.statSync(path.join(root, 'state/ui-host', name), { throwIfNoEntry: false })?.isFile())
               throw fault('DESKTOP_VOICE_COMPONENT_REQUIRED');
-          await readAudioEndpoints(root);
+          await readAudioEndpoints(root, { binding: normalized.voiceCable });
           voiceSend = true;
         } catch (error) {
-          voiceSendError = /^[A-Z][A-Z0-9_]{1,79}$/.test(error.code ?? '') ? error.code : 'DESKTOP_VOICE_UNAVAILABLE';
+          voiceSendError = failureCode(error, 'DESKTOP_VOICE_UNAVAILABLE');
         }
+      let layoutCheck;
+      if (verifyLayout) {
+        try {
+          // The explicit check never takes focus, enables accessibility or
+          // publishes a layout for the running sender.
+          const result = await bootstrap({ root, settings: normalized, account, persistLayout: false });
+          await result.provider?.close();
+          layoutCheck = { verified: true, source: result.layoutSource };
+        } catch (error) {
+          layoutCheck = { verified: false, reason: failureCode(error, 'DESKTOP_LAYOUT_UNVERIFIED') };
+        }
+      }
       return {
         ...(active?.boot.health ?? {
           ready: true,
@@ -163,7 +190,8 @@ export async function createDesktopRuntimeDriver({
           binding: structuredClone(binding),
           readOnly: true,
         }),
-        layoutPending: !active,
+        layoutPending: layoutCheck ? !layoutCheck.verified : !active,
+        ...(layoutCheck ? { layoutCheck } : {}),
         controlMode: normalized.controlMode,
         paused: normalized.paused,
         voiceSend,
@@ -180,9 +208,16 @@ export async function createDesktopRuntimeDriver({
     prepareVoiceSession: async (job, options) => (await choose(job, options)).prepareVoiceSession(job, options),
     finishVoiceInteraction: options => active?.driver.finishVoiceInteraction?.(options),
     observe: job => (active ? active.driver.observe(job) : { ready: false, reason: 'UI_QT_PREPARATION_REQUIRED' }),
+    resumeImage: (job, options) => active?.driver.resumeImage(job, options),
+    canResumeImage: job => active?.driver.canResumeImage(job) ?? false,
     releaseTextFocus: () => active?.driver.releaseTextFocus(),
     createVoiceTransport: callbacks =>
-      new NativeVoiceTransport({ root, driver: wrapper, audioEndpoints: () => readAudioEndpoints(root), ...callbacks }),
+      new NativeVoiceTransport({
+        root,
+        driver: wrapper,
+        audioEndpoints: () => readAudioEndpoints(root, { binding: normalized.voiceCable }),
+        ...callbacks,
+      }),
     close: async () => {
       closed = true;
       try {
@@ -198,15 +233,7 @@ export async function createDesktopRuntimeDriver({
       }
     },
   };
-  for (const name of [
-    'typeGrapheme',
-    'pasteText',
-    'submit',
-    'pasteImage',
-    'submitImage',
-    'resumeImage',
-    'canResumeImage',
-  ])
+  for (const name of ['typeGrapheme', 'pasteText', 'submit', 'pasteImage', 'submitImage'])
     wrapper[name] = (...args) => active.driver[name](...args);
   return wrapper;
 }

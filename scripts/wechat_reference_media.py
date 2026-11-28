@@ -1,7 +1,9 @@
 """Find the original quoted media row within the current Reader conversation."""
 
 import re
+from xml.etree.ElementTree import ParseError
 from reader_message_rows import server_event_id
+from wechat_forwarded import CONTENT_DIGESTS, THUMB_DIGESTS, media_digests, safe_xml
 from wechat_video import video_metadata
 from wechat_voice_input import voice_info
 
@@ -16,7 +18,7 @@ def forwarded_original_row(reader, talker, part):
     if (
         row
         and row['localType'] in kinds[part['kind']]
-        and all(row.get(key) == value for key, value in identity.items())
+        and all((talker if key == 'conversation' else row.get(key)) == value for key, value in identity.items())
     ):
         sender = row['senderUsername']
         if (
@@ -29,6 +31,27 @@ def forwarded_original_row(reader, talker, part):
     if reference:
         raise ValueError('FORWARD_REFERENCE_UNAVAILABLE')
     return None
+
+
+def forwarded_quote_hashes(row, part, source_names):
+    # The original row has already been bound in this chat. Some rows contain
+    # no digest, so use the bound card's digest to verify the cached bytes.
+    element = {'image': 'img', 'sticker': 'emoji', 'audio': 'voicemsg', 'video': 'videomsg'}[part['kind']]
+    known = set(source_names)
+    try:
+        root = safe_xml(row['fullText'])
+        nodes = [root] if root.tag == element else root.findall(element) if root.tag == 'msg' else []
+        fields = (*CONTENT_DIGESTS, *THUMB_DIGESTS, 'externmd5', 'androidmd5', 'voicemd5')
+        if len(nodes) == 1:
+            known.update(media_digests(nodes, fields))
+    except (ValueError, ParseError):
+        pass
+    if not known:
+        return part['hashes']
+    matched = [digest for digest in part['hashes'] if digest in known]
+    if not matched:
+        raise ValueError('FORWARD_REFERENCE_CONTENT_CHANGED')
+    return matched
 
 
 def original_media_row(reader, talker, reference):
@@ -68,9 +91,11 @@ def register_quoted_original(reader, talker, ref):
         return None
     source['video'] = {**record, 'videoType': kind, 'video': video}
     reader.register_video(talker, source)
+    if 'image' not in source:
+        return None
     return {
         'kind': 'video',
-        'frames': source['videoFrames'],
+        'id': source['image']['id'],
         **({'playback': source['videoPlayback']} if 'videoPlayback' in source else {}),
         **({'voice': source['voice']} if 'voice' in source else {}),
     }

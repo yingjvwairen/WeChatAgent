@@ -8,7 +8,13 @@ import { ReplyMediaCatalog, replyMediaScore } from './reply-media-catalog.mjs';
 import { createDesktopControlHandler, executeDesktopControl } from './desktop-control.mjs';
 import { desktopMediaAllowed } from './desktop-media-permission.mjs';
 import { AdapterError, deliverDesktopMessage } from './desktop-message-delivery.mjs';
-import { allowedConversation, validChatId, validUserId } from '../packages/wechat-identity.mjs';
+import {
+  activeReaderAccount,
+  deliveryScopeAllowed,
+  validChatId,
+  validUserId,
+  validReaderOrder,
+} from '../packages/wechat-identity.mjs';
 import path from 'node:path';
 import { stickerPolicy, cleanStickerLabel } from '../components/qq-bridge/src/core/sticker-policy.js';
 import { FileDeliveryWorker } from './file-delivery-worker.mjs';
@@ -16,11 +22,10 @@ import { TextDeliveryStore } from './text-delivery-store.mjs';
 import { VoiceSend } from './voice-send.mjs';
 import { dialogueFeature } from './voice-synthesis.mjs';
 import { RealtimeReplies } from './realtime-reply.mjs';
-import { assistantSenderAllowed } from '../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import {
   conversationGrant,
-  conversationMode,
   conversationWorkMode,
+  naturalGroupWakeEpoch,
 } from '../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 import { DesktopSender } from './desktop-sender.mjs';
 import { DesktopReceipts } from './desktop-receipts.mjs';
@@ -44,6 +49,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // An uncached lookup can spend 8s finding the row and 2s proving its UI locator.
 const quoteLookupTimeoutMs = 12000;
+const intakeLimits = { dsh: 8, realtime: 1 };
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
 const fail = code => {
   throw new AdapterError(code);
@@ -99,6 +105,7 @@ export class WechatOneBot {
     this.desktopSender = desktopSender;
     this.fetch = fetchImpl;
     this.socket = null;
+    this.initialized = false;
     this.stopped = false;
     this.controllers = new Set();
     this.targetsSending = new Set();
@@ -107,11 +114,11 @@ export class WechatOneBot {
     this.realtime = new RealtimeReplies(this, this.voiceSend, {
       log: line => console.log(new Date().toISOString(), line),
     });
-    this.realtimeQueue = Promise.resolve();
-    this.realtimePending = 0;
     this.activeActions = 0;
+    this.activeReceiptActions = 0;
     this.intakePending = new Map();
     this.fileWorker = new FileDeliveryWorker(this, { log: line => console.log(new Date().toISOString(), line) });
+    const adapter = this;
     this.status = {
       backend: DESKTOP_BACKEND,
       project: 'WeChatAgent',
@@ -119,7 +126,9 @@ export class WechatOneBot {
       statusVersion: 1,
       pid: process.pid,
       projectRoot: path.resolve(directory),
-      ready: false,
+      get ready() {
+        return adapter.initialized && !adapter.stopped && this.ob_connected && this.reader_connected;
+      },
       ob_connected: false,
       reader_connected: false,
       sender_connected: false,
@@ -152,16 +161,22 @@ export class WechatOneBot {
       receipt: (job, phase) => this.desktopReceipt(job, phase),
     });
     this.desktopReceipts ??= new DesktopReceipts(this.directory, {
-      messages: async (talker, window) => {
-        const response = await this.reader('/api/v1/outgoing-messages?' + new URLSearchParams({ talker, ...window }));
+      messages: async (talker, window, receiptProof) => {
+        const response = await this.reader('/api/v1/outgoing-messages?' + new URLSearchParams({ talker, ...window }), {
+          receiptProof,
+        });
         if (!Array.isArray(response.messages)) fail('INVALID_RECEIPT_RESPONSE');
         return response;
       },
-      authorize: job => this.authorizeDesktopCurrent(job, false),
-      recordingReceipt: body =>
+      authorize: (job, forInput) => this.authorizeDesktopCurrent(job, forInput),
+      recordingReceipt: (body, receiptProof) =>
         this.json(this.api.reader_base_url, '/api/v1/outgoing-recorded-voice-receipt', {
           method: 'POST',
-          headers: { Authorization: 'Bearer ' + this.api.reader_token, 'Content-Type': 'application/json' },
+          headers: {
+            Authorization: 'Bearer ' + this.api.reader_token,
+            'Content-Type': 'application/json',
+            'X-WeChatAgent-Receipt': receiptProof,
+          },
           body: JSON.stringify(body),
         }),
     });
@@ -184,11 +199,17 @@ export class WechatOneBot {
     if (result?.success === false) fail('READER_NOT_READY');
     return result;
   }
-  reader(route, { signal, timeout } = {}) {
+  reader(route, { signal, timeout, receiptProof } = {}) {
     return this.json(
       this.api.reader_base_url,
       route,
-      { headers: { Authorization: 'Bearer ' + this.api.reader_token }, signal },
+      {
+        headers: {
+          Authorization: 'Bearer ' + this.api.reader_token,
+          ...(receiptProof ? { 'X-WeChatAgent-Receipt': receiptProof } : {}),
+        },
+        signal,
+      },
       timeout,
     );
   }
@@ -226,7 +247,7 @@ export class WechatOneBot {
       ...(kind === 'group' ? { groupName: row.name } : {}),
     };
   }
-  async checkNative() {
+  async checkNative({ probeOnly = false, verifyLayout = false } = {}) {
     this.reload();
     this.status.sender_connected = false;
     this.status.sender_account_verified = false;
@@ -250,6 +271,8 @@ export class WechatOneBot {
       account: this.account,
       accountRef: this.accountRef,
       accountWxid: this.ownWxid,
+      probeOnly,
+      ...(verifyLayout ? { verifyLayout: true } : {}),
     });
     const problem = desktopAccountProblem(health, this.account);
     if (problem) fail(problem);
@@ -276,21 +299,29 @@ export class WechatOneBot {
       voiceTransport: 'desktop',
       recordingAccount: reader.ownWxid,
       accountRef: this.accountRef,
+      ...(verifyLayout ? { layoutCheck: health.layoutCheck } : {}),
     };
+  }
+  receiptAccount() {
+    if (!this.account || !this.accountRef || activeReaderAccount(this.directory).id !== this.accountRef)
+      fail('DESKTOP_ACCOUNT_CHANGED');
+    return { account: this.account, accountRef: this.accountRef };
   }
   authorizeDesktopCurrent(job, forInput = true) {
     const config = read(path.join(this.directory, 'config/wechatagent.json'));
     const key = 'wechat:' + job.kind + ':' + job.target;
     if (
       config.runtime.sender !== DESKTOP_BACKEND ||
-      !allowedConversation(config.wechat, key) ||
       job.account.toLowerCase() !== this.account ||
-      job.accountRef !== this.accountRef ||
-      job.rosterGrant !== conversationGrant(config.wechat, key)
+      !this.accountRef ||
+      job.accountRef !== this.accountRef
     )
       return false;
-    if (!validChatId(job.kind, job.target)) return false;
-    if (forInput && job.proactive) {
+    // Reader independently binds lookup to the durable attempt. Input still
+    // requires the current roster grant and all applicable media policies.
+    if (!forInput) return true;
+    if (!deliveryScopeAllowed(config.wechat, this.accountRef, job)) return false;
+    if (job.proactive) {
       try {
         this.assertProactive(job.kind, job.target, [], job.proactive, job, config.wechat);
       } catch {
@@ -298,17 +329,17 @@ export class WechatOneBot {
       }
     }
     if (
-      forInput &&
       job.parentId &&
       !job.fileDeliveryId &&
       ['image', 'sticker'].includes(job.operation) &&
       this.textDeliveries.get(job.deliveryId)?.withdrawn
     )
       return false;
-    if (!desktopMediaAllowed(this.directory, config, job, forInput)) return false;
+    if (!desktopMediaAllowed(this.directory, config, job, true)) return false;
     if (job.voicePlugin) {
       const feature = job.voicePlugin.feature ?? 'voice-output-v1';
-      if (!['voice-output-v1', 'voice-dialogue-v1'].includes(feature)) return false;
+      if (!['voice-output-v1', dialogueFeature].includes(feature)) return false;
+      if (feature === dialogueFeature && conversationWorkMode(config.wechat, key) === 'assistant') return false;
       const candidates = this.voiceSend.synthesis.candidates(key, feature);
       if (
         candidates.length !== 1 ||
@@ -323,7 +354,13 @@ export class WechatOneBot {
     if (!this.authorizeDesktopCurrent(job)) return { allowed: false };
     let quote;
     if (preparing && job.quote) {
-      quote = await this.quoteSource(job.target, job.quote.id, { signal }).catch(() => null);
+      try {
+        quote = await this.quoteSource(job.target, job.quote.id, { signal });
+      } catch (error) {
+        if (error instanceof AdapterError && error.message === 'SENDER_BUSY')
+          return { allowed: false, reason: error.data.reason };
+        fail('INPUT_QUOTE_SOURCE_UNVERIFIED');
+      }
       if (
         !quote ||
         ['id', 'serverId', 'sender', 'timestamp', 'text', 'kind'].some(key => quote[key] !== job.quote[key]) ||
@@ -359,13 +396,32 @@ export class WechatOneBot {
   desktopReceipt(job, request) {
     return this.desktopReceipts.observe(job, request);
   }
-  async waitForNative({ timeoutMs = 35000, intervalMs = 250, onWaiting = () => {} } = {}) {
+  async checkDesktop({ startup = false, onWaiting } = {}) {
+    const identity = await this.waitForNative({ probeOnly: true, verifyLayout: true, onWaiting });
+    this.startupStage = 'desktop-layout';
+    const layout = identity.layoutCheck;
+    if (layout?.verified === true) return identity;
+    const pendingReason = {
+      ocr: 'UI_QT_LAYOUT_WINDOW_OBSCURED',
+      uia: 'DESKTOP_UIA_ACCESSIBILITY_PROVIDER_REQUIRED',
+    }[this.status.controlMode];
+    if (!startup || layout?.verified !== false || !pendingReason || layout.reason !== pendingReason)
+      fail(layout?.reason ?? 'DESKTOP_LAYOUT_UNVERIFIED');
+    return identity;
+  }
+  async waitForNative({
+    timeoutMs = 35000,
+    intervalMs = 250,
+    probeOnly = false,
+    verifyLayout = false,
+    onWaiting = () => {},
+  } = {}) {
     const waitable = ['INPUT_WECHAT_NOT_RUNNING', 'INPUT_ACCOUNT_UNVERIFIED', 'DESKTOP_NOT_READY'];
     const deadline = Date.now() + timeoutMs;
     let notified = false;
     for (;;) {
       try {
-        return await this.checkNative();
+        return await this.checkNative({ probeOnly, verifyLayout });
       } catch (error) {
         if (!waitable.includes(error.code ?? error.message) || Date.now() >= deadline) throw error;
         if (!notified) {
@@ -383,7 +439,12 @@ export class WechatOneBot {
   }
   async quoteSource(target, id, { signal } = {}) {
     const query = new URLSearchParams({ talker: target, id });
-    return (await this.reader('/api/v1/quote-source?' + query, { signal, timeout: quoteLookupTimeoutMs })).quote;
+    try {
+      return (await this.reader('/api/v1/quote-source?' + query, { signal, timeout: quoteLookupTimeoutMs })).quote;
+    } catch (error) {
+      if (error instanceof AdapterError && ['API_HTTP_403', 'API_HTTP_409'].includes(error.message)) return null;
+      throw new AdapterError('SENDER_BUSY', { reason: 'INPUT_QUOTE_LOOKUP_UNAVAILABLE' });
+    }
   }
   async send(
     kind,
@@ -396,6 +457,8 @@ export class WechatOneBot {
     observeOnly = false,
     voicePlugin,
     expectedRosterGrant,
+    reserveAdmission,
+    permitInput,
   ) {
     if (quoteEventId && (!deliveryId || proactive)) fail('INPUT_QUOTE_UNAVAILABLE');
     return deliverDesktopMessage(
@@ -411,10 +474,17 @@ export class WechatOneBot {
         observeOnly,
         voicePlugin,
         expectedRosterGrant,
+        reserveAdmission,
+        permitInput,
       },
       async wxid => {
         const quote = quoteEventId ? await this.quoteSource(wxid, quoteEventId) : undefined;
-        if (quoteEventId && !quote) fail('INPUT_QUOTE_SOURCE_UNVERIFIED');
+        if (quoteEventId && !quote)
+          throw new AdapterError('NATIVE_SEND_REJECTED', {
+            rejected: true,
+            attempted: false,
+            reason: 'INPUT_QUOTE_SOURCE_UNVERIFIED',
+          });
         return { operation: 'text', body: { text, ...(quote ? { quote } : {}) } };
       },
     );
@@ -429,7 +499,12 @@ export class WechatOneBot {
   ) {
     const conversation = 'wechat:' + kind + ':' + target,
       policy = proactivePolicy(wechat, conversation);
-    if (!policy.enabled || Date.now() >= proactive.expiresAt || !withinProactiveWindow(Date.now(), policy))
+    if (
+      !policy.enabled ||
+      conversationWorkMode(wechat, conversation) === 'assistant' ||
+      Date.now() >= proactive.expiresAt ||
+      !withinProactiveWindow(Date.now(), policy)
+    )
       fail('PROACTIVE_NOT_ALLOWED');
     const saved = fs.existsSync(path.join(this.directory, 'state/social-messages.json'))
       ? read(path.join(this.directory, 'state/social-messages.json'))
@@ -448,6 +523,7 @@ export class WechatOneBot {
     const rows = saved.chats?.[conversation] ?? [];
     if (
       saved.pendingReplies?.[conversation] ||
+      Object.values(saved.mediaReplies ?? {}).some(item => item.key === conversation && item.observeOnly !== true) ||
       declinedProactive(rows) ||
       conversationSnapshot(rows) !== proactive.contextId ||
       currentRows.some(
@@ -530,14 +606,17 @@ export class WechatOneBot {
     kind,
     target,
     id,
-    deliveryId,
-    proactive,
-    receiptOnly = false,
-    deferReceipt = false,
-    deadlineAt,
-    abandon = false,
-    observeOnly = false,
-    expectedRosterGrant,
+    {
+      deliveryId,
+      proactive,
+      receiptOnly = false,
+      deadlineAt,
+      admissionDeadlineAt,
+      abandon = false,
+      observeOnly = false,
+      expectedRosterGrant,
+      reserveAdmission,
+    } = {},
   ) {
     if (abandon && (!deliveryId || !receiptOnly)) fail('INVALID_RECEIPT_QUERY');
     if (!/^[a-f0-9]{64}$/.test(id)) fail('INVALID_STICKER_REFERENCE');
@@ -552,8 +631,10 @@ export class WechatOneBot {
         receiptOnly,
         observeOnly,
         deadlineAt,
+        admissionDeadlineAt,
         abandon,
         expectedRosterGrant,
+        reserveAdmission,
         media: true,
         text: '[STICKER:' + id + ']',
       },
@@ -615,7 +696,7 @@ export class WechatOneBot {
   // Trigger rules for one Realtime turn, rechecked before deciding and before
   // every send. Group text requires a native self or all-members mention. The Realtime
   // model has no silent option, unlike the DSH social pipeline.
-  realtimePermitted({ kind, target, sender, mentioned, input, accountRef, rosterGrant }) {
+  realtimePermitted({ kind, target, mentioned, input, accountRef, rosterGrant, naturalGroupEpoch }) {
     const key = 'wechat:' + kind + ':' + target;
     return record => {
       this.reload();
@@ -626,7 +707,8 @@ export class WechatOneBot {
         this.accountRef !== accountRef ||
         !rosterGrant ||
         conversationGrant(wechat, key) !== rosterGrant ||
-        (record && record.account !== this.account)
+        (record && record.account !== this.account) ||
+        conversationWorkMode(wechat, key) === 'assistant'
       )
         return false;
       const candidates = this.voiceSend.synthesis.candidates(key, dialogueFeature);
@@ -636,26 +718,32 @@ export class WechatOneBot {
           (record.voicePlugin.id !== candidates[0].id || record.voicePlugin.generation !== candidates[0].generation))
       )
         return false;
-      if (conversationWorkMode(wechat, key) === 'assistant' && !assistantSenderAllowed(wechat, key, sender))
-        return false;
       if (kind === 'private') return true;
       if (input === 'text') return mentioned;
-      return conversationMode(wechat, key) !== 'mention' || mentioned;
+      if (mentioned) return true;
+      const epoch = naturalGroupWakeEpoch(wechat, key);
+      return epoch !== null && (naturalGroupEpoch === undefined || epoch === naturalGroupEpoch);
     };
   }
   realtimeInput(payload, event, receipt) {
     if (payload.contextOnly || event.wechatagent?.contextOnly || ![1, 34].includes(payload.type)) return null;
     const voice = payload.type === 34;
     if (!voice && (!payload.content.trim() || payload.content.trim().length > 4096)) return null;
+    const group = event.message_type === 'group';
+    const mentioned = group && oneBotMentionTarget(event.message, event.self_id) !== null;
     return {
       kind: event.message_type,
       target: payload.sessionId,
       sender: payload.talkerId,
-      mentioned: event.message_type === 'group' && oneBotMentionTarget(event.message, event.self_id) !== null,
+      mentioned,
+      ...(group && voice && !mentioned
+        ? { naturalGroupEpoch: naturalGroupWakeEpoch(this.project.wechat, 'wechat:group:' + payload.sessionId) }
+        : {}),
       input: voice ? 'voice' : 'text',
       rawid: receipt.rawid,
       accountRef: receipt.account,
       rosterGrant: receipt.grant,
+      ...(validReaderOrder(receipt.order) ? { order: receipt.order } : {}),
       ...(voice ? { voiceId: payload.voice.id } : { text: payload.content.trim() }),
     };
   }
@@ -668,32 +756,32 @@ export class WechatOneBot {
     if (!['realtime', 'dsh'].includes(result.route)) throw new AdapterError('INVALID_READER_INTAKE_ROUTE');
     return result.route;
   }
-  scheduleRealtime(run) {
-    if (this.realtimePending >= 8) return { status: 'busy' };
-    this.realtimePending++;
-    const task = this.realtimeQueue
-      .then(async () => {
-        if (this.stopped) return { status: 'busy' };
-        const result = await run();
-        if (result.status === 'rejected') this.status.last_error = result.error;
-        return result;
-      })
-      .finally(() => {
-        this.realtimePending--;
-      });
-    this.realtimeQueue = task.catch(() => {
-      this.status.last_error = 'VOICE_REALTIME_FAILED';
-    });
-    return task;
+  intakeRoute(payload, event, receipt) {
+    if (receipt.route) return receipt.route;
+    const input = event && this.realtimeInput(payload, event, receipt);
+    return this.claimIntakeRoute(
+      receipt,
+      !payload.offlineReplay && input && this.realtimePermitted(input)() ? 'realtime' : 'dsh',
+    );
+  }
+  advanceIntakeConsumer() {
+    const previous = this.readerConsumer;
+    const client = previous ? previous.slice(0, 24) : crypto.randomBytes(12).toString('hex');
+    const sequence = previous ? Number.parseInt(previous.slice(24), 16) + 1 : 1;
+    this.readerConsumer = client + sequence.toString(16).padStart(8, '0');
   }
   async connectOneBot() {
+    const token = process.env.SOCIAL_ONEBOT_TOKEN;
     while (!this.stopped) {
-      const socket = new WebSocket(this.api.onebot_ws_url);
+      const url = new URL(this.api.onebot_ws_url);
+      const local = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+      const options = token && local ? { headers: { Authorization: 'Bearer ' + token } } : undefined;
+      const socket = new WebSocket(url, options);
       this.socket = socket;
       await new Promise(resolve => {
         const connectTimer = setTimeout(() => socket.close(), 8000);
         socket.addEventListener('open', () => {
-          this.readerConsumer = crypto.randomBytes(16).toString('hex');
+          this.advanceIntakeConsumer();
           clearTimeout(connectTimer);
           this.status.ob_connected = true;
           socket.send(
@@ -740,6 +828,7 @@ export class WechatOneBot {
       });
       socket.close();
       this.status.ob_connected = false;
+      this.status.reader_connected = false;
       if (!this.stopped) await sleep(1500);
     }
   }
@@ -749,51 +838,67 @@ export class WechatOneBot {
       try {
         const socket = this.socket;
         if (socket?.readyState !== WebSocket.OPEN || !this.readerConsumer) {
+          this.status.reader_connected = false;
           await sleep(250);
           continue;
         }
-        if (active.size >= 8) {
-          await Promise.race(active.values());
+        const routes = [...active.values()];
+        const blocked = Object.keys(intakeLimits).filter(
+          route => routes.filter(entry => entry.route === route).length >= intakeLimits[route],
+        );
+        if (blocked.length === Object.keys(intakeLimits).length) {
+          await Promise.race(routes.map(entry => entry.task));
           continue;
         }
         const query = new URLSearchParams({ consumer: this.readerConsumer });
         for (const token of active.keys()) query.append('busy', token);
+        for (const route of blocked) query.append('excludeRoute', route);
         const { event: payload } = await this.reader('/api/v1/intake/next?' + query);
-        if (socket !== this.socket || socket.readyState !== WebSocket.OPEN) continue;
+        if (this.stopped || socket !== this.socket || socket.readyState !== WebSocket.OPEN) continue;
+        const receipt = payload?.readerIntake;
+        if (
+          payload !== null &&
+          (receipt?.version !== 1 ||
+            receipt.rawid !== payload.rawid ||
+            !/^[a-f0-9]{64}$/.test(receipt.rawid) ||
+            !/^[a-f0-9]{64}$/.test(receipt.token))
+        )
+          fail('INVALID_READER_INTAKE');
+        if (!this.status.reader_connected && this.status.last_error === 'READER_INTAKE_UNAVAILABLE')
+          this.status.last_error = '';
         this.status.reader_connected = true;
-        if (!payload) {
+        if (payload === null) {
           await sleep(500);
           continue;
         }
-        const receipt = payload.readerIntake;
-        if (
-          receipt?.version !== 1 ||
-          receipt.rawid !== payload.rawid ||
-          !/^[a-f0-9]{64}$/.test(receipt.rawid) ||
-          !/^[a-f0-9]{64}$/.test(receipt.token)
-        )
-          fail('INVALID_READER_INTAKE');
         if (active.has(receipt.token)) {
           await sleep(100);
           continue;
         }
-        const task = this.deliverIntake(payload, receipt, socket)
+        const event = this.incoming(payload);
+        const route = await this.intakeRoute(payload, event, receipt);
+        if (!Object.hasOwn(intakeLimits, route)) fail('INVALID_READER_INTAKE_ROUTE');
+        // Unclassified heads can still be assigned to a full route. The
+        // durable assignment then lets the next query skip that chat.
+        if (this.stopped || blocked.includes(route) || socket !== this.socket || socket.readyState !== WebSocket.OPEN)
+          continue;
+        const task = this.deliverIntake(payload, event, { ...receipt, route }, socket)
           .catch(async () => {
             this.status.last_error = 'READER_INTAKE_UNAVAILABLE';
             await sleep(500);
           })
           .finally(() => active.delete(receipt.token));
-        active.set(receipt.token, task);
+        active.set(receipt.token, { route, task });
       } catch {
+        this.status.reader_connected = false;
         this.status.last_error = 'READER_INTAKE_UNAVAILABLE';
         await sleep(1000);
       }
     }
-    await Promise.all(active.values());
+    await Promise.all([...active.values()].map(entry => entry.task));
     this.status.reader_connected = false;
   }
-  async deliverIntake(payload, receipt, socket) {
-    const event = this.incoming(payload);
+  async deliverIntake(payload, event, receipt, socket) {
     if (event && !(await this.persistIntake(payload, event, receipt, socket))) {
       await sleep(500);
       return;
@@ -807,20 +912,29 @@ export class WechatOneBot {
     if (event) this.status.received++;
   }
   async persistIntake(payload, event, receipt, socket = this.socket) {
-    if (socket?.readyState !== WebSocket.OPEN || socket !== this.socket) return false;
-    const input = this.realtimeInput(payload, event, receipt);
-    const permitted = input && this.realtimePermitted(input);
-    const route =
-      receipt.route ??
-      (await this.claimIntakeRoute(receipt, !payload.offlineReplay && permitted?.() ? 'realtime' : 'dsh'));
+    const currentSocket = () => !this.stopped && socket?.readyState === WebSocket.OPEN && socket === this.socket;
+    if (!currentSocket()) return false;
+    const { route } = receipt;
     if (route === 'realtime') {
-      if (!input || !permitted()) return true;
-      const result = await this.scheduleRealtime(() => this.realtime.handle(input, permitted));
-      if (['busy', 'pending'].includes(result.status)) return false;
-      if (result.status !== 'forward') return true;
-      await this.claimIntakeRoute(receipt, 'dsh', true);
+      const input = this.realtimeInput(payload, event, receipt);
+      if (input) {
+        const result = await this.realtime.handle(input, this.realtimePermitted(input), {
+          canStart: () => !payload.offlineReplay && currentSocket(),
+        });
+        if (result.status === 'busy') return false;
+        if (result.status === 'rejected') this.status.last_error = result.error;
+        if (result.status !== 'forward') return true;
+      }
+      if (!currentSocket()) return false;
+      this.reload();
+      const key = 'wechat:' + event.message_type + ':' + payload.sessionId;
+      if (this.accountRef !== receipt.account || conversationGrant(this.project.wechat, key) !== receipt.grant)
+        return true;
+      if ((await this.claimIntakeRoute(receipt, 'dsh', true)) !== 'dsh')
+        throw new AdapterError('INVALID_READER_INTAKE_ROUTE');
+      return false; // The next fetch admits this head using the DSH budget.
     } else if (route !== 'dsh') throw new AdapterError('INVALID_READER_INTAKE_ROUTE');
-    if (socket !== this.socket || socket.readyState !== WebSocket.OPEN) return false;
+    if (!currentSocket()) return false;
     const pending = { token: receipt.token, rawid: receipt.rawid, confirmed: false };
     this.intakePending.set(receipt.token, pending);
     try {
@@ -883,7 +997,7 @@ export class WechatOneBot {
         );
         return;
       }
-      if (!this.status.ready && req.method !== 'GET') {
+      if ((!this.initialized || this.stopped) && req.method !== 'GET') {
         res.writeHead(503);
         res.end();
         return;
@@ -932,11 +1046,15 @@ export class WechatOneBot {
     this.reload();
     await this.desktopSender.resumePending();
     if (this.stopped) throw new AdapterError('ADAPTER_START_CANCELLED');
+    this.realtime.recoverPending();
+    this.voiceSend.recoverReplies();
     this.tasks = [this.connectOneBot(), this.receiveReaderInbox()];
     this.fileTimer = setInterval(() => {
       try {
         this.fileWorker.tick();
       } catch {}
+      this.voiceSend.tickReplies();
+      this.realtime.tick();
     }, 1000);
     this.fileTimer.unref();
     let checking = false;
@@ -952,8 +1070,8 @@ export class WechatOneBot {
         checking = false;
       }
     }, 15000);
-    this.status.ready = true;
-    console.log('WeChatAgent desktop WebSocket ready for the verified account.');
+    this.initialized = true;
+    console.log('WeChatAgent desktop adapter initialized for the verified account.');
   }
   stop() {
     return (this.shutdownTask ??= this.stopServices().catch(error => {
@@ -964,12 +1082,12 @@ export class WechatOneBot {
   }
   async stopServices() {
     this.stopped = true;
-    this.status.ready = false;
     for (const controller of this.controllers) controller.abort();
     clearInterval(this.healthTimer);
     clearInterval(this.fileTimer);
     this.fileWorker.stop();
     const cleanup = await Promise.allSettled([
+      this.realtime.close(),
       this.voiceSend.close(),
       this.localSpeech?.close(),
       this.desktopSender?.close(),
@@ -978,18 +1096,27 @@ export class WechatOneBot {
     if (failure) throw failure.reason;
     this.socket?.close();
     if (this.server?.listening) await new Promise(resolve => this.server.close(resolve));
-    await Promise.allSettled([...(this.tasks ?? []), this.realtimeQueue]);
+    await Promise.allSettled(this.tasks ?? []);
   }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let adapter;
+  const startupCheck = process.argv.includes('--check-startup');
+  const checkOnly = startupCheck || process.argv.includes('--check');
   try {
     adapter = new WechatOneBot({ exitOnShutdown: true });
-    if (process.argv.includes('--check')) {
+    if (checkOnly) {
       try {
-        await adapter.waitForNative({ onWaiting: () => console.log('Waiting for the selected WeChat account...') });
-        console.log('Desktop sender and selected account verified.');
+        const identity = await adapter.checkDesktop({
+          startup: startupCheck,
+          onWaiting: () => console.log('Waiting for the selected WeChat account...'),
+        });
+        if (identity.layoutCheck.verified)
+          console.log('微信账号、发送依赖和窗口布局核验通过。布局来源 ' + identity.layoutCheck.source);
+        else console.log('微信账号和发送依赖核验通过。发送器将在运行时准备布局。' + identity.layoutCheck.reason);
+        if (adapter.status.foreground_voice_error)
+          console.log('语音线路暂不可用 ' + adapter.status.foreground_voice_error);
       } finally {
         await adapter.desktopSender.close();
       }
@@ -1004,9 +1131,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         });
     }
   } catch (error) {
-    console.error(
-      adapterStartupMessage(error, { checkOnly: process.argv.includes('--check'), stage: adapter?.startupStage }),
-    );
+    console.error(adapterStartupMessage(error, { checkOnly, stage: adapter?.startupStage }));
     process.exitCode = 1;
   }
 }

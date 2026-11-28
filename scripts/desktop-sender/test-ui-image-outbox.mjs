@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { UiImageOutbox } from './ui-image-outbox.mjs';
+import { createDesktopRuntimeDriver } from './runtime-driver.mjs';
+import { fileDialogSendButton, QtAttachmentSession } from './qt-attachment-session.mjs';
 
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const md5 = value => crypto.createHash('md5').update(value).digest('hex');
@@ -76,7 +78,7 @@ function fixture(t, options = {}) {
     sourceImageSha256: job.sourceImageSha256,
     nativeImageRowConfirmed: true,
     imageContentVerified: false,
-    sourceMd5Matched: true,
+    imageContentMatch: 'raster',
     sourceShard: 'd'.repeat(64),
     localId: '1',
     serverId: '500',
@@ -143,7 +145,7 @@ function fixture(t, options = {}) {
     },
     submitted: () => {
       events.push('submit-intent');
-      return { submitted: true };
+      return { recorded: true };
     },
     query: async job => {
       events.push('query');
@@ -379,6 +381,246 @@ test('known applied image resumes in place after pause without another navigatio
   assert.equal(f.state.pastes, 1);
   assert.equal(f.state.submits, 1);
 });
+test('an OCR restart with an applied image requests manual recovery without activating the driver', async t => {
+  const f = fixture(t);
+  const paste = f.driver.pasteImage;
+  f.driver.pasteImage = async (job, guard) => {
+    const result = await paste(job, guard);
+    f.outbox.pause(job.id);
+    return result;
+  };
+  f.outbox.enqueue(f.request);
+  await f.outbox.tick();
+  await f.outbox.shutdown();
+
+  const bounds = { left: 0, top: 0, right: 1000, bottom: 800 };
+  const driver = await createDesktopRuntimeDriver({
+    root: f.directory,
+    settings: { controlMode: 'ocr', wechatExecutable: path.join(f.directory, 'Weixin.exe') },
+    account: {
+      readOnly: true,
+      accountRef: f.scope.accountRef,
+      accountWxid: f.scope.account,
+      executableVersion: '4.2.0.53',
+      executableSha256: 'f'.repeat(64),
+      binding: {
+        hwnd: '123',
+        pid: 12,
+        threadId: 13,
+        processCreatedFileTimeUtc: '134000000000000000',
+        dpi: 96,
+        clientRect: bounds,
+        captureRect: bounds,
+      },
+    },
+    bootstrap: async () => assert.fail('restart recovery must not navigate or capture'),
+    createOffscreen: () => ({ close: async () => {} }),
+  });
+  t.after(() => driver.close());
+  const restarted = f.make({ driver });
+  restarted.resume(id(1));
+  await restarted.tick();
+  const paused = restarted.get(id(1));
+  assert.equal(paused.state, 'paused');
+  assert.equal(paused.reason, 'UI_IMAGE_DRAFT_RECOVERY_REQUIRED');
+  assert.equal(f.state.pastes, 1);
+  assert.equal(f.state.submits, 0);
+  assert.equal(
+    restarted.acknowledgeClearedDraft(id(1), {
+      expectedRevision: paused.revision,
+      acknowledgedCleared: true,
+      assertStopped: () => true,
+    }).state,
+    'cancelled',
+  );
+});
+async function ocrFileDialogScenario(t, refused = false) {
+  const f = fixture(t);
+  const file = path.join(f.directory, 'note.txt');
+  const contents = Buffer.from('file dialog fixture');
+  fs.writeFileSync(file, contents);
+  const sha256 = sha(contents);
+  const titleSha256 = sha('fixture chat');
+  const proofId = 'a'.repeat(32);
+  const revision = 'activity-1';
+  const header = 'b'.repeat(64);
+  const screenshotDirectory = path.join(f.directory, 'state/ui-host/qt-frames');
+  fs.mkdirSync(screenshotDirectory, { recursive: true });
+  const screenshot = path.join(screenshotDirectory, 'qt-' + proofId + '.png');
+  fs.writeFileSync(screenshot, png);
+  const imageSha256 = sha(png);
+  const actions = [];
+  const released = [];
+  if (refused) {
+    const prepare = f.receipts.prepare;
+    f.receipts.prepare = async job => ({ ...(await prepare(job)), baselineId: 'file-baseline' });
+    f.receipts.notAttempted = (job, baseline) => {
+      released.push({ id: job.id, baseline });
+    };
+  }
+  let captures = 0;
+  const input = {
+    root: f.directory,
+    config: { ocrBackend: 'rapidocr' },
+    async recognize({ file }) {
+      assert.equal(file, screenshot);
+      return {
+        imageSha256,
+        width: 300,
+        height: 210,
+        words: dialogWords(path.basename(input.fileName)),
+      };
+    },
+    current: null,
+    allowSubmit: true,
+    checkJob() {},
+    active() {},
+    verifyControlBinding: async () => {},
+    rememberImageDraft(previous, update) {
+      this.current = { ...previous, ...update };
+    },
+    beginImageSubmission(job) {
+      this.imageSubmitAttempted = job.id;
+    },
+    refuseImageSubmission(job) {
+      assert.equal(this.imageSubmitAttempted, job.id);
+      this.imageSubmitAttempted = null;
+    },
+    discardDraft() {
+      this.current = null;
+    },
+    holdDraft: () => assert.fail('the verified dialog should proceed to submission'),
+    async requestNative(operation, args) {
+      actions.push(operation);
+      if (operation === 'pasteFile') {
+        assert.equal(args.imageSha256, sha256);
+        assert.equal(args.titleSha256, titleSha256);
+        assert.deepEqual(fs.readFileSync(args.imagePath), contents);
+        input.fileName = args.imagePath;
+        return {
+          performed: true,
+          attempted: true,
+          pasteApplied: true,
+          clipboardRestored: true,
+          revision,
+          imageFormat: 'file',
+          originalFilePasted: true,
+          imageConsumption: { consumerProcessMatched: true },
+          fileDialogProof: { id: proofId, sha256 },
+        };
+      }
+      if (operation === 'captureOcrFileDialog') {
+        assert.deepEqual(args, { proofId, sha256 });
+        return { width: 300, height: 210, image: { file: screenshot, sha256: imageSha256 } };
+      }
+      assert.equal(operation, 'submitFileDialog');
+      assert.deepEqual(args, { proofId, sha256, buttonRect: { left: 150, top: 170, right: 230, bottom: 184 } });
+      if (refused)
+        throw Object.assign(Error('file dialog refused before input'), {
+          code: 'QT_FILE_DIALOG_CHANGED',
+          nativeAction: operation,
+          attempted: false,
+        });
+      return { performed: true, attempted: true, inputQueued: true, dialogClosed: true, revision };
+    },
+  };
+  const frames = {
+    config: { layoutMode: 'adaptive-v1', idleMs: 1000, layout: {} },
+    async capture() {
+      assert.equal(++captures, 1, 'the modal owns the foreground after paste');
+      return { regions: [{ rgbaSha256: header }], idleMs: 1000, revision };
+    },
+    invalidateFrame() {},
+  };
+  const focus = { preparationLease: () => null, releaseTextFocus: async () => {} };
+  const session = new QtAttachmentSession({ input, frames, focus });
+  const fileAssetsDirectory = path.join(f.directory, 'file-assets');
+  const outbox = f.make({
+    fileAssetsDirectory,
+    driver: {
+      prepare: async job => {
+        input.current = {
+          jobId: job.id,
+          account: job.account,
+          target: job.target,
+          editorToken: 'editor-1',
+          revision,
+          header,
+          fileTitleSha256: titleSha256,
+        };
+        return { ready: true };
+      },
+      observe: async job =>
+        session.observeFileDialog(job) ?? {
+          ready: true,
+          foreground: true,
+          account: job.account,
+          target: job.target,
+          editorToken: 'editor-1',
+          activityRevision: revision,
+          idleMs: 1000,
+        },
+      pasteImage: (job, guard) => session.pasteImage(job, guard),
+      submitImage: (job, guard) => session.submitImage(job, guard),
+    },
+  });
+  outbox.enqueue({ ...f.request, mode: 'file', image: { path: file, sha256 } });
+  await outbox.tick();
+  assert.deepEqual(actions, ['pasteFile', 'captureOcrFileDialog', 'submitFileDialog']);
+  if (refused) {
+    const saved = f.make({ fileAssetsDirectory }).get(id(1));
+    assert.equal(saved.state, 'paused');
+    assert.equal(saved.submittedAt, undefined);
+    assert.equal(saved.imageDraftPresent, true);
+    assert.equal(saved.reason, 'QT_FILE_DIALOG_CHANGED');
+    assert.equal(input.imageSubmitAttempted, null);
+    assert.deepEqual(released, [{ id: id(1), baseline: 'file-baseline' }]);
+    assert.equal(f.events.includes('query'), false);
+    return;
+  }
+  assert.equal(outbox.get(id(1)).inputReleased, true);
+  f.state.confirmed = true;
+  f.advance(500);
+  await outbox.tick();
+  assert.equal(outbox.get(id(1)).state, 'confirmed');
+  assert.deepEqual(actions, ['pasteFile', 'captureOcrFileDialog', 'submitFileDialog']);
+}
+test(
+  'an OCR file dialog reaches durable submission and receipt without clicking the main window',
+  ocrFileDialogScenario,
+);
+test('an OCR file dialog refused before input releases its receipt intent and keeps its draft', async t => {
+  await ocrFileDialogScenario(t, true);
+});
+
+function dialogWords(fileName) {
+  return ['发送给：fixture chat', fileName, '发送'].map((text, line) => ({
+    text,
+    line,
+    x: 150,
+    y: 30 + line * 70,
+    width: 80,
+    height: 14,
+    confidence: 0.99,
+  }));
+}
+
+test('file dialog OCR requires an exact destination, exact filename and a unique send control', () => {
+  const bounds = { left: 0, top: 0, right: 300, bottom: 210 },
+    fileName = '说明.txt',
+    titleSha256 = sha('fixture chat'),
+    words = dialogWords(fileName),
+    find = items => fileDialogSendButton({ words: items }, bounds, fileName, titleSha256);
+  assert.ok(find(words));
+  for (const invalid of [
+    [{ ...words[0], text: '发送给：fixture chat 2' }, ...words.slice(1)],
+    [{ ...words[1], text: '说明…' }, words[0], words[2]],
+    [words[0], words[1], { ...words[2], confidence: 0.7 }],
+    [...words, { ...words[2], line: 3, x: 50 }],
+    [words[0], words[1], { ...words[2], y: 20 }],
+  ])
+    assert.equal(find(invalid), null);
+});
 test('prepare and native callbacks recheck human pause and target authorization after async work', async t => {
   const f = fixture(t);
   let release, entered;
@@ -452,12 +694,25 @@ test('missing or reserved baseline prevents native submit, never reattempts the 
   assert.equal(f.state.submits, 0);
   assert.equal(f.outbox.get(id(1)).state, 'submitting');
 });
+test('missing reservation acknowledgement prevents the native submit', async t => {
+  const f = fixture(t);
+  f.receipts.submitted = () => ({ recorded: false });
+  f.outbox.enqueue(f.request);
+  await f.outbox.tick();
+  assert.equal(f.state.pastes, 1);
+  assert.equal(f.state.submits, 0);
+  const saved = f.outbox.get(id(1));
+  assert.equal(saved.state, 'submitting');
+  assert.equal(saved.reason, 'UI_SUBMISSION_UNCERTAIN');
+});
+
 test('foreign receipt or false pixel verification never confirms', async t => {
   for (const patch of [
     { sourceImageSha256: 'e'.repeat(64) },
     { target: 'other' },
     { imageContentVerified: true },
-    { sourceMd5Matched: undefined },
+    { imageContentMatch: undefined },
+    { imageContentMatch: false, nativeSubmitVerified: true },
     { localType: 47 },
     { serverId: 'secret1' },
   ]) {
@@ -469,6 +724,30 @@ test('foreign receipt or false pixel verification never confirms', async t => {
     assert.equal(f.outbox.get(id(1)).state, 'submitted');
   }
 });
+test('a verified cleared editor permits read-only image reconciliation after the receipt deadline', async t => {
+  const f = fixture(t);
+  f.driver.submitImage = async () => {
+    f.state.submits++;
+    return { performed: true, attempted: true, inputReleased: true };
+  };
+  const match = f.receipts.query;
+  f.receipts.query = async () => ({ confirmed: false, reason: 'DESKTOP_IMAGE_CONTENT_UNVERIFIED' });
+  f.outbox.enqueue(f.request);
+  await f.outbox.tick();
+  assert.equal(f.outbox.get(id(1)).inputReleased, true);
+  await f.outbox.tick();
+  f.advance(30001);
+  await f.outbox.tick();
+  const restored = f.make();
+  assert.equal(restored.get(id(1)).state, 'unconfirmed');
+  assert.equal(restored.get(id(1)).nativeRecoveryRequired, false);
+  f.state.confirmed = true;
+  f.receipts.query = match;
+  const result = await restored.reconcileReceipt(id(1));
+  assert.equal(result.state, 'confirmed');
+  assert.equal(f.state.submits, 1);
+});
+
 test('unconfirmed submission blocks later queued images and cannot be cancelled into retry', async t => {
   const f = fixture(t);
   f.outbox.enqueue(f.request);

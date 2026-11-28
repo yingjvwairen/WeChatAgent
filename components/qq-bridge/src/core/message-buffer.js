@@ -2,6 +2,7 @@ import { validFileReference } from '../../../../packages/wechat-file-reference.m
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import modelFields from '../../../../packages/speech-contract/local-model-fields.json' with { type: 'json' };
 import { buildConversationKey } from './conversation-key.js';
 import { normalizeForwardedRecord, normalizeQuoteReply } from './wechat-events.js';
@@ -9,6 +10,9 @@ import { STICKER_CANDIDATE_MAX } from './sticker-policy.js';
 import { validReplyMessageLimit } from '../../../../packages/dsh-social-bridge-plugin/reply-layout-policy.mjs';
 import { verifiedAssistantSender } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import { validQuoteRefs, nativeQuoteKind } from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
+import { validGroupWakeEpoch } from '../../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
+import { TERMINAL_DELIVERY_STATES } from '../../../../packages/delivery-contract.mjs';
+import { validReaderOrder } from '../../../../packages/wechat-identity.mjs';
 
 export function replyDeliveryParts(result, deliveryId) {
   // A voice reply is one part; its text fallback is derived from the same delivery.
@@ -76,7 +80,10 @@ function validReplyParts(item) {
         part.voiceText === target.voiceText &&
         part.quoteEventId === target.quoteEventId &&
         part.deliveryId === target.deliveryId &&
+        (part.desktopPending === undefined || part.desktopPending === true) &&
         (part.voiceFallback === undefined || (part.voiceFallback === true && typeof part.voiceText === 'string')) &&
+        (part.voiceFallbackPending === undefined ||
+          (part.voiceFallbackPending === true && part.voiceFallback === true && part.desktopPending !== true)) &&
         ['queued', 'sending', 'submitted', 'confirmed', 'unconfirmed', 'failed', 'cancelled', 'expired'].includes(
           part.state,
         ) &&
@@ -92,6 +99,24 @@ function validReplyParts(item) {
       (typeof item.deliveryNotice === 'string' && item.deliveryNotice.length <= 1000))
   );
 }
+function validPendingReply(item, key) {
+  return (
+    item &&
+    /^[a-f0-9]{64}$/.test(item.deliveryId ?? '') &&
+    typeof item.throughId === 'string' &&
+    ['RESPOND', 'STICKER'].includes(item.result?.decision) &&
+    validQuotedDecision(item.result) &&
+    (item.result.decision !== 'RESPOND' || validReplyText(item.result, replyTextLimit(item))) &&
+    (item.result.decision !== 'STICKER' ||
+      (item.result.textParts === undefined && /^[a-f0-9]{64}$/.test(item.result.stickerId ?? ''))) &&
+    item.message &&
+    (item.naturalGroupEpoch === undefined || validGroupWakeEpoch(item.naturalGroupEpoch)) &&
+    (item.result.stickerId === undefined || /^[a-f0-9]{64}$/.test(item.result.stickerId)) &&
+    validReplyParts(item) &&
+    buildConversationKey(item.message.platform, item.message.kind, item.message.conversation_id) === key
+  );
+}
+
 function validPendingRequest(item) {
   return (
     item &&
@@ -128,12 +153,16 @@ function validPendingRequest(item) {
 
 /** Small persistent recent-message buffer. Corrupt files fail closed and are never overwritten. */
 export class MessageBuffer {
-  constructor(file, { maxPerChat = 300, archive = null } = {}) {
+  #retryingArchives = false;
+
+  constructor(file, { maxPerChat = 300, archive = null, readerAccount = '' } = {}) {
     this.file = file;
+    this.readerAccount = readerAccount;
     this.archive = archive;
     this.maxPerChat = Math.min(1000, Math.max(10, Number(maxPerChat) || 300));
     this.chats = new Map();
     this.pendingReplies = new Map();
+    this.replyReceipts = new Map();
     this.mediaReplies = new Map();
     this.contextNotices = new Map();
     this.pendingRequests = new Map();
@@ -159,29 +188,35 @@ export class MessageBuffer {
       }
       for (const [key, rows] of Object.entries(saved.chats)) {
         if (!Array.isArray(rows)) throw new Error(`invalid message buffer chat ${key}`);
-        this.archive?.backfill(key, rows);
+        if (this.archive) {
+          this.archive.backfill(
+            key,
+            rows.map(row => (row.archiveText === undefined ? row : { ...row, text: row.archiveText })),
+          );
+          for (const row of rows) {
+            delete row.archivePending;
+            delete row.archiveText;
+          }
+        }
         this.chats.set(
           key,
           this.trimRecent(rows).map(row => ({ ...row, id: row.id ?? crypto.randomUUID() })),
         );
       }
       for (const [key, item] of Object.entries(saved.pendingReplies ?? {})) {
-        if (
-          !item ||
-          !/^[a-f0-9]{64}$/.test(item.deliveryId ?? '') ||
-          typeof item.throughId !== 'string' ||
-          !['RESPOND', 'STICKER'].includes(item.result?.decision) ||
-          !validQuotedDecision(item.result) ||
-          (item.result.decision === 'RESPOND' && !validReplyText(item.result, replyTextLimit(item))) ||
-          (item.result.decision === 'STICKER' &&
-            (item.result.textParts !== undefined || !/^[a-f0-9]{64}$/.test(item.result.stickerId ?? ''))) ||
-          !item.message ||
-          (item.result.stickerId !== undefined && !/^[a-f0-9]{64}$/.test(item.result.stickerId)) ||
-          !validReplyParts(item) ||
-          buildConversationKey(item.message.platform, item.message.kind, item.message.conversation_id) !== key
-        )
-          throw Error('invalid reply outbox');
+        if (!validPendingReply(item, key)) throw Error('invalid reply outbox');
         this.pendingReplies.set(key, item);
+      }
+      for (const [id, item] of Object.entries(saved.replyReceipts ?? {})) {
+        if (
+          !validPendingReply(item, item?.key) ||
+          item.deliveryId !== id ||
+          !item.parts?.length ||
+          (item.retiredAt !== undefined && (!Number.isSafeInteger(item.retiredAt) || item.retiredAt < 1)) ||
+          item.parts.some(part => part.state !== 'submitted' && !TERMINAL_DELIVERY_STATES.has(part.state))
+        )
+          throw Error('invalid reply receipt outbox');
+        this.replyReceipts.set(id, item);
       }
       for (const [key, item] of Object.entries(saved.contextNotices ?? {})) {
         if (!item || typeof item.id !== 'string' || typeof item.text !== 'string' || item.text.length > 1000)
@@ -197,8 +232,11 @@ export class MessageBuffer {
           !/^[a-f0-9]{64}$/.test(id) ||
           item?.part?.deliveryId !== id ||
           !/^[a-f0-9]{64}$/.test(item.part.stickerId ?? '') ||
-          !['queued', 'sending', 'submitted'].includes(item.part.state) ||
+          !['queued', 'sending', 'submitted', 'confirmed'].includes(item.part.state) ||
+          (item.observeOnly !== undefined && typeof item.observeOnly !== 'boolean') ||
+          (item.retiredAt !== undefined && (!Number.isSafeInteger(item.retiredAt) || item.retiredAt < 1)) ||
           !item.message ||
+          (item.naturalGroupEpoch !== undefined && !validGroupWakeEpoch(item.naturalGroupEpoch)) ||
           buildConversationKey(item.message.platform, item.message.kind, item.message.conversation_id) !== item.key ||
           !['createdAt', 'expiresAt'].every(name => Number.isSafeInteger(item[name]) && item[name] >= 0) ||
           item.expiresAt < item.createdAt ||
@@ -210,17 +248,26 @@ export class MessageBuffer {
           )
         )
           throw Error('invalid media outbox');
+        if (item.part.state === 'confirmed') {
+          const receipt = this.findReplyPart(item.key, id);
+          if (receipt?.delivery_status !== 'confirmed' || receipt.sticker_id !== item.part.stickerId)
+            throw Error('invalid media outbox');
+        }
         this.mediaReplies.set(id, item);
       }
-      if (this.mediaReplies.size > 64) throw Error('media outbox limit');
+      if ([...this.mediaReplies.values()].filter(item => !item.observeOnly).length > 64)
+        throw Error('media outbox limit');
     }
   }
 
-  append(message, { outgoing = false, skipReason } = {}) {
+  append(message, { outgoing = false, processed = false, skipReason, deferArchive = false } = {}) {
     const key = buildConversationKey(message.platform, message.kind, message.conversation_id);
     if (!outgoing) {
       const existing = this.findIncoming(message);
-      if (existing) return existing;
+      if (existing) {
+        if (!deferArchive && existing.archivePending) this.#archiveRow(key, existing);
+        return existing;
+      }
     }
     const row = {
       id: crypto.randomUUID(),
@@ -246,7 +293,8 @@ export class MessageBuffer {
       files: outgoing ? [] : (message.files ?? []).filter(validFileReference).slice(0, 3),
       direct_mention: Boolean(message.direct_mention),
       outgoing,
-      processed: outgoing,
+      processed: outgoing || processed,
+      ...(!outgoing && this.archive ? { archivePending: true } : {}),
     };
     if (
       !outgoing &&
@@ -256,7 +304,7 @@ export class MessageBuffer {
     )
       row.mentionTarget = message.mentionTarget;
     if (typeof message.readerGrant === 'string') row.readerGrant = message.readerGrant;
-    if (message.readerOrder) row.readerOrder = message.readerOrder;
+    if (validReaderOrder(message.readerOrder)) row.readerOrder = message.readerOrder;
     if (message.readerReplay === 'context' || message.readerReplay === 'reply') row.readerReplay = message.readerReplay;
     if (message.contextOnly === true) row.contextOnly = true;
     if (message.attachmentUnavailable === true) row.attachmentUnavailable = true;
@@ -269,17 +317,34 @@ export class MessageBuffer {
     if (record) row.forwardedRecord = record;
     const quoteReply = !outgoing && normalizeQuoteReply(message.quoteReply);
     if (quoteReply) row.quoteReply = quoteReply;
+    if (!outgoing && /^[a-f0-9]{64}$/.test(message.voice?.id ?? '')) {
+      row.voice = { id: message.voice.id };
+      if (message.voiceSource === 'video') row.voiceSource = 'video';
+    }
+    if (record && Array.isArray(message.forwardedVoices)) {
+      const references = message.forwardedVoices
+        .filter(
+          ref =>
+            /^[a-f0-9]{64}$/.test(ref?.id ?? '') &&
+            Number.isInteger(ref.index) &&
+            ['1', '3', '4'].includes(record.items[ref.index]?.kind),
+        )
+        .slice(0, 4)
+        .map(({ id, index }) => ({ id, index }));
+      if (references.length) row.forwardedVoices = references;
+    }
     const previousNotice = this.contextNotices.get(key);
     if (!outgoing && skipReason) {
       row.processed = true;
       row.reply_skip_reason = skipReason;
       row.reply_skipped_at = Date.now();
-      if (row.work_mode === 'assistant') row.reply_review_required = true;
-      if (skipReason !== 'context_only')
+      if (row.work_mode === 'assistant' && skipReason !== 'awaiting_mention') row.reply_review_required = true;
+      if (!['context_only', 'awaiting_mention'].includes(skipReason)) {
         this.contextNotices.set(key, {
           id: crypto.randomUUID(),
           text: '离线旧消息仅作为背景，不能逐条补答或自动执行旧任务。请根据恢复后的当前新消息处理。',
         });
+      }
     }
     const previous = this.chats.get(key);
     const rows = this.trimRecent([...(previous ?? []), row]);
@@ -294,8 +359,66 @@ export class MessageBuffer {
       else this.contextNotices.delete(key);
       throw error;
     }
-    this.archive?.append(key, row, { fullText: row.text });
+    if (!deferArchive) this.#archiveRow(key, row);
     return row;
+  }
+
+  #archiveRow(key, row, options = {}) {
+    if (!this.archive) return;
+    this.archive.append(key, row, { fullText: row.archiveText ?? row.text, ...options });
+    delete row.archivePending;
+    delete row.archiveText;
+  }
+
+  async retryPendingArchives({ signal, isCurrent = () => true } = {}) {
+    if (!this.archive || this.#retryingArchives || signal?.aborted || !isCurrent()) return 0;
+    const pending = [...this.chats].flatMap(([key, rows]) =>
+      rows.filter(row => row.archivePending).map(row => [key, row]),
+    );
+    if (!pending.length) return 0;
+    this.#retryingArchives = true;
+    const recovered = new Set();
+    let failures = 0;
+    try {
+      for (const [key, row] of pending) {
+        // Keep intake responsive between synchronous SQLite writes.
+        await setImmediate();
+        if (signal?.aborted || !isCurrent()) break;
+        if (!row.archivePending) continue;
+        try {
+          this.#archiveRow(key, row, { waitForLock: false });
+          recovered.add(key);
+        } catch (error) {
+          failures++;
+          // A busy or locked database cannot accept the remaining writes this pass.
+          if (error?.code === 'ERR_SQLITE_ERROR' && [5, 6].includes(error.errcode & 255)) break;
+        }
+      }
+      if (recovered.size && !signal?.aborted && isCurrent()) {
+        for (const key of recovered) this.chats.set(key, this.trimRecent(this.chats.get(key) ?? []));
+        this.#save();
+      }
+      return failures;
+    } finally {
+      this.#retryingArchives = false;
+    }
+  }
+
+  updateVoice(key, row, update, { archive = false } = {}) {
+    if (!this.chats.get(key)?.includes(row)) return false;
+    const previous = Object.fromEntries(Object.keys(update).map(field => [field, row[field]]));
+    const willArchive = archive && this.archive;
+    if (willArchive) previous.archivePending = row.archivePending;
+    Object.assign(row, update);
+    if (willArchive) row.archivePending = true;
+    try {
+      this.#save();
+    } catch (error) {
+      Object.assign(row, previous);
+      throw error;
+    }
+    if (archive) this.#archiveRow(key, row);
+    return true;
   }
 
   findIncoming(message) {
@@ -314,8 +437,8 @@ export class MessageBuffer {
   confirmBuffered(message) {
     const row = this.findIncoming(message);
     if (!row) return false;
-    const key = buildConversationKey(message.platform, message.kind, message.conversation_id);
-    this.archive?.append(key, row, { fullText: row.text });
+    if (row.archivePending)
+      this.#archiveRow(buildConversationKey(message.platform, message.kind, message.conversation_id), row);
     return true;
   }
   rememberReply(key, item) {
@@ -343,6 +466,54 @@ export class MessageBuffer {
     this.pendingReplies.delete(key);
     this.#save();
   }
+  deferReplyReceipt(key, item) {
+    const id = item.deliveryId;
+    const pending = this.pendingReplies.get(key);
+    const rows = this.chats.get(key);
+    const processed = rows?.map(row => row.processed);
+    const saved = structuredClone({
+      ...item,
+      key,
+      retiredAt: Date.now(),
+      message: pending?.deliveryId === id ? pending.message : item.message,
+    });
+    const previous = [
+      [this.pendingReplies, key, pending],
+      [this.chats, key, rows],
+      [this.contextNotices, key, this.contextNotices.get(key)],
+      [this.replyReceipts, id, this.replyReceipts.get(id)],
+    ];
+    try {
+      if (item.deliveryNotice) this.contextNotices.set(key, { id, text: item.deliveryNotice });
+      this.replyReceipts.set(id, saved);
+      // Publish the receipt-only record and consume the old input in one snapshot.
+      this.completeReply(key, item, null);
+    } catch (error) {
+      for (const [index, row] of rows?.entries() ?? []) row.processed = processed[index];
+      for (const [map, entry, value] of previous) {
+        if (value === undefined) map.delete(entry);
+        else map.set(entry, value);
+      }
+      throw error;
+    }
+  }
+
+  rememberReplyReceipt(item) {
+    this.replyReceipts.set(item.deliveryId, item);
+    this.#save();
+  }
+
+  forgetReplyReceipt(id) {
+    const previous = this.replyReceipts.get(id);
+    this.replyReceipts.delete(id);
+    try {
+      this.#save();
+    } catch (error) {
+      if (previous) this.replyReceipts.set(id, previous);
+      throw error;
+    }
+  }
+
   rememberRequest(key, item) {
     if (!validPendingRequest(item)) throw Error('invalid pending model request');
     this.pendingRequests.set(key, structuredClone(item));
@@ -354,6 +525,44 @@ export class MessageBuffer {
   }
   saveMedia() {
     this.#save();
+  }
+  retireInputs(key, reasonFor) {
+    const retired = [];
+    for (const row of this.chats.get(key) ?? []) {
+      if (row.outgoing || row.processed) continue;
+      const reason = reasonFor(row);
+      if (reason)
+        retired.push({
+          row,
+          reason,
+          previous: {
+            processed: row.processed,
+            reply_skip_reason: row.reply_skip_reason,
+            reply_skipped_at: row.reply_skipped_at,
+            reply_review_required: row.reply_review_required,
+          },
+        });
+    }
+    if (!retired.length) return 0;
+    const request = this.pendingRequests.get(key);
+    const ids = new Set(retired.map(({ row }) => row.id));
+    const retireRequest = request?.rowIds.some(id => ids.has(id));
+    const at = Date.now();
+    try {
+      for (const { row, reason } of retired) {
+        row.processed = true;
+        row.reply_skip_reason = reason;
+        row.reply_skipped_at = at;
+        if (row.work_mode === 'assistant') row.reply_review_required = true;
+      }
+      if (retireRequest) this.pendingRequests.delete(key);
+      this.#save();
+    } catch (error) {
+      for (const { row, previous } of retired) Object.assign(row, previous);
+      if (retireRequest) this.pendingRequests.set(key, request);
+      throw error;
+    }
+    return retired.length;
   }
   skipOfflineInputs({ before = Infinity, reason = 'dsh_offline' } = {}) {
     let skipped = 0;
@@ -395,32 +604,26 @@ export class MessageBuffer {
     this.contextNotices.set(key, item);
     this.#save();
   }
-  recordReplyPart(key, item, outgoing) {
-    if (outgoing)
-      this.archive?.append(key, {
-        ...outgoing,
-        outgoing: true,
-        sender_name: 'AI',
-        delivery_id: item.deliveryId,
-        message_id: 'out-' + item.deliveryId,
-      });
+  findReplyPart(key, deliveryId) {
+    return this.chats.get(key)?.find(row => row.outgoing && row.delivery_id === deliveryId);
+  }
+  recordReplyPart(key, item, outgoing, { inSendOrder = false, receiptOrder } = {}) {
     const rows = this.chats.get(key) ?? [];
-    const existing = rows.find(row => row.outgoing && row.delivery_id === item.deliveryId);
-    if (outgoing && existing?.delivery_status === 'unconfirmed' && outgoing.delivery_status === 'confirmed') {
-      existing.delivery_status = 'confirmed';
-      existing.text = String(outgoing.text).slice(0, 4000);
-    }
-    if (outgoing && !existing) {
-      rows.push({
-        id: crypto.randomUUID(),
+    if (outgoing) {
+      const existing = this.findReplyPart(key, item.deliveryId);
+      const messageId = 'out-' + item.deliveryId;
+      const fullText = String(outgoing.text);
+      const row = existing ?? {
+        id: messageId,
         platform: outgoing.platform,
         kind: outgoing.kind,
         conversation_id: String(outgoing.conversation_id),
         conversation_name: String(outgoing.conversation_name ?? ''),
         sender_id: String(outgoing.sender_id ?? ''),
         sender_name: 'AI',
-        message_id: 'out-' + item.deliveryId,
-        text: String(outgoing.text).slice(0, 4000),
+        ...(typeof outgoing.self_id === 'string' ? { self_id: outgoing.self_id } : {}),
+        message_id: messageId,
+        text: fullText.slice(0, 4000),
         timestamp: outgoing.timestamp,
         images: [],
         direct_mention: false,
@@ -431,9 +634,58 @@ export class MessageBuffer {
         proactive: outgoing.proactive === true,
         ...(outgoing.work_mode ? { work_mode: outgoing.work_mode } : {}),
         ...(/^[a-f0-9]{64}$/.test(outgoing.sticker_id ?? '') ? { sticker_id: outgoing.sticker_id } : {}),
-      });
+      };
+      const hasReceiptOrder =
+        !row.readerOrder &&
+        outgoing.delivery_status === 'confirmed' &&
+        validReaderOrder(receiptOrder) &&
+        Number(receiptOrder.slice(0, 20)) === outgoing.timestamp;
+      const readerOrder = hasReceiptOrder ? receiptOrder : row.readerOrder;
+      const timestamp = hasReceiptOrder ? outgoing.timestamp : row.timestamp;
+      if (this.archive && (row.delivery_status !== 'confirmed' || outgoing.delivery_status === 'confirmed')) {
+        try {
+          this.archive.append(
+            key,
+            { ...row, timestamp, readerOrder, delivery_status: outgoing.delivery_status },
+            { fullText, waitForLock: false },
+          );
+          delete row.archivePending;
+          delete row.archiveText;
+        } catch (error) {
+          if (error?.code !== 'ERR_SQLITE_ERROR') throw error;
+          // A desktop result remains valid while the history database cannot accept the write.
+          row.archivePending = true;
+          if (fullText !== row.text) row.archiveText = fullText;
+          else delete row.archiveText;
+        }
+      }
+
+      if (row.delivery_status === 'unconfirmed' && outgoing.delivery_status === 'confirmed') {
+        row.delivery_status = 'confirmed';
+        row.text = fullText.slice(0, 4000);
+      }
+      if (!existing || hasReceiptOrder) {
+        if (readerOrder) row.readerOrder = readerOrder;
+        row.timestamp = timestamp;
+        if (existing) rows.splice(rows.indexOf(existing), 1);
+        const later =
+          inSendOrder || readerOrder
+            ? rows.findIndex(
+                item =>
+                  item.timestamp > row.timestamp ||
+                  (item.timestamp === row.timestamp &&
+                    readerOrder &&
+                    item.readerOrder &&
+                    item.readerOrder > readerOrder),
+              )
+            : -1;
+        if (later < 0) rows.push(row);
+        else rows.splice(later, 0, row);
+      }
     }
     this.chats.set(key, this.trimRecent(rows));
+    if (outgoing && item.noticeId && this.contextNotices.get(key)?.id === item.noticeId)
+      this.contextNotices.delete(key);
     this.#save();
   }
   completeReply(key, item, outgoing) {
@@ -456,7 +708,8 @@ export class MessageBuffer {
     if (excess <= 0) return rows;
     const latest = rows.at(-1);
     return rows.filter(row => {
-      if (row !== latest && excess > 0 && (row.processed || row.readerReplay !== 'reply')) {
+      // Keep unread work and input whose archive write has not succeeded.
+      if (row !== latest && excess > 0 && row.processed && !row.archivePending) {
         excess--;
         return false;
       }
@@ -469,8 +722,8 @@ export class MessageBuffer {
   keys() {
     return [...this.chats.keys()];
   }
-  unread(key, limit = 50) {
-    return (this.chats.get(key) ?? []).filter(row => !row.processed).slice(0, limit);
+  unread(key, limit = 50, accepts = () => true) {
+    return (this.chats.get(key) ?? []).filter(row => !row.processed && accepts(row)).slice(0, limit);
   }
   markProcessed(key, throughId = null, noticeId = null) {
     const rows = this.chats.get(key) ?? [];
@@ -489,20 +742,43 @@ export class MessageBuffer {
   #save() {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const chats = Object.fromEntries(this.chats);
+    const readerMedia = new Set();
+    if (this.readerAccount) {
+      // Save the references with the rows and pending requests in the same
+      // atomic write. The Reader can then acknowledge without dropping them.
+      const track = ({ images, files, voice, forwardedVoices }) => {
+        for (const item of [...(images ?? []), ...(files ?? []), voice, ...(forwardedVoices ?? [])])
+          if (/^[a-f0-9]{64}$/.test(item?.id ?? '')) readerMedia.add(item.id);
+      };
+      for (const rows of this.chats.values()) for (const row of rows) track(row);
+      for (const request of this.pendingRequests.values()) track(request.metadata);
+    }
     const temp = `${this.file}.${process.pid}.tmp`;
     fs.writeFileSync(
       temp,
       JSON.stringify({
         version: 1,
         chats,
+        ...(this.readerAccount ? { readerMediaPins: { account: this.readerAccount, ids: [...readerMedia] } } : {}),
         dshConnection: this.dshConnection,
         pendingReplies: Object.fromEntries(this.pendingReplies),
+        replyReceipts: Object.fromEntries(this.replyReceipts),
         mediaReplies: Object.fromEntries(this.mediaReplies),
         contextNotices: Object.fromEntries(this.contextNotices),
         pendingRequests: Object.fromEntries(this.pendingRequests),
       }),
       { mode: 0o600, flush: true },
     );
-    fs.renameSync(temp, this.file);
+    // Windows may briefly deny replacement while the Reader loads the snapshot.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.renameSync(temp, this.file);
+        return;
+      } catch (error) {
+        if (process.platform !== 'win32' || attempt === 5 || !['EACCES', 'EPERM', 'EBUSY'].includes(error.code))
+          throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (attempt + 1));
+      }
+    }
   }
 }

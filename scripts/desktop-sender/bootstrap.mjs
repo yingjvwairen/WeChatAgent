@@ -142,6 +142,7 @@ export async function bootstrapDesktopSender({
   popupEvidence,
   signal,
   allowFocusCapture = false,
+  persistLayout = true,
   canCapture,
   createProvider = createUiaControlProvider,
   createClient = options => new QtActionsClient(options),
@@ -187,7 +188,7 @@ export async function bootstrapDesktopSender({
     newlineKey: 'Shift+Enter',
     searchPopupCalibration: popup,
   };
-  let provider, config;
+  let provider, config, layoutSource;
   try {
     if (settings.controlMode === 'uia') {
       provider = createProvider({ root, configFile, ensureAccessibility });
@@ -195,6 +196,7 @@ export async function bootstrapDesktopSender({
       config = validateQtConfig(
         toUiaLayoutConfig(seed, { layout: observed.layout, voice: observed.voice, searchPopupCalibration: popup }),
       );
+      layoutSource = 'uia';
     } else {
       const client = createClient({
         root,
@@ -222,29 +224,34 @@ export async function bootstrapDesktopSender({
           if (saved.config.account !== account.accountWxid || !saved.config.sharedDesktop)
             throw fault('DESKTOP_CALIBRATION_ACCOUNT_CHANGED');
           config = validateQtConfig({ ...saved.config, idleMs: seed.idleMs, searchPopupCalibration: popup });
+          layoutSource = 'calibration';
         } else {
           const result = await resolveOcr({ root, config: seed, inspection, client, signal, allowFocusCapture });
           if (result?.verified !== true || result.proof !== 'verified-edge-anchor-layout-v1')
             throw fault('DESKTOP_BOOTSTRAP_LAYOUT_UNCONFIRMED');
           config = validateQtConfig(result.config);
+          layoutSource = 'ocr';
         }
       } finally {
         await client.close();
       }
     }
     if (signal?.aborted) throw fault('DESKTOP_BOOTSTRAP_ABORTED');
-    const temporary = configFile + '.' + crypto.randomUUID() + '.tmp';
-    try {
-      fs.writeFileSync(temporary, JSON.stringify(config), { mode: 0o600, flag: 'wx' });
-      fs.renameSync(temporary, configFile);
-    } finally {
-      fs.rmSync(temporary, { force: true });
+    if (persistLayout) {
+      const temporary = configFile + '.' + crypto.randomUUID() + '.tmp';
+      try {
+        fs.writeFileSync(temporary, JSON.stringify(config), { mode: 0o600, flag: 'wx' });
+        fs.renameSync(temporary, configFile);
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
     }
     return {
       config,
       configFile,
       accountProbe,
       provider,
+      layoutSource,
       health: {
         ready: true,
         backend: 'wechat-ui',

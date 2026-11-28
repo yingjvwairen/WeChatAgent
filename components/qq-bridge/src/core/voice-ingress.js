@@ -1,10 +1,12 @@
+import { boundedTask } from '../../../../packages/dsh-social-bridge-plugin/deadline.mjs';
 import { buildConversationKey } from './conversation-key.js';
+import { annotateForwardedItem } from './wechat-events.js';
 
-/** Per-chat ordering, bounded API concurrency, and no automatic upload retries. */
+/** Prepare scoped audio for admitted turns, with bounded API concurrency. */
 export class VoiceIngress {
   constructor({
     recognize,
-    deliver,
+    deliver = message => message,
     canRecognize = () => true,
     generationFor = () => '',
     onResult = () => {},
@@ -19,9 +21,23 @@ export class VoiceIngress {
     this.controllers = new Set();
     this.waiters = [];
   }
-  async acquire() {
-    while (!this.closed && this.active >= 2) await new Promise(resolve => this.waiters.push(resolve));
+  async acquire(signal) {
+    while (!this.closed && !signal.aborted && this.active >= 2)
+      await new Promise(resolve => {
+        const ready = () => {
+          signal.removeEventListener('abort', ready);
+          const index = this.waiters.indexOf(ready);
+          if (index !== -1) this.waiters.splice(index, 1);
+          resolve();
+        };
+        this.waiters.push(ready);
+        signal.addEventListener('abort', ready, { once: true });
+      });
     if (this.closed) return false;
+    if (signal.aborted) {
+      if (this.active < 2) this.waiters.shift()?.();
+      return false;
+    }
     this.active++;
     return true;
   }
@@ -29,13 +45,66 @@ export class VoiceIngress {
     this.active--;
     this.waiters.shift()?.();
   }
-  push(message) {
-    if (this.closed) return Promise.resolve();
+  async prepareRows(buffer, key, rows, permitted, { signal } = {}) {
+    let remaining = 4;
+    for (const row of rows) {
+      const forwarded = row.forwardedVoices;
+      const count = Math.min(remaining, forwarded?.length ?? (row.voice ? 1 : 0));
+      if (this.closed || signal?.aborted) return;
+      if (!count || !permitted(row) || !(await this.canRecognize(row))) continue;
+      remaining -= count;
+      const selected = forwarded?.slice(0, count);
+      const unprocessed = forwarded?.slice(count);
+      const interrupted = row.voiceAttempted === true;
+      let started = interrupted || selected?.some(ref => ref.attempted === true) === true;
+      const providers = [];
+      const prepared = await this.push(selected ? { ...row, forwardedVoices: selected } : row, {
+        interrupted,
+        signal,
+        providers,
+        permitted: () => permitted(row),
+        // Checkpoint each attachment just before handing it to the provider.
+        beforeRecognize: voice => {
+          const update = selected
+            ? { forwardedVoices: row.forwardedVoices.map(ref => (ref === voice ? { ...ref, attempted: true } : ref)) }
+            : { voiceAttempted: true };
+          const saved = buffer.updateVoice(key, row, update);
+          started ||= saved;
+          return saved;
+        },
+      });
+      if (this.closed || signal?.aborted) return;
+      if (!started || !prepared || !permitted(row)) continue;
+      // Completing the provider call and publishing its result are separate boundaries.
+      const canPublish = await this.canRecognize(row, providers);
+      if (this.closed || signal?.aborted) return;
+      if (!canPublish || !permitted(row)) continue;
+      buffer.updateVoice(
+        key,
+        row,
+        {
+          text: prepared.text,
+          forwardedRecord: prepared.forwardedRecord,
+          quoteReply: prepared.quoteReply,
+          voice: undefined,
+          voiceSource: undefined,
+          forwardedVoices: unprocessed?.length ? unprocessed : undefined,
+          voiceAttempted: interrupted && unprocessed?.length ? true : undefined,
+        },
+        { archive: true },
+      );
+    }
+  }
+  push(
+    message,
+    { interrupted = false, permitted = () => true, beforeRecognize = () => true, signal, providers = [] } = {},
+  ) {
+    if (this.closed || signal?.aborted) return Promise.resolve();
     const key = buildConversationKey(message.platform, message.kind, message.conversation_id),
       identity = key + '\0' + message.message_id;
     if (!message.voice && !message.forwardedVoices?.length && !this.queues.has(key))
       return Promise.resolve().then(() => {
-        if (!this.closed) return this.deliver(message);
+        if (!this.closed && !signal?.aborted && permitted()) return this.deliver(message);
       });
     if (this.ids.has(identity)) return Promise.resolve();
     if (this.pending >= 64) {
@@ -48,27 +117,36 @@ export class VoiceIngress {
     const next = previous
       .catch(() => {})
       .then(async () => {
-        if (this.closed) return;
+        if (this.closed || signal?.aborted) return;
         const controller = new AbortController();
+        const runSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
         this.controllers.add(controller);
         try {
           let prepared = message;
           const voices = message.forwardedVoices ?? (message.voice ? [message.voice] : []);
           for (const voice of voices) {
+            const wasInterrupted = interrupted || voice.attempted === true;
             const current = message.forwardedVoices ? { ...message, voice: { id: voice.id } } : message;
             let generation = '';
             try {
               generation = this.generationFor(message);
             } catch {}
             let result;
-            const allowed = await this.canRecognize(message);
-            if (this.closed || controller.signal.aborted) return;
-            if (!allowed) result = { ok: false, code: 'VOICE_INPUT_UNAVAILABLE', stage: 'host' };
-            else if (await this.acquire()) {
+            const allowed = !wasInterrupted && permitted() && (await this.canRecognize(message));
+            if (this.closed || runSignal.aborted || !permitted()) return;
+            if (wasInterrupted) result = { ok: false, code: 'VOICE_INPUT_INTERRUPTED', stage: 'host' };
+            else if (!allowed) result = { ok: false, code: 'VOICE_INPUT_UNAVAILABLE', stage: 'host' };
+            else if (await this.acquire(runSignal)) {
               try {
-                if (!(await this.canRecognize(message)))
+                if (runSignal.aborted) return;
+                const stillAllowed = await this.canRecognize(message);
+                if (runSignal.aborted) return;
+                if (!permitted() || !stillAllowed)
                   result = { ok: false, code: 'VOICE_INPUT_UNAVAILABLE', stage: 'host' };
-                else result = await this.recognize(current, { signal: controller.signal });
+                else {
+                  if (!beforeRecognize(voice)) return;
+                  result = await boundedTask(signal => this.recognize(current, { signal }), { signal: runSignal });
+                }
               } catch (error) {
                 result = {
                   ok: false,
@@ -79,15 +157,27 @@ export class VoiceIngress {
                 this.release();
               }
             } else return;
-            if (this.closed || controller.signal.aborted) return;
-            if (!(await this.canRecognize(message))) result = { ok: false, code: 'VOICE_INPUT_UNAVAILABLE' };
+            if (this.closed || runSignal.aborted || !permitted()) return;
+            const plugin =
+              typeof result?.plugin === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(result.plugin)
+                ? result.plugin
+                : undefined;
+            const provider =
+              plugin && typeof result.generation === 'string' && result.generation.length <= 200
+                ? { id: plugin, generation: result.generation }
+                : null;
+            if (!wasInterrupted && !(await this.canRecognize(message, provider ? [provider] : []))) {
+              if (provider) return;
+              result = { ok: false, code: 'VOICE_INPUT_UNAVAILABLE' };
+            }
+            if (this.closed || runSignal.aborted || !permitted()) return;
             const success =
               result?.ok === true &&
               typeof result.text === 'string' &&
               !!result.text.trim() &&
               result.text.length <= 12000;
             const code = /^VOICE_[A-Z0-9_]{3,80}$/.test(result?.code ?? '') ? result.code : 'VOICE_INPUT_FAILED';
-            const plugin = /^[a-z][a-z0-9-]{0,39}$/.test(result?.plugin ?? '') ? { plugin: result.plugin } : {};
+            if (success && provider) providers.push(provider);
             try {
               await this.onResult(
                 message,
@@ -98,45 +188,25 @@ export class VoiceIngress {
                     ? 'complete'
                     : (result?.stage ??
                       (/^VOICE_(API|MODEL)_/.test(code) ? 'api' : /^VOICE_DECODE/.test(code) ? 'audio' : 'host')),
-                  ...plugin,
+                  ...(plugin ? { plugin } : {}),
                 },
-                generation,
+                provider ? [provider] : generation,
               );
             } catch {
               this.log('[Voice] diagnostic_write_failed');
             }
             if (message.forwardedVoices) {
               const record = prepared.forwardedRecord;
-              const items = record.items.slice();
-              const length = text => [...text].length;
-              const available = Math.max(
-                0,
-                Math.min(
-                  760,
-                  6200 -
-                    items.reduce(
-                      (n, item, i) =>
-                        n + length(item.sender) + length(item.time) + 12 + (i === voice.index ? 0 : length(item.text)),
-                      length(record.title),
-                    ),
-                ),
-              );
-              const source = items[voice.index];
+              const source = record.items[voice.index];
               const transcript = success
                 ? '[历史音轨自动转写] ' + result.text.trim()
                 : code === 'VOICE_VIDEO_NO_AUDIO'
                   ? '[历史视频没有音轨]'
                   : '[历史音轨未能转写]';
-              const label =
-                source.kind === '1'
-                  ? source.text + '\n[以下音轨属于被引用的历史消息]\n' + transcript
-                  : source.kind === '4'
-                    ? source.text + '\n' + transcript
-                    : transcript;
-              items[voice.index] = { ...items[voice.index], text: [...label].slice(0, available).join('') };
+              const label = source.kind === '1' ? '[以下音轨属于被引用的历史消息]\n' + transcript : transcript;
               prepared = {
                 ...prepared,
-                forwardedRecord: { ...record, items, truncated: record.truncated || length(label) > available },
+                forwardedRecord: annotateForwardedItem(record, voice.index, label),
               };
               continue;
             }
@@ -195,7 +265,8 @@ export class VoiceIngress {
                     : 'VOICE_INPUT_FAILED'),
             );
           }
-          if (!this.closed) return await this.deliver(prepared);
+          if (providers.length && !(await this.canRecognize(message, providers))) return;
+          if (!this.closed && !runSignal.aborted && permitted()) return await this.deliver(prepared);
         } finally {
           controller.abort();
           this.controllers.delete(controller);

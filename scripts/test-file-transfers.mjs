@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   FileTransfers,
   filesAllowed,
@@ -105,6 +106,9 @@ test('the console exposes delivery controls only for the saved chat and current 
     await new Promise(resolve => app.server.close(resolve));
   });
   const base = 'http://127.0.0.1:' + address.port;
+  const contract = await fetch(base + '/packages/delivery-contract.mjs');
+  assert.equal(contract.status, 200);
+  assert.match(contract.headers.get('content-type'), /^text\/javascript/);
   const { token } = await (await fetch(base + '/api/info')).json();
   const headers = { 'x-console-token': token, 'Content-Type': 'application/json', Origin: base };
   const url = base + '/api/chat-deliveries?key=' + encodeURIComponent(key);
@@ -241,6 +245,61 @@ test('competing file admissions share the last slot and the byte limit', async t
   }
 });
 
+for (const limit of ['count', 'bytes']) {
+  test('expired files without a send intent release the current account staging budget, limit=' + limit, async t => {
+    const f = fixture(t);
+    const account = 'b'.repeat(64);
+    const marker = path.join(f.root, 'state/weflow/active-account.json');
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, JSON.stringify({ id: account }));
+    const { id } = await f.queue();
+    const first = f.store.read(id);
+    const staged = f.store.staged(first);
+    const now = Date.now();
+    const expired = { ...first, createdAt: now - 121000, deadlineAt: now - 1000, queuePaused: true };
+    f.store.write(expired);
+
+    const admitted = {
+      ...expired,
+      id: digest('admitted file without a receipt'),
+      account: 'wxid_fixture_account',
+      accountRef: account,
+      nativeAdmitted: true,
+      nativeState: 'paused',
+      queuePaused: false,
+    };
+    const uncertain = {
+      ...admitted,
+      id: digest('file without an admission acknowledgement'),
+      state: 'submitted',
+      dispatchPending: true,
+    };
+    f.store.write(admitted);
+    f.store.write(uncertain);
+    for (let index = 0; index < (limit === 'count' ? 125 : 11); index++) {
+      const size = limit === 'count' ? first.size : index < 10 ? FILE_LIMIT : 12 * 1024 * 1024 - 3 * first.size;
+      f.store.write({ ...expired, id: digest('expired file ' + index), size });
+    }
+
+    const next = await f.queue({ batchId: digest('fresh file') });
+    assert.equal(next.state, 'queued');
+    assert.equal(f.store.read(id).state, 'expired');
+    assert.equal(f.store.read(id).error, 'FILE_DELIVERY_TIMEOUT');
+    assert.equal(fs.existsSync(staged), false);
+    assert.equal(fs.readFileSync(path.join(f.cwd, first.name), 'utf8'), 'file proof');
+    assert.deepEqual(f.store.read(admitted.id), admitted);
+    assert.deepEqual(f.store.read(uncertain.id), uncertain);
+    assert.deepEqual(f.store.history.due(account, now), []);
+    assert.deepEqual(
+      f.store
+        .list()
+        .map(job => job.id)
+        .sort(),
+      [admitted.id, uncertain.id, next.id].sort(),
+    );
+  });
+}
+
 test('damaged metadata keeps its quota but does not stop unrelated deliveries', async t => {
   const f = fixture(t);
   const { id } = await f.queue();
@@ -273,6 +332,44 @@ test('restart discards unpublished bytes and finishes publishing committed file 
   assert.equal(fs.existsSync(ready), false);
 });
 
+test('terminal cleanup keeps a locked unpublished file in the staging budget until removal', async t => {
+  const f = fixture(t);
+  const { id } = await f.queue();
+  const job = f.store.read(id);
+  const staged = f.store.staged(job);
+  const ready = path.join(f.store.outgoing, id + '.ready');
+  fs.renameSync(staged, ready);
+  fs.rmdirSync(path.dirname(staged));
+  const checkpoint = path.join(f.store.jobs, id + '.json');
+  fs.writeFileSync(checkpoint, JSON.stringify({ ...job, state: 'expired', error: 'FILE_DELIVERY_TIMEOUT' }));
+
+  const remove = fs.rmSync.bind(fs);
+  const locked = t.mock.method(fs, 'rmSync', (file, options) => {
+    if (file === ready) throw Object.assign(Error('fixture staging copy is still in use'), { code: 'EBUSY' });
+    return remove(file, options);
+  });
+  const restarted = new FileTransfers(f.root);
+  try {
+    const usage = restarted.withDeliveryLock(() => restarted.inspectActive());
+    assert.equal(usage.count, 1);
+    assert.equal(usage.bytes, job.size);
+    assert.deepEqual(
+      usage.retiring.map(item => item.id),
+      [id],
+    );
+    assert.equal(fs.existsSync(checkpoint), true);
+    assert.equal(fs.existsSync(ready), true);
+    assert.equal(restarted.read(id).state, 'expired');
+  } finally {
+    locked.mock.restore();
+  }
+
+  assert.deepEqual(restarted.list(), []);
+  assert.equal(fs.existsSync(ready), false);
+  assert.equal(fs.existsSync(checkpoint), false);
+  assert.equal(restarted.read(id).state, 'expired');
+});
+
 test('a restart finishes interrupted terminal cleanup without requeueing the file', async t => {
   const f = fixture(t);
   const { id } = await f.queue();
@@ -281,27 +378,206 @@ test('a restart finishes interrupted terminal cleanup without requeueing the fil
   const checkpoint = path.join(f.store.jobs, id + '.json');
   job.state = 'unconfirmed';
   job.nativeAdmitted = true;
+  job.nativeRecovery = { kind: 'draft', canRecover: true, recovered: false };
   // Simulate a stop after the terminal JSON was committed but before archival.
   fs.writeFileSync(checkpoint, JSON.stringify(job));
   const restarted = new FileTransfers(f.root);
   assert.deepEqual(restarted.list(), []);
   assert.equal(fs.existsSync(staged), false);
   assert.deepEqual(
-    restarted.history.due(100).map(item => item.id),
+    restarted.history.due(restarted.account(), 100).map(item => item.id),
     [id],
   );
   restarted.history.defer(id, 200);
   // A leftover checkpoint after archival must preserve the scheduled retry.
   fs.writeFileSync(checkpoint, JSON.stringify(job));
   assert.deepEqual(restarted.list(), []);
-  assert.deepEqual(restarted.history.due(100), []);
+  assert.deepEqual(restarted.history.due(restarted.account(), 100), []);
   assert.deepEqual(
-    restarted.history.due(200).map(item => item.id),
+    restarted.history.due(restarted.account(), 200).map(item => item.id),
     [id],
   );
+  assert.deepEqual(restarted.conversationDeliveries(key).jobs[0].recovery, job.nativeRecovery);
   assert.equal(restarted.saveProgress({ ...job, nativeReviewed: true }), true);
-  assert.deepEqual(restarted.history.due(300), []);
+  assert.deepEqual(restarted.history.due(restarted.account(), 300), []);
   assert.equal(restarted.status(id, key, sender).state, 'unconfirmed');
+  const [reviewed] = restarted.conversationDeliveries(key).jobs;
+  assert.equal(reviewed.reviewed, true);
+  assert.equal(reviewed.state, 'unconfirmed');
+  assert.equal(reviewed.recovery, undefined);
+});
+
+for (const staleState of ['queued', 'unconfirmed']) {
+  test('a finalized file receipt survives a stale checkpoint on restart, ' + staleState, async t => {
+    const f = fixture(t);
+    const { id } = await f.queue();
+    const before = f.store.read(id);
+    const a = adapterFor(f);
+    await new FileDeliveryWorker(a.adapter).run(structuredClone(before));
+    const confirmed = f.store.read(id);
+    assert.equal(confirmed.state, 'confirmed');
+    const checkpoint = path.join(f.store.jobs, id + '.json');
+    assert.equal(fs.existsSync(checkpoint), false);
+    const stale = {
+      ...before,
+      state: staleState,
+      ...(staleState === 'unconfirmed' ? { nativeAdmitted: true, accountRef: a.adapter.accountRef } : {}),
+    };
+    fs.writeFileSync(checkpoint, JSON.stringify(stale));
+
+    const resumed = new FileTransfers(f.root);
+    assert.deepEqual(resumed.status(id, key, sender).receipt, confirmed.receipt);
+    assert.deepEqual(resumed.list(), []);
+    assert.equal(fs.existsSync(checkpoint), false);
+    resumed.history.save({ ...stale, state: 'unconfirmed', nativeAdmitted: true }, true);
+    assert.deepEqual(resumed.history.find(id), confirmed);
+    assert.deepEqual(resumed.history.due(resumed.account(), Date.now()), []);
+    assert.equal((await f.queue()).state, 'confirmed');
+    assert.equal(a.submissions, 1);
+  });
+}
+
+test('a pending file archive keeps its original admission and scope during checkpoint cleanup', async t => {
+  const f = fixture(t);
+  const { id } = await f.queue();
+  const queued = f.store.read(id);
+  const a = adapterFor(f, { noReceipt: true });
+  await new FileDeliveryWorker(a.adapter).run(structuredClone(queued));
+  const pending = f.store.read(id);
+  assert.equal(pending.state, 'unconfirmed');
+  const checkpoint = path.join(f.store.jobs, id + '.json');
+  const invalidConfirmation = {
+    ...pending,
+    state: 'confirmed',
+    accountRef: 'c'.repeat(64),
+    receipt: { serverConfirmed: true, serverId: '999' },
+  };
+  const resumed = new FileTransfers(f.root);
+  for (const stale of [queued, invalidConfirmation]) {
+    fs.writeFileSync(checkpoint, JSON.stringify(stale));
+    assert.deepEqual(resumed.read(id), pending);
+    assert.deepEqual(resumed.list(), []);
+    assert.equal(fs.existsSync(checkpoint), false);
+    assert.deepEqual(resumed.history.find(id), pending);
+  }
+  assert.equal(a.submissions, 1);
+});
+
+test('a newer confirmed file checkpoint finishes an interrupted update to pending history', async t => {
+  const f = fixture(t);
+  const { id } = await f.queue();
+  const options = { noReceipt: true };
+  const a = adapterFor(f, options);
+  const worker = new FileDeliveryWorker(a.adapter);
+  await worker.run(f.store.read(id));
+  const pending = f.store.read(id);
+  assert.equal(pending.state, 'unconfirmed');
+  options.noReceipt = false;
+  t.mock.method(worker.store.history, 'save', () => {
+    throw Object.assign(Error('simulated interruption before updating the archive'), { code: 'EIO' });
+  });
+  await assert.rejects(worker.run(structuredClone(pending)), { code: 'EIO' });
+
+  const resumed = new FileTransfers(f.root);
+  const receipt = resumed.status(id, key, sender).receipt;
+  assert.equal(receipt.serverId, '901');
+  assert.deepEqual(resumed.history.find(id), pending);
+  assert.deepEqual(resumed.list(), []);
+  assert.equal(resumed.history.find(id).state, 'confirmed');
+  assert.deepEqual(resumed.history.find(id).receipt, receipt);
+  assert.deepEqual(resumed.history.due(resumed.account(), Date.now()), []);
+  assert.equal(a.submissions, 1);
+});
+
+test('a locked file receipt archive keeps confirmations visible and lets the next file continue', async t => {
+  const f = fixture(t);
+  const old = await f.queue();
+  const options = { noReceipt: true };
+  const a = adapterFor(f, options);
+  const worker = new FileDeliveryWorker(a.adapter);
+  await worker.run(f.store.read(old.id));
+  const pending = f.store.read(old.id);
+  assert.equal(pending.state, 'unconfirmed');
+  const next = await f.queue({ batchId: 'c'.repeat(64) });
+  const originalMessages = a.adapter.messages.bind(a.adapter);
+  a.adapter.messages = async () =>
+    (await originalMessages()).map(row => ({
+      ...row,
+      localId: 8 + a.submissions,
+      serverId: String(900 + a.submissions),
+    }));
+  options.noReceipt = false;
+
+  const lock = new DatabaseSync(f.store.history.file);
+  lock.exec('BEGIN IMMEDIATE');
+  try {
+    const started = performance.now();
+    await worker.run(pending);
+    assert(performance.now() - started < 2700, 'a history write must not wait behind the lock');
+    assert.equal(f.store.history.find(old.id).state, 'unconfirmed');
+    assert.equal(f.store.status(old.id, key, sender).state, 'confirmed');
+    assert.equal(f.store.conversationDeliveries(key).jobs.find(job => job.id === old.id)?.state, 'confirmed');
+
+    worker.tick();
+    for (let n = 0; worker.running.size && n < 200; n++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(worker.running.size, 0);
+    assert.equal(f.store.status(next.id, key, sender).state, 'confirmed');
+    assert.equal(f.store.status(next.id, key, sender).receipt.serverId, '902');
+    assert.equal(f.store.history.find(next.id), undefined);
+    assert.equal(f.store.conversationDeliveries(key).jobs.find(job => job.id === next.id)?.state, 'confirmed');
+    assert.equal(fs.existsSync(f.store.staged(f.store.read(next.id))), true);
+    assert.equal(a.submissions, 2);
+    assert.equal(a.adapter.status.confirmed_sends, 2);
+  } finally {
+    lock.close();
+  }
+
+  worker.tick();
+  assert.equal(f.store.history.find(old.id).state, 'confirmed');
+  assert.equal(f.store.history.find(next.id).state, 'confirmed');
+  assert.deepEqual(f.store.list(), []);
+  assert.deepEqual(fs.readdirSync(f.store.outgoing), []);
+  assert.equal(a.submissions, 2);
+});
+
+test('newer file history cannot hide older files that still need a receipt or draft review', async t => {
+  const f = fixture(t);
+  const { id } = await f.queue();
+  const original = f.store.read(id);
+  const unconfirmed = { ...original, state: 'unconfirmed', nativeAdmitted: true };
+  const draft = {
+    ...original,
+    id: digest('old file draft'),
+    state: 'cancelled',
+    nativeAdmitted: true,
+    nativeRecovery: { kind: 'draft', canRecover: true, recovered: false },
+  };
+  const reviewed = { ...unconfirmed, id: digest('old reviewed file'), nativeReviewed: true };
+  f.store.write(unconfirmed);
+  f.store.history.save(draft, false);
+  f.store.history.save(reviewed, false);
+  for (let index = 0; index < 131; index++) {
+    f.store.history.save(
+      {
+        ...original,
+        id: digest('finished file ' + index),
+        state: 'confirmed',
+        createdAt: original.createdAt + index + 1,
+      },
+      false,
+    );
+  }
+  f.store.history.save({ ...draft, id: digest('other account file draft'), accountScope: 'a'.repeat(64) }, false);
+  f.store.history.save({ ...draft, id: digest('old grant file draft'), rosterGrant: 'old-grant' }, false);
+  const { jobs } = new FileTransfers(f.root).conversationDeliveries(key);
+  assert.equal(jobs.length, 130);
+  assert.equal(jobs.filter(job => job.state === 'confirmed').length, 128);
+  assert.equal(jobs.find(job => job.id === id)?.state, 'unconfirmed');
+  assert.deepEqual(jobs.find(job => job.id === draft.id)?.recovery, draft.nativeRecovery);
+  assert.equal(
+    jobs.some(job => job.id === reviewed.id),
+    false,
+  );
 });
 
 test('absolute paths, workspace escapes, invalid names and oversize files are rejected', async t => {
@@ -389,7 +665,10 @@ function adapterFor(f, options = {}) {
     accountRef: 'b'.repeat(64),
     targetsSending: new Set(),
     async checkNative() {
-      return { account: 'wxid_fixture_account' };
+      return this.receiptAccount();
+    },
+    receiptAccount() {
+      return { account: 'wxid_fixture_account', accountRef: this.accountRef };
     },
     async lookupTarget() {
       return 'fixture@chatroom';
@@ -421,6 +700,7 @@ function adapterFor(f, options = {}) {
     const [row] = await adapter.messages();
     return {
       admitted: true,
+      operation: 'file',
       deliveryId,
       state: row ? 'confirmed' : 'unconfirmed',
       confirmed: !!row,
@@ -428,14 +708,14 @@ function adapterFor(f, options = {}) {
       ...(row
         ? {
             receipt: {
+              source: 'wechat-server-id',
               localId: row.localId,
               serverId: row.serverId,
               localType: row.localType,
               fileName: row.fileName,
               fileSize: row.fileSize,
-              sourceImageMd5: row.imageMd5 ?? row.stickerMd5,
-              sourceMd5Matched: !!row.imageMd5,
-              gifContentMd5Matched: !!row.stickerMd5,
+              fileMd5: row.fileMd5,
+              fileContentMd5Matched: Boolean(row.fileMd5),
             },
           }
         : {}),
@@ -472,13 +752,19 @@ test('uncertain submissions survive restart without resending and end at a bound
     created = await f.queue(),
     job = f.store.read(created.id),
     a = adapterFor(f, { error: 'NETWORK_LOST', noReceipt: true });
-  job.deadlineAt = Date.now() + 80;
+  const started = Date.now();
+  job.deadlineAt = started + 1000;
   f.store.write(job);
-  const worker = new FileDeliveryWorker(a.adapter);
+  const worker = new FileDeliveryWorker(a.adapter, { now: () => started });
   await worker.run(job);
   assert.equal(a.submissions, 1);
+  const pending = f.store.read(job.id);
+  assert.equal(pending.state, 'submitted');
+  assert.equal(pending.dispatchPending, true);
+  const restarted = new FileDeliveryWorker(a.adapter, { now: () => job.deadlineAt + 1 });
+  await restarted.run(pending);
   assert.equal(f.store.read(job.id).state, 'unconfirmed');
-  await worker.run(f.store.read(job.id));
+  await restarted.run(f.store.read(job.id));
   assert.equal(a.submissions, 1);
 });
 test('late confirmed file receipt updates the assistant record without dispatching the file again', async t => {
@@ -491,7 +777,7 @@ test('late confirmed file receipt updates the assistant record without dispatchi
   assert.equal(f.store.read(id).state, 'unconfirmed');
   assert.deepEqual(fs.readdirSync(f.store.outgoing), []);
   assert.deepEqual(
-    f.store.history.due(Date.now()).map(job => job.id),
+    f.store.history.due(f.store.account(), Date.now()).map(job => job.id),
     [id],
   );
   settings.noReceipt = false;
@@ -505,25 +791,323 @@ test('late confirmed file receipt updates the assistant record without dispatchi
   assert.equal(f.store.read(id).state, 'confirmed');
   assert.equal(a.submissions, 1);
 });
-test('revoking a grant during receipt lookup prevents a late confirmation from crossing it', async t => {
-  const f = fixture(t),
-    { id } = await f.queue();
-  const options = { noReceipt: true },
-    { adapter } = adapterFor(f, options);
-  const worker = new FileDeliveryWorker(adapter);
-  await worker.run(f.store.read(id));
-  options.noReceipt = false;
-  const lookup = adapter.desktopSender.request;
-  adapter.desktopSender.request = async (...args) => {
-    const result = await lookup(...args);
-    f.config.wechat.rosterGrants = { [key]: crypto.randomUUID() };
+for (const archiveFirst of [false, true]) {
+  test('an archived file lookup and the next file can run in the same chat, archiveFirst=' + archiveFirst, async t => {
+    const f = fixture(t);
+    const old = await f.queue();
+    const options = { noReceipt: true };
+    const a = adapterFor(f, options);
+    const worker = new FileDeliveryWorker(a.adapter);
+    await worker.run(f.store.read(old.id));
+    assert.equal(f.store.read(old.id).state, 'unconfirmed');
+    options.noReceipt = false;
+    const read = a.adapter.messages.bind(a.adapter);
+    a.adapter.messages = async () =>
+      (await read()).map(row => ({ ...row, localId: 8 + a.submissions, serverId: String(900 + a.submissions) }));
+
+    const held = Promise.withResolvers();
+    const lookup = a.adapter.desktopSender.request;
+    let checking = false;
+    a.adapter.desktopSender.request = async (operation, scope) => {
+      const result = await lookup(operation, scope);
+      if (scope.deliveryId === old.id) {
+        assert.equal(operation, 'lookup');
+        assert.equal(scope.observeOnly, true);
+        assert.equal(scope.rosterGrant, 'legacy');
+        checking = true;
+        await held.promise;
+      }
+      return result;
+    };
+    const wait = async condition => {
+      for (let n = 0; n < 150 && !condition(); n++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert(condition(), 'file scheduler did not advance');
+    };
+    try {
+      if (archiveFirst) {
+        worker.tick();
+        await wait(() => checking);
+      }
+      f.config.wechat.rosterGrants = { [key]: crypto.randomUUID() };
+      f.save();
+      const next = await f.queue({ batchId: 'd'.repeat(64) });
+      worker.tick();
+
+      await wait(() => checking && f.store.read(next.id).state === 'confirmed');
+      assert.equal(f.store.read(old.id).state, 'unconfirmed');
+      assert.equal(f.store.read(next.id).receipt.serverId, '902');
+      assert.equal(a.submissions, 2);
+    } finally {
+      held.resolve();
+      await wait(() => worker.running.size === 0);
+    }
+    assert.equal(f.store.read(old.id).state, 'confirmed');
+    assert.equal(f.store.read(old.id).receipt.serverId, '901');
+    assert.equal(a.submissions, 2);
+  });
+}
+
+for (const boundary of ['selected account', 'roster grant', 'sender permission']) {
+  test('a paused file outside the current sending scope cannot hold the chat queue, ' + boundary, async t => {
+    const f = fixture(t);
+    const account = 'b'.repeat(64);
+    const previousAccount = boundary === 'selected account' ? 'a'.repeat(64) : account;
+    const marker = path.join(f.root, 'state/weflow/active-account.json');
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, JSON.stringify({ id: previousAccount }));
+    const old = await f.queue();
+    f.store.controlDelivery({ id: old.id, key, account: previousAccount, revision: 0, operation: 'pause' });
+    const checkpoint = f.store.read(old.id);
+
+    let nextSender = sender;
+    if (boundary === 'selected account') fs.writeFileSync(marker, JSON.stringify({ id: account }));
+    if (boundary === 'roster grant') f.config.wechat.rosterGrants = { [key]: crypto.randomUUID() };
+    if (boundary === 'sender permission') {
+      nextSender = 'wxid_next_admin';
+      f.config.wechat.assistant.administrators = [nextSender];
+    }
     f.save();
-    return result;
+    const next = await f.queue({ batchId: 'd'.repeat(64), sender: nextSender });
+    const a = adapterFor(f);
+    const restarted = new FileDeliveryWorker(a.adapter);
+    const run = t.mock.method(restarted, 'run');
+    restarted.tick();
+    await Promise.all(run.mock.calls.map(call => call.result));
+
+    assert.deepEqual(
+      run.mock.calls.map(call => call.arguments[0].id),
+      [next.id],
+    );
+    assert.equal(f.store.read(next.id).state, 'confirmed');
+    assert.deepEqual(f.store.read(old.id), checkpoint);
+    assert.equal(a.submissions, 1);
+  });
+}
+
+test('a file lookup interrupted by an account switch can save progress again when the saved account returns', async t => {
+  const f = fixture(t);
+  const account = 'b'.repeat(64);
+  const marker = path.join(f.root, 'state/weflow/active-account.json');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, JSON.stringify({ id: account }));
+  const { id } = await f.queue();
+  const a = adapterFor(f);
+  const saved = {
+    ...f.store.read(id),
+    ...a.adapter.receiptAccount(),
+    nativeState: 'paused',
+    nativeAdmitted: true,
   };
-  await worker.run(f.store.read(id));
-  assert.equal(f.store.read(id).state, 'unconfirmed');
-  assert.equal(adapter.status.confirmed_sends, 0);
+  f.store.write(saved);
+  const result = {
+    deliveryId: id,
+    operation: 'file',
+    admitted: true,
+    state: 'cancelled',
+    submission: 'not-started',
+    inputStarted: false,
+  };
+  const seen = Promise.withResolvers();
+  const pending = Promise.withResolvers();
+  const lookup = t.mock.method(a.adapter.desktopSender, 'request', (operation, scope) => {
+    assert.equal(operation, 'lookup');
+    assert.equal(scope.accountRef, account);
+    assert.equal(scope.deliveryId, id);
+    seen.resolve();
+    return pending.promise;
+  });
+  const worker = new FileDeliveryWorker(a.adapter);
+  const checkpoint = structuredClone(saved);
+  const finished = worker.run(saved);
+  try {
+    await Promise.race([seen.promise, finished]);
+    assert.equal(lookup.mock.callCount(), 1);
+    fs.writeFileSync(marker, JSON.stringify({ id: 'e'.repeat(64) }));
+  } finally {
+    pending.resolve(result);
+    await finished;
+  }
+
+  assert.deepEqual(f.store.read(id), checkpoint);
+  fs.writeFileSync(marker, JSON.stringify({ id: account }));
+  await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
+  assert.equal(f.store.read(id).state, 'cancelled');
+  assert.equal(lookup.mock.callCount(), 2);
+  assert.equal(a.submissions, 0);
 });
+
+test('files that expire in another account release staging without discarding the original receipt scope', async t => {
+  const f = fixture(t);
+  const account = 'a'.repeat(64);
+  const marker = path.join(f.root, 'state/weflow/active-account.json');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, JSON.stringify({ id: account }));
+  const queued = await f.queue();
+  const attempted = await f.queue({ batchId: 'c'.repeat(64) });
+  const now = Date.now();
+  const age = { createdAt: now - 121000, deadlineAt: now - 1000 };
+  f.store.write({ ...f.store.read(queued.id), ...age, queuePaused: true });
+  f.store.write({
+    ...f.store.read(attempted.id),
+    ...age,
+    account: 'wxid_fixture_account',
+    accountRef: account,
+    state: 'submitted',
+    nativeAdmitted: true,
+    dispatchPending: true,
+  });
+
+  const selected = 'b'.repeat(64);
+  fs.writeFileSync(marker, JSON.stringify({ id: selected }));
+  const write = f.store.write.bind(f.store);
+  const locked = t.mock.method(f.store, 'write', job => {
+    if (job.id === queued.id) throw Object.assign(Error('checkpoint in use'), { code: 'EBUSY' });
+    return write(job);
+  });
+  let next;
+  try {
+    next = await f.queue({ batchId: 'd'.repeat(64) });
+    assert.equal(f.store.read(queued.id).state, 'queued');
+    assert.equal(f.store.read(attempted.id).state, 'unconfirmed');
+  } finally {
+    locked.mock.restore();
+  }
+  assert.deepEqual(
+    f.store.list().map(job => job.id),
+    [next.id],
+  );
+  assert.equal(f.store.read(queued.id).state, 'expired');
+  const unresolved = f.store.read(attempted.id);
+  assert.equal(unresolved.state, 'unconfirmed');
+  assert.equal(unresolved.accountRef, account);
+  assert.equal(unresolved.dispatchPending, true);
+  assert.equal(fs.existsSync(path.join(f.store.outgoing, queued.id)), false);
+  assert.equal(fs.existsSync(path.join(f.store.outgoing, attempted.id)), false);
+  assert.deepEqual(f.store.history.due(selected, now), []);
+  assert.deepEqual(
+    f.store.history.due(account, now).map(job => job.id),
+    [attempted.id],
+  );
+});
+
+test('archived receipts from another account cannot use the active file worker slots', async t => {
+  const f = fixture(t);
+  const account = 'b'.repeat(64);
+  const oldAccount = 'a'.repeat(64);
+  const marker = path.join(f.root, 'state/weflow/active-account.json');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, JSON.stringify({ id: account }));
+  const { id } = await f.queue();
+  const settings = { noReceipt: true };
+  const a = adapterFor(f, settings);
+  const worker = new FileDeliveryWorker(a.adapter);
+  await worker.run(f.store.read(id));
+  const current = f.store.read(id);
+  assert.equal(current.state, 'unconfirmed');
+  assert.equal(current.accountScope, account);
+  for (let index = 0; index < 18; index++) {
+    f.store.history.save(
+      {
+        ...current,
+        id: digest('older account file ' + index),
+        accountScope: oldAccount,
+        accountRef: oldAccount,
+        key: index === 0 ? current.key : 'wechat:private:previous-' + index,
+        createdAt: current.createdAt - 60_000 + index,
+      },
+      true,
+    );
+  }
+  settings.noReceipt = false;
+  const lookup = a.adapter.desktopSender.request;
+  const lookups = [];
+  a.adapter.desktopSender.request = async (operation, scope) => {
+    lookups.push(scope.deliveryId);
+    assert.equal(scope.accountRef, account);
+    assert.equal(scope.observeOnly, true);
+    return lookup(operation, scope);
+  };
+  worker.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(lookups, [id]);
+  assert.equal(f.store.read(id).state, 'confirmed');
+  assert.equal(f.store.history.due(oldAccount, Date.now())[0].id, digest('older account file 0'));
+  assert.equal(a.submissions, 1);
+});
+
+for (const switchAccount of [false, true])
+  test('an existing file can acquire a receipt only in its own account, switchAccount=' + switchAccount, async t => {
+    const f = fixture(t),
+      { id } = await f.queue();
+    const options = { noReceipt: true },
+      a = adapterFor(f, options);
+    const worker = new FileDeliveryWorker(a.adapter);
+    await worker.run(f.store.read(id));
+    options.noReceipt = false;
+    const lookup = a.adapter.desktopSender.request;
+    a.adapter.desktopSender.request = async (op, scope) => {
+      assert.equal(op, 'lookup');
+      assert.equal(scope.observeOnly, true);
+      const result = await lookup(op, scope);
+      f.config.wechat.rosterGrants = { [key]: crypto.randomUUID() };
+      f.save();
+      if (switchAccount) {
+        const marker = path.join(f.root, 'state/weflow/active-account.json');
+        fs.mkdirSync(path.dirname(marker), { recursive: true });
+        fs.writeFileSync(marker, JSON.stringify({ id: 'e'.repeat(64) }));
+      }
+      return result;
+    };
+    await worker.run(f.store.read(id));
+    assert.equal(f.store.read(id).state, switchAccount ? 'unconfirmed' : 'confirmed');
+    assert.equal(a.adapter.status.confirmed_sends, Number(!switchAccount));
+    assert.equal(a.submissions, 1);
+    assert.deepEqual(f.store.conversationDeliveries(key).jobs, []);
+  });
+
+for (const exit of ['before input', 'uncertain input', 'account changed']) {
+  test('an archived file only settles a native refusal with proof in the saved account, ' + exit, async t => {
+    const f = fixture(t);
+    const { id } = await f.queue();
+    const a = adapterFor(f, { noReceipt: true });
+    await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
+    assert.equal(f.store.read(id).state, 'unconfirmed');
+    f.config.wechat.assistant.fileTransferChats[key] = false;
+    f.save();
+
+    let lookups = 0;
+    a.adapter.desktopSender.request = async (operation, scope) => {
+      lookups++;
+      assert.equal(operation, 'lookup');
+      assert.equal(scope.observeOnly, true);
+      assert.equal(scope.deliveryId, id);
+      if (exit === 'account changed') {
+        const marker = path.join(f.root, 'state/weflow/active-account.json');
+        fs.mkdirSync(path.dirname(marker), { recursive: true });
+        fs.writeFileSync(marker, JSON.stringify({ id: 'e'.repeat(64) }));
+      }
+      return {
+        admitted: true,
+        operation: 'file',
+        deliveryId: id,
+        state: 'cancelled',
+        submission: 'not-started',
+        inputStarted: exit === 'uncertain input',
+        reason: 'DESKTOP_PERMISSION_CHANGED',
+      };
+    };
+    await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
+
+    const settled = exit === 'before input';
+    assert.equal(f.store.read(id).state, settled ? 'cancelled' : 'unconfirmed');
+    assert.deepEqual(
+      f.store.history.due('legacy', Date.now()).map(job => job.id),
+      settled ? [] : [id],
+    );
+    assert.equal(lookups, 1);
+    assert.equal(a.submissions, 1);
+  });
+}
 
 test('revoking file access before submission cancels only that file job', async t => {
   const f = fixture(t),
@@ -546,7 +1130,14 @@ test('a file intent saved before desktop admission resumes exactly once after re
   a.adapter.dispatchDesktop = async (_operation, body) => {
     count++;
     if (count === 1) throw Error('interrupted before admission');
-    admitted = { admitted: true, deliveryId: body.deliveryId, state: 'waiting', pending: true, submitted: false };
+    admitted = {
+      admitted: true,
+      operation: 'file',
+      deliveryId: body.deliveryId,
+      state: 'waiting',
+      pending: true,
+      submitted: false,
+    };
     return { ret: 0, ...admitted };
   };
   a.adapter.desktopSender.request = async operation => {
@@ -568,6 +1159,7 @@ test('worker ticks survive Reader outages before admission and while tracking a 
   const scope = { accountRef: adapter.accountRef, rosterGrant: f.store.read(id).rosterGrant };
   let available = true,
     resolvable = true,
+    receiptsAvailable = true,
     attempts = 0,
     admitted = null;
   const check = adapter.checkNative.bind(adapter),
@@ -585,13 +1177,21 @@ test('worker ticks survive Reader outages before admission and while tracking a 
     assert.equal(body.deliveryId, id);
     attempts++;
     if (attempts === 1) throw Error('interrupted before admission');
-    return (admitted = { admitted: true, deliveryId: id, state: 'waiting', pending: true, submitted: false });
+    return (admitted = {
+      admitted: true,
+      operation: 'file',
+      deliveryId: id,
+      state: 'waiting',
+      pending: true,
+      submitted: false,
+    });
   };
   adapter.desktopSender.request = async (operation, query) => {
     assert.equal(operation, 'lookup');
     assert.equal(query.deliveryId, id);
     assert.equal(query.accountRef, scope.accountRef);
     assert.equal(query.rosterGrant, scope.rosterGrant);
+    if (!receiptsAvailable) throw Error('READER_CONNECTION_RESET');
     return admitted;
   };
   let worker = new FileDeliveryWorker(adapter);
@@ -614,16 +1214,26 @@ test('worker ticks survive Reader outages before admission and while tracking a 
   adapter.status.paused = false;
   assert.equal((await tick()).nativeState, 'waiting');
   resolvable = false;
+  assert.equal((await tick()).error, undefined);
+  receiptsAvailable = false;
   assert.equal((await tick()).error, 'READER_CONNECTION_RESET');
   assert.equal(attempts, 2);
-  resolvable = true;
+  receiptsAvailable = true;
   adapter.status.paused = true;
   adapter.status.file_send = false;
   admitted = {
     ...admitted,
     state: 'confirmed',
     confirmed: true,
-    receipt: { localId: 5, serverId: '999', fileName: '报告.txt', fileSize: 10 },
+    receipt: {
+      source: 'wechat-server-id',
+      localId: 5,
+      serverId: '999',
+      fileName: '报告.txt',
+      fileSize: 10,
+      fileMd5: f.store.read(id).md5,
+      fileContentMd5Matched: true,
+    },
   };
   assert.equal((await tick()).state, 'confirmed');
   assert.equal((await tick()).receipt.serverId, '999');
@@ -634,7 +1244,7 @@ test('a missing admitted task or an invalid receipt is observed until deadline w
   const f = fixture(t),
     { id } = await f.queue(),
     { adapter } = adapterFor(f);
-  let mapping = { admitted: true, deliveryId: id, state: 'submitted', submitted: true };
+  let mapping = { admitted: true, operation: 'file', deliveryId: id, state: 'submitted', submitted: true };
   let sends = 0;
   adapter.dispatchDesktop = async () => {
     sends++;
@@ -666,6 +1276,102 @@ test('a missing admitted task or an invalid receipt is observed until deadline w
   assert.equal(sends, 1);
 });
 
+test('a unique file without MD5 completes and keeps its server receipt after restart', async t => {
+  const f = fixture(t),
+    { id } = await f.queue(),
+    { adapter } = adapterFor(f);
+  let sends = 0;
+  adapter.dispatchDesktop = async () => {
+    sends++;
+    return {
+      admitted: true,
+      operation: 'file',
+      deliveryId: id,
+      state: 'confirmed',
+      confirmed: true,
+      receipt: {
+        source: 'wechat-server-id',
+        localId: '9',
+        serverId: '901',
+        fileName: '报告.txt',
+        fileSize: 10,
+        fileContentMd5Matched: false,
+      },
+    };
+  };
+  await new FileDeliveryWorker(adapter).run(f.store.read(id));
+  const job = f.store.read(id);
+  assert.equal(job.state, 'confirmed');
+  assert.equal(job.receipt.fileContentMd5Matched, false);
+  assert.equal(job.error, undefined);
+  assert.match(f.store.status(id, key, sender).notice, /内容摘要未核实/);
+  assert.equal(f.store.conversationDeliveries(key).jobs[0].receipt.serverId, '901');
+  assert.deepEqual(f.store.history.due(f.store.account(), Date.now() + 60_000), []);
+  adapter.desktopSender.request = async () => assert.fail('finished deliveries must not query again');
+  await new FileDeliveryWorker(adapter).run(job);
+  assert.equal(sends, 1);
+  assert.deepEqual(f.store.read(id).receipt, job.receipt);
+});
+
+test('a paused file holds later work in its chat while other chats and read-only receipts advance', async () => {
+  const worker = new FileDeliveryWorker({ directory: '.' }, { now: () => 100 });
+  const head = { id: 'head', key: 'chat', state: 'queued', createdAt: 1, deadlineAt: 200, queuePaused: true };
+  const next = { ...head, id: 'next', createdAt: 2, queuePaused: false };
+  const other = { ...next, id: 'other', key: 'other-chat' };
+  const late = { ...next, id: 'late', state: 'unconfirmed', nativeAdmitted: true };
+  const ran = [];
+  let due = true;
+  worker.store = {
+    list: () => [next, other, head],
+    account: () => 'legacy',
+    allowedJob: () => true,
+    history: {
+      due: () => (due ? [late] : []),
+      defer() {
+        due = false;
+      },
+    },
+  };
+  worker.run = async job => ran.push(job.id);
+  worker.tick();
+  assert.deepEqual(ran, ['other', 'late']);
+  await new Promise(resolve => setImmediate(resolve));
+  head.queuePaused = false;
+  worker.tick();
+  assert.deepEqual(ran.slice(2).sort(), ['head', 'other']);
+});
+
+for (const hasActiveHead of [false, true]) {
+  test('an archived file backlog leaves other chats visible, active head=' + hasActiveHead, async t => {
+    const f = fixture(t);
+    const { id } = await f.queue();
+    const head = f.store.read(id);
+    if (!hasActiveHead)
+      f.store.controlDelivery({ id, key, account: f.store.account(), revision: 0, operation: 'cancel' });
+    const archive = (chat, index) => {
+      const archived = {
+        ...head,
+        id: digest('archived-' + index),
+        key: chat,
+        state: 'unconfirmed',
+        nativeAdmitted: true,
+        createdAt: head.createdAt - 60000 + index,
+      };
+      f.store.history.save(archived, true);
+      return archived.id;
+    };
+    const backlog = Array.from({ length: 17 }, (_, index) => archive(key, index));
+    const other = archive('wechat:group:789@chatroom', 17);
+    const runs = [];
+    const worker = new FileDeliveryWorker({ directory: f.root });
+    worker.run = async job => runs.push(job.id);
+    worker.tick();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(runs, hasActiveHead ? [id, backlog[0], other] : [backlog[0], other]);
+  });
+}
+
 test('native waiting and paused checkpoints survive file worker restarts without resubmitting', async t => {
   const f = fixture(t),
     { id } = await f.queue(),
@@ -674,6 +1380,7 @@ test('native waiting and paused checkpoints survive file worker restarts without
     queries = 0;
   const mapping = state => ({
     admitted: true,
+    operation: 'file',
     deliveryId: id,
     state,
     pending: true,
@@ -703,7 +1410,15 @@ test('native waiting and paused checkpoints survive file worker restarts without
     ...mapping('confirmed'),
     confirmed: true,
     pending: false,
-    receipt: { localId: '9', serverId: '901', fileName: '报告.txt', fileSize: 10 },
+    receipt: {
+      source: 'wechat-server-id',
+      localId: '9',
+      serverId: '901',
+      fileName: '报告.txt',
+      fileSize: 10,
+      fileMd5: f.store.read(id).md5,
+      fileContentMd5Matched: true,
+    },
   });
   await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
   assert.equal(f.store.read(id).state, 'confirmed');
@@ -717,7 +1432,15 @@ test('revoking a grant after admission leaves the last observed checkpoint uncon
   let submissions = 0;
   a.adapter.dispatchDesktop = async () => {
     submissions++;
-    return { ret: 0, admitted: true, deliveryId: id, state: 'waiting', submitted: false, submission: 'not-started' };
+    return {
+      ret: 0,
+      admitted: true,
+      operation: 'file',
+      deliveryId: id,
+      state: 'waiting',
+      submitted: false,
+      submission: 'not-started',
+    };
   };
   await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
   f.config.wechat.assistant.fileTransferChats[key] = false;
@@ -859,20 +1582,164 @@ test('file worker circles back to waiting chats after servicing the others', asy
     createdAt: index,
   }));
   const calls = [];
-  const worker = Object.assign(Object.create(FileDeliveryWorker.prototype), {
-    running: new Set(),
-    targets: new Set(),
-    now: () => 100,
-    store: { list: () => [...jobs], history: { due: () => [] } },
-    run: async job => {
-      calls.push(job.id);
-    },
-  });
+  const worker = new FileDeliveryWorker({ directory: '.' }, { now: () => 100 });
+  worker.store = { list: () => [...jobs], account: () => 'legacy', history: { due: () => [] } };
+  worker.run = async job => {
+    calls.push(job.id);
+  };
   for (let i = 0; i < 3; i++) {
     worker.tick();
     await new Promise(resolve => setImmediate(resolve));
   }
   assert.deepEqual(calls, ['first', 'second', 'third', 'first', 'second', 'third']);
+});
+
+test('file intents awaiting admission do not take the slots for admitted or archived receipts', async () => {
+  const [first, second, admitted, archived] = ['first', 'second', 'admitted', 'archived'].map((id, createdAt) => ({
+    id,
+    key: 'wechat:private:' + id,
+    createdAt,
+    nativeAdmitted: true,
+  }));
+  first.dispatchPending = second.dispatchPending = archived.dispatchPending = true;
+  archived.state = 'unconfirmed';
+  const worker = new FileDeliveryWorker({ directory: '.' }, { now: () => 100 });
+  const checked = [];
+  const deferred = [];
+  const gate = Promise.withResolvers();
+  worker.store = {
+    list: () => [first, second, admitted],
+    account: () => 'legacy',
+    history: { due: () => [archived], defer: id => deferred.push(id) },
+  };
+  worker.run = async job => {
+    if (job === first || job === second) await gate.promise;
+    else checked.push(job.id);
+  };
+  try {
+    worker.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(checked, ['admitted', 'archived']);
+    assert.deepEqual(deferred, ['archived']);
+    assert.deepEqual([...worker.running], ['first', 'second']);
+  } finally {
+    gate.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+});
+
+test('a slow archive check preserves both slots for current file receipts', async t => {
+  const archived = { id: 'saved', key: 'wechat:private:first', state: 'unconfirmed', nativeAdmitted: true };
+  const active = ['first', 'second'].map((id, createdAt) => ({
+    id,
+    key: 'wechat:private:' + id,
+    nativeAdmitted: true,
+    createdAt,
+  }));
+  const hold = Promise.withResolvers();
+  const finishArchive = Promise.withResolvers();
+  let current = [];
+  let archives = [archived];
+  const calls = [];
+  const worker = new FileDeliveryWorker({ directory: '.' }, { now: () => 100 });
+  worker.store = {
+    list: () => current,
+    account: () => 'legacy',
+    history: { due: () => archives, defer() {} },
+  };
+  worker.run = async job => {
+    calls.push(job.id);
+    await (job === archived ? finishArchive.promise : hold.promise);
+  };
+  try {
+    worker.tick();
+    assert.deepEqual(calls, ['saved']);
+    current = active;
+    worker.tick();
+    assert.deepEqual(calls, ['saved', 'first', 'second']);
+    assert.equal(worker.receiptChecks.size, 2);
+
+    archives = [];
+    finishArchive.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    current = [{ id: 'replacement', key: active[0].key, createdAt: 2 }];
+    worker.tick();
+    assert.deepEqual(calls, ['saved', 'first', 'second']);
+  } finally {
+    finishArchive.resolve();
+    hold.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+});
+
+test('a timed-out archived file lookup leaves the receipt pending and frees its slot', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = {
+    id: 'saved',
+    key: 'wechat:private:peer',
+    account: 'fixture-account',
+    accountRef: 'a'.repeat(64),
+    accountScope: 'legacy',
+    state: 'unconfirmed',
+    nativeAdmitted: true,
+  };
+  const started = Promise.withResolvers();
+  const receipt = Promise.withResolvers();
+  const waits = [];
+  let confirmations = 0;
+  const worker = new FileDeliveryWorker({
+    directory: '.',
+    accountRef: saved.accountRef,
+    desktopSender: {
+      request(operation, scope) {
+        assert.equal(operation, 'lookup');
+        assert.equal(scope.observeOnly, true);
+        started.resolve();
+        return receipt.promise;
+      },
+    },
+  });
+  worker.store = { list: () => [], account: () => 'legacy', history: { due: () => [saved], defer() {} } };
+  worker.recordWait = (_job, code) => waits.push(code);
+  worker.applyNative = () => {
+    confirmations++;
+  };
+  worker.tick();
+  await started.promise;
+  assert.equal(worker.archiveChecks.size, 1);
+  t.mock.timers.tick(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(worker.archiveChecks.size, 0);
+  assert.deepEqual(waits, ['FILE_RECEIPT_TIMEOUT']);
+  assert.equal(saved.state, 'unconfirmed');
+  receipt.resolve({ admitted: true, confirmed: true, state: 'confirmed' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(confirmations, 0);
+});
+
+test('new file admissions do not reset the rotation of pending receipts', async () => {
+  const receipts = ['a', 'b', 'c', 'd'].map((id, createdAt) => ({
+    id,
+    key: 'wechat:private:' + id,
+    createdAt,
+    nativeAdmitted: true,
+  }));
+  const admitted = [];
+  const checked = [];
+  let nextFile;
+  const worker = new FileDeliveryWorker({ directory: '.' }, { now: () => 100 });
+  worker.store = { list: () => [...receipts, nextFile], account: () => 'legacy', history: { due: () => [] } };
+  worker.run = async job => {
+    (job.nativeAdmitted ? checked : admitted).push(job.id);
+  };
+  for (const id of ['new-1', 'new-2', 'new-3']) {
+    nextFile = { id, key: 'wechat:private:' + id, createdAt: 10 };
+    worker.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(worker.running.size, 0);
+  }
+  assert.deepEqual(admitted, ['new-1', 'new-2', 'new-3']);
+  assert.deepEqual(checked, ['a', 'b', 'c', 'd', 'a', 'b']);
 });
 
 test('the DSH file tool accepts the verified foreground sender capability', async t => {

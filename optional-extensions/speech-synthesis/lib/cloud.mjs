@@ -52,9 +52,11 @@ const parse = bytes => {
     return undefined;
   }
 };
-const transcriptOf = text => {
-  const value = typeof text === 'string' ? text.trim() : '';
-  if (!value || value.length > 4000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(value)) throw fault('VOICE_TTS_TRANSCRIPT');
+const transcriptOf = (text, allowEmpty) => {
+  if (typeof text !== 'string') throw fault('VOICE_TTS_TRANSCRIPT');
+  const value = text.trim();
+  if ((!allowEmpty && !value) || value.length > 4000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(value))
+    throw fault('VOICE_TTS_TRANSCRIPT');
   return value;
 };
 // Recognition input: 16 kHz mono 16-bit PCM, at most 60 seconds.
@@ -222,7 +224,7 @@ async function tencentTranscribe(service, settings, wav, options) {
     settings,
     options,
   );
-  return transcriptOf(result.Result);
+  return transcriptOf(result.Result, options.allowEmpty);
 }
 
 // ---- ElevenLabs ----
@@ -267,7 +269,7 @@ async function elevenTranscribe(service, settings, wav, options) {
   );
   const json = parse(bytes);
   if (!response.ok) throw elevenError(json, failed);
-  return transcriptOf(json?.text);
+  return transcriptOf(json?.text, options.allowEmpty);
 }
 
 async function elevenLists(service, settings, options) {
@@ -352,7 +354,7 @@ async function azureTranscribe(service, settings, wav, options) {
   const json = parse(bytes);
   if (!response.ok) throw fault(failed('VOICE_TTS_HTTP'));
   if (json?.RecognitionStatus !== 'Success') throw fault('VOICE_TTS_TRANSCRIPT', json?.RecognitionStatus);
-  return transcriptOf(json.DisplayText);
+  return transcriptOf(json.DisplayText, options.allowEmpty);
 }
 
 async function azureLists(service, settings, options) {
@@ -489,7 +491,12 @@ async function googleTranscribe(service, settings, wav, options) {
   );
   const json = parse(bytes);
   if (!response.ok) throw googleError(json, failed);
-  return transcriptOf((json?.results ?? []).map(row => row?.alternatives?.[0]?.transcript ?? '').join(''));
+  const results = json?.results ?? [];
+  if (!json || typeof json !== 'object' || Array.isArray(json) || json.error || !Array.isArray(results))
+    throw fault('VOICE_TTS_TRANSCRIPT');
+  const parts = results.map(row => row?.alternatives?.[0]?.transcript);
+  if (parts.some(part => typeof part !== 'string')) throw fault('VOICE_TTS_TRANSCRIPT');
+  return transcriptOf(parts.join(''), options.allowEmpty);
 }
 
 async function googleLists(service, settings, options) {

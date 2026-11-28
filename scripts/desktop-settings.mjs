@@ -11,6 +11,7 @@ const fail = code => {
   throw Object.assign(new Error(code), { code });
 };
 const safePath = value => typeof value === 'string' && value.length <= 1024 && !/[\0\r\n"]/u.test(value);
+const endpointId = value => typeof value === 'string' && value.length > 0 && safePath(value);
 
 /** One desktop sender; OCR and UIA are locator strategies, not extra backends. */
 export function desktopSettings(config, root, { requireClient = true } = {}) {
@@ -54,6 +55,16 @@ export function desktopSettings(config, root, { requireClient = true } = {}) {
     values[key] = input[key] === true;
   }
   if (values.offscreen && controlMode !== 'uia') fail('DESKTOP_OFFSCREEN_REQUIRES_UIA');
+  const voiceCable = input.voiceCable;
+  if (
+    voiceCable !== undefined &&
+    (!voiceCable ||
+      Object.keys(voiceCable).length !== 2 ||
+      !endpointId(voiceCable.renderId) ||
+      !endpointId(voiceCable.captureId) ||
+      voiceCable.renderId === voiceCable.captureId)
+  )
+    fail('DESKTOP_CABLE_BINDING_INVALID');
   return {
     ...values,
     executable: executable ? path.resolve(root, executable) : '',
@@ -61,6 +72,7 @@ export function desktopSettings(config, root, { requireClient = true } = {}) {
     expectedVersion,
     controlMode,
     sendKey,
+    ...(voiceCable ? { voiceCable } : {}),
   };
 }
 

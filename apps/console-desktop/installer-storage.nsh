@@ -16,7 +16,7 @@ Var WcaMigrate
 
 !macro customInit
   ReadRegStr $WcaPreviousProgram HKCU "${INSTALL_REGISTRY_KEY}" "InstallLocation"
-  ReadRegStr $WcaDataHome HKCU "Software\WeChatAgent" "DataHome"
+  ReadRegStr $WcaDataHome HKCU "${INSTALL_REGISTRY_KEY}" "DataHome"
   ReadINIStr $1 "$WcaPreviousProgram\storage.ini" "Storage" "dataHome"
   ${If} $1 != ""
     StrCpy $WcaDataHome $1
@@ -27,7 +27,7 @@ Var WcaMigrate
   ${EndIf}
   StrCpy $WcaMigrationSource $WcaDataHome
   ${If} $WcaMigrationSource == ""
-    StrCpy $WcaMigrationSource "$APPDATA\WeChatAgent"
+    StrCpy $WcaMigrationSource "$APPDATA\${PRODUCT_NAME}"
   ${EndIf}
   ${IfNot} ${FileExists} "$WcaMigrationSource\workspace\config\wechatagent.json"
     ReadINIStr $1 "$INSTDIR\storage.ini" "Storage" "migrationSource"
@@ -37,7 +37,7 @@ Var WcaMigrate
     ${If} $1 != ""
       StrCpy $WcaMigrationSource $1
     ${Else}
-      StrCpy $WcaMigrationSource "$APPDATA\WeChatAgent"
+      StrCpy $WcaMigrationSource "$APPDATA\${PRODUCT_NAME}"
     ${EndIf}
   ${EndIf}
   # Refuse a legacy layout whose own uninstaller would delete the source.
@@ -147,6 +147,18 @@ Function WcaPrepareStorage
     Return
   ${EndIf}
   Call WcaSelectStoragePaths
+  ${If} ${FileExists} "$WcaProgram\WeChatAgent.exe"
+  ${OrIf} ${FileExists} "$WcaProgram\${PRODUCT_FILENAME}.exe"
+  ${AndIf} $WcaProgram != $WcaPreviousProgram
+    StrCpy $WcaStorageError "所选目录已有另一个 WeChatAgent 程序，请选择独立的安装根目录。"
+    Return
+  ${EndIf}
+  ${If} ${FileExists} "$WcaRoot\WeChatAgent.exe"
+  ${OrIf} ${FileExists} "$WcaRoot\${PRODUCT_FILENAME}.exe"
+  ${AndIf} $WcaRoot != $WcaPreviousProgram
+    StrCpy $WcaStorageError "所选目录已有另一个 WeChatAgent 程序，请选择独立的安装根目录。"
+    Return
+  ${EndIf}
   ${GetRoot} "$WcaRoot" $0
   ${If} $WcaRoot == $0
   ${OrIf} $WcaRoot == "$0\"
@@ -248,6 +260,6 @@ FunctionEnd
     MessageBox MB_ICONSTOP "无法保存数据位置，安装未完成。原数据未删除。"
     Abort
   ${EndIf}
-  WriteRegStr HKCU "Software\WeChatAgent" "DataHome" "$WcaDataHome"
+  WriteRegStr HKCU "${INSTALL_REGISTRY_KEY}" "DataHome" "$WcaDataHome"
 !macroend
 !endif

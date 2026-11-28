@@ -9,6 +9,9 @@ import { fork } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ReplyDeliveryControls } from '../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
+import { reconcileAssistantReplay } from '../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
+import { HistoryStore } from '../packages/dsh-social-bridge-plugin/history-store.mjs';
+import { readVoiceAttempt } from '../packages/plugin-api/voice-status.mjs';
 
 const projectRoot = path.resolve(process.env.WECHATAGENT_ENTRY_TEST_ROOT ?? path.join(import.meta.dirname, '..'));
 const entry = path.join(projectRoot, 'components/qq-bridge/src/social-bridge.js');
@@ -38,6 +41,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
     async t => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechatagent-entry-'));
       selectPluginAccount(root);
+      const voiceGeneration = 'fixture-speech-settings';
       const requests = [],
         sent = [],
         intakeReceipts = [],
@@ -47,6 +51,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
         exited,
         logs = '',
         ready,
+        healthHold,
         uncertainNext = false;
       const configFile = path.join(root, 'config/wechatagent.json');
       const server = http.createServer(async (req, res) => {
@@ -55,7 +60,11 @@ if (process.argv[2] === '--bridge-entry-fixture') {
         const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : null;
         requests.push({ route: req.url, body });
         res.setHeader('Content-Type', 'application/json');
-        if (req.url === '/health')
+        if (req.url === '/health') {
+          if (healthHold) {
+            healthHold.seen = true;
+            await healthHold.promise;
+          }
           res.end(
             JSON.stringify({
               ok: true,
@@ -67,8 +76,15 @@ if (process.argv[2] === '--bridge-entry-fixture') {
               instanceStartedAt: Date.now(),
             }),
           );
-        else if (req.url === '/voice-input')
-          res.end(JSON.stringify({ ok: true, text: 'speech fixture transcript', plugin: 'speech-recognition' }));
+        } else if (req.url === '/voice-input')
+          res.end(
+            JSON.stringify({
+              ok: true,
+              text: 'speech fixture transcript',
+              plugin: 'speech-recognition',
+              generation: voiceGeneration,
+            }),
+          );
         else if (req.url === '/followup')
           res.end(JSON.stringify({ text: 'RESPOND: Fixture reply ' + requests.length }));
         else if (req.url === '/diary-question')
@@ -79,6 +95,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
         }
       });
       t.after(async () => {
+        healthHold?.resolve();
         ws?.close();
         if (child && child.exitCode === null && child.signalCode === null) {
           if (child.connected) child.send('stop');
@@ -366,6 +383,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
               enabled: true,
               permissions: ['audio_read'],
               chatScopes: { [fixturePluginAccount]: { [key]: 'legacy' } },
+              generation: voiceGeneration,
             },
           },
         }),
@@ -400,14 +418,18 @@ if (process.argv[2] === '--bridge-entry-fixture') {
       await until(() => intakeReceipts.includes(rawid) && sent.length === 9, 'transcribed recovered candidate');
       assert.equal(requests.filter(row => row.route === '/voice-input').length, 1);
       assert.match(turns().at(-1).body.message, /speech fixture transcript/);
+      assert.equal(readVoiceAttempt(root, asr, voiceGeneration)?.ok, true);
       const admin = 'fixture_admin',
         target = admin,
         adminKey = 'wechat:private:' + target;
+      const beforeAuthorization = Math.floor(Date.now() / 1000) - 180;
+      const previous = structuredClone(wechat);
       wechat.whitelist.private.push(String(target));
       wechat.workModes = { [adminKey]: 'assistant' };
       wechat.assistant = { administrators: [admin], replayOffline: true };
+      reconcileAssistantReplay(previous, wechat, beforeAuthorization * 1000);
       await save();
-      const emitAssistant = (digit, readerRole) => {
+      const emitAssistant = (digit, readerRole, timestamp = beforeAuthorization + 60) => {
         const id = digit.repeat(64);
         ws.send(
           JSON.stringify({
@@ -416,7 +438,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
             self_id: '999',
             user_id: target,
             sender: { user_id: target, nickname: 'Admin' },
-            time: Date.now() / 1000 - 120,
+            time: timestamp,
             message_id: id,
             message: [{ type: 'text', data: { text: 'fixture question' } }],
             wechatagent: {
@@ -437,6 +459,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
       };
       const before = turns().length;
       await emitAssistant('a', 'assistant-member');
+      await emitAssistant('d', 'assistant-admin', beforeAuthorization);
       assert.equal(turns().length, before);
       await emitAssistant('b', 'assistant-admin');
       await until(() => turns().length === before + 1, 'authorized recovered assistant request');
@@ -445,6 +468,96 @@ if (process.argv[2] === '--bridge-entry-fixture') {
       await save();
       await emitAssistant('c', 'assistant-admin');
       assert.equal(turns().length, before + 1);
+
+      const groupTarget = '789@chatroom';
+      const groupKey = 'wechat:group:' + groupTarget;
+      const accountTarget = '345';
+      const accountKey = 'wechat:private:' + accountTarget;
+      wechat.whitelist.groups.push(groupTarget);
+      wechat.whitelist.private.push(accountTarget);
+      await save();
+      const pauseIntake = async (kind, target, digit) => {
+        const hold = (healthHold = Promise.withResolvers());
+        const id = digit.repeat(64);
+        ws.send(
+          JSON.stringify({
+            post_type: 'message',
+            message_type: kind,
+            self_id: '999',
+            user_id: kind === 'private' ? target : 'fixture_member',
+            ...(kind === 'group' ? { group_id: target } : {}),
+            message_id: id,
+            time: Math.floor(Date.now() / 1000),
+            message: [{ type: 'text', data: { text: 'context fixture ' + digit } }],
+            wechatagent: {
+              contextOnly: true,
+              readerIntake: { version: 1, rawid: id, token: id, account: fixturePluginAccount, grant: 'legacy' },
+            },
+          }),
+        );
+        await until(
+          () => hold.seen && logs.includes('[WeChat] accepted wechat:' + kind + ':' + target),
+          'paused intake',
+        );
+        return () => {
+          healthHold = undefined;
+          hold.resolve();
+        };
+      };
+
+      const resumeGroup = await pauseIntake('group', groupTarget, '5');
+      wechat.workModes[groupKey] = 'assistant';
+      await save();
+      resumeGroup();
+      await until(() => intakeReceipts.includes('5'.repeat(64)), 'archive under the refreshed group role');
+      const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
+      const shared = path.join(root, 'state/messages.json');
+      const member = path.join(root, 'state/accounts', fixturePluginAccount, 'assistant-group-chat.json');
+      assert.equal(read(shared).chats[groupKey], undefined);
+      assert.equal(read(member).chats[groupKey][0].message_id, '5'.repeat(64));
+
+      const history = new HistoryStore(root, fixturePluginAccount);
+      const reoffers = [
+        { oldScope: adminKey, target: admin, digit: '7' },
+        { oldScope: key + ':assistant', target: '123', digit: '8' },
+      ];
+      try {
+        for (const { oldScope, target, digit } of reoffers) {
+          const id = digit.repeat(64);
+          const timestamp = Math.floor(Date.now() / 1000);
+          history.append(oldScope, { sender_id: target, message_id: id, timestamp, text: 'already archived' });
+          assert.ok(!read(shared).chats['wechat:private:' + target]?.some(row => row.message_id === id));
+          ws.send(
+            JSON.stringify({
+              post_type: 'message',
+              message_type: 'private',
+              self_id: '999',
+              user_id: target,
+              message_id: id,
+              time: timestamp,
+              message: [{ type: 'text', data: { text: 'already archived' } }],
+              wechatagent: {
+                senderWxid: target,
+                readerIntake: { version: 1, rawid: id, token: id, account: fixturePluginAccount, grant: 'legacy' },
+              },
+            }),
+          );
+          await until(() => intakeReceipts.includes(id), 'already accepted in another work mode');
+          assert.ok(!read(shared).chats['wechat:private:' + target]?.some(row => row.message_id === id));
+        }
+      } finally {
+        history.close();
+      }
+
+      const resumeAccount = await pauseIntake('private', accountTarget, '6');
+      selectPluginAccount(root, 'e'.repeat(64));
+      resumeAccount();
+      await until(
+        () => logs.includes('[WeChat] account_changed_before_intake ' + accountKey),
+        'rechecked reader account',
+      );
+      assert.equal(read(shared).chats[accountKey], undefined);
+      assert.equal(intakeReceipts.includes('6'.repeat(64)), false);
     },
   );
 }

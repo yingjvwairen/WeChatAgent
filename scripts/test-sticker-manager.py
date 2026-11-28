@@ -236,6 +236,7 @@ class ManagerTests(unittest.TestCase):
         reader = api.Reader.__new__(api.Reader)
         reader.root = self.root
         reader.account = self.root / 'account'
+        reader.lock = threading.Lock()
         reader.sticker_collection = self.pool
         reader.sticker_labels = StickerLabels(self.root / 'labels.json')
         reader.image_index = {}
@@ -243,7 +244,7 @@ class ManagerTests(unittest.TestCase):
         choices = reader.sticker_candidates('wechat:group:123@chatroom', '开心')
         self.assertEqual(choices[0]['tags'], ['开心', '打招呼'])
         native = reader.resolve_sticker(choices[0]['id'], 'wechat:group:123@chatroom')
-        self.assertEqual(pathlib.Path(native['path']).parent, self.root / 'state/stickers/outgoing')
+        self.assertEqual(pathlib.Path(native['path']).parent, (self.root / 'state/stickers/outgoing').resolve())
 
     def test_real_reader_http_manager_requires_token_and_checks_account_scope(self):
         import importlib.util

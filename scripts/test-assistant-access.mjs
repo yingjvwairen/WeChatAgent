@@ -450,6 +450,82 @@ test('adding an administrator neither drops an authorized result nor changes a p
   assert.equal(batches[0], batches[1]);
   assert.equal(f.buffer.unread(group).length, 0);
 });
+test('revoking an unrelated queued sender preserves the authorized request snapshot', async t => {
+  const w = config().wechat;
+  w.assistant.administrators = [wxid, other];
+  const attempts = [];
+  const f = engineFixture(t, w, {
+    decide: async (_key, prompt, metadata) => {
+      attempts.push({ prompt, batchId: metadata.batchId });
+      if (attempts.length === 1) throw Error('fixture response lost');
+      return 'RESPOND: 原请求成功恢复';
+    },
+  });
+  f.engine.receive(message(wxid));
+  await wait(() => attempts.length === 1 && !f.engine.running.size);
+  const original = new MessageBuffer(f.buffer.file).pendingRequests.get(group);
+  assert(original);
+  const denied = f.buffer.append({
+    ...message(other, '助手 被撤回的请求'),
+    work_mode: 'assistant',
+    direct_mention: true,
+  });
+  w.assistant.administrators = [wxid];
+
+  assert.deepEqual(
+    f.engine.unreadFor(group).map(row => row.id),
+    original.rowIds,
+  );
+  assert.deepEqual(new MessageBuffer(f.buffer.file).pendingRequests.get(group), original);
+  assert.equal(denied.processed, true);
+  assert.equal(denied.reply_skip_reason, 'assistant_access_changed');
+
+  f.engine.replay(group);
+  await wait(() => f.sent.length === 1);
+  assert.deepEqual(attempts, [attempts[0], attempts[0]]);
+  assert.equal(f.sent[0].text, '原请求成功恢复');
+});
+
+test('retiring a revoked request rolls back if its buffer snapshot cannot be saved', async t => {
+  const w = config().wechat;
+  w.assistant.administrators.push(other);
+  let attempts = 0;
+  const f = engineFixture(t, w, {
+    decide: async (_key, prompt) => {
+      if (++attempts === 1) throw Error('fixture dispatch response lost');
+      assert.match(prompt, /当前请求/);
+      assert.doesNotMatch(prompt, /之前的请求/);
+      return 'RESPOND: 已处理当前请求';
+    },
+  });
+  const old = message(other, '助手 之前的请求');
+  f.engine.receive(old);
+  await wait(() => attempts === 1 && !f.engine.running.size);
+  const pending = f.buffer.pendingRequests.get(group);
+  assert(pending);
+  const oldRow = f.buffer.findIncoming(old);
+  f.buffer.append({ ...message(wxid, '助手 当前请求'), work_mode: 'assistant', direct_mention: true });
+  w.assistant.administrators = [wxid];
+
+  const rename = fs.renameSync;
+  const failure = t.mock.method(fs, 'renameSync', (source, target) => {
+    if (target === f.buffer.file) throw Error('fixture buffer save failed');
+    return rename(source, target);
+  });
+  try {
+    assert.throws(() => f.engine.unreadFor(group), /fixture buffer save failed/);
+    assert.equal(oldRow.processed, false);
+    assert.equal(f.buffer.pendingRequests.get(group), pending);
+  } finally {
+    failure.mock.restore();
+  }
+
+  f.engine.replay(group);
+  await wait(() => f.sent.length === 1);
+  assert.equal(attempts, 2);
+  assert.equal(oldRow.reply_skip_reason, 'assistant_access_changed');
+});
+
 test('switching bot accounts resets admin policy and restores it on switching back', t => {
   const root = temp(t),
     c = config();

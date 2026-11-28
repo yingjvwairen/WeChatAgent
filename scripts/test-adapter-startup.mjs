@@ -94,7 +94,10 @@ async function boundSocket(t) {
   });
   const port = Number(
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error('bound fixture: ' + stderr)), 10000);
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(Error('bound fixture: ' + stderr));
+      }, 30000);
       lines.once('line', line => {
         clearTimeout(timer);
         resolve(line);
@@ -191,18 +194,61 @@ test('reader transport failures retain their own stage and port', async t => {
   }
 });
 
-test('adapter status identifies the actual PID, project and readiness without exposing authentication material', async t => {
+test('startup defers only layout failures the selected sender can recover from', async t => {
+  const { adapter } = fixture(t);
+  const request = adapter.desktopSender.request;
+  for (const [mode, reason] of [
+    ['ocr', 'UI_QT_LAYOUT_WINDOW_OBSCURED'],
+    ['uia', 'DESKTOP_UIA_ACCESSIBILITY_PROVIDER_REQUIRED'],
+  ]) {
+    adapter.desktopSender.request = async (operation, payload) => {
+      assert.equal(operation, 'health');
+      assert.equal(payload.probeOnly, true);
+      assert.equal(payload.verifyLayout, true);
+      return {
+        ...(await request()),
+        controlMode: mode,
+        layoutCheck: { verified: false, reason },
+      };
+    };
+    await assert.rejects(adapter.checkDesktop(), { message: reason });
+    assert.deepEqual((await adapter.checkDesktop({ startup: true })).layoutCheck, { verified: false, reason });
+  }
+
+  for (const [controlMode, reason] of [
+    ['ocr', 'DESKTOP_UIA_ACCESSIBILITY_PROVIDER_REQUIRED'],
+    ['uia', 'UIA_MODE_BINDING_CHANGED'],
+  ]) {
+    adapter.desktopSender.request = async () => ({
+      ...(await request()),
+      controlMode,
+      layoutCheck: { verified: false, reason },
+    });
+    await assert.rejects(adapter.checkDesktop({ startup: true }), { message: reason });
+  }
+  adapter.desktopSender.request = async () => ({ ...(await request()), version: '0.0.0' });
+  await assert.rejects(adapter.checkDesktop({ startup: true }), { message: 'DESKTOP_HEALTH_INVALID' });
+});
+
+test('adapter status requires both connections and identifies the process without exposing authentication material', async t => {
   const f = fixture(t);
   await f.adapter.start();
-  const response = await fetch('http://127.0.0.1:' + f.adapter.server.address().port + '/status'),
-    data = await response.json();
+  const url = 'http://127.0.0.1:' + f.adapter.server.address().port + '/status';
+  const status = async () => (await fetch(url)).json();
+  const data = await status();
   assert.equal(data.project, 'WeChatAgent');
   assert.equal(data.component, 'adapter');
   assert.equal(data.statusVersion, 1);
   assert.equal(data.pid, process.pid);
   assert.equal(data.projectRoot, f.directory);
-  assert.equal(data.ready, true);
+  assert.equal(data.ready, false);
   assert(!JSON.stringify(data).includes('a'.repeat(64)));
+  f.adapter.status.ob_connected = true;
+  assert.equal((await status()).ready, false);
+  f.adapter.status.reader_connected = true;
+  assert.equal((await status()).ready, true);
+  f.adapter.status.ob_connected = false;
+  assert.equal((await status()).ready, false);
 });
 
 test('recovery must finish before readiness, and rejected startup releases its listener', async t => {
@@ -218,6 +264,7 @@ test('recovery must finish before readiness, and rejected startup releases its l
   };
   const starting = adapter.start();
   await recovering;
+  adapter.status.ob_connected = adapter.status.reader_connected = true;
   const url = 'http://127.0.0.1:' + adapter.server.address().port;
   assert.equal((await (await fetch(url + '/status')).json()).ready, false);
   reject(Error('fixture recovery failed'));
@@ -259,6 +306,10 @@ test('startup formatting keeps only diagnostic codes and never prints arbitrary 
     /Windows.*8766/,
   );
   assert.match(taskFailureMessage('SERVICE_PORT_IN_USE service=adapter port=8766 owners=123', 1), /核对/);
+  assert.match(
+    taskFailureMessage('SERVICE_RESTART_REQUIRED service=adapter port=8767 runningPort=8766', 1),
+    /重新启动/,
+  );
   assert.match(
     taskFailureMessage(
       'Adapter startup failed: READER_CONNECTION_RESET stage=reader-status port=5031 system=ECONNRESET',
@@ -362,12 +413,15 @@ $root=$PSScriptRoot;$stateDir=$PSScriptRoot;$script:record=@{};$script:owner=777
 function Get-NetTCPConnection{param($LocalPort,$ErrorAction)@([pscustomobject]@{State='Listen';LocalAddress='::';OwningProcess=999},[pscustomobject]@{State='Listen';LocalAddress='127.0.0.1';OwningProcess=777})}
 $ipv4=@(Get-PortBindings 8766);if($ipv4.Count -ne 1 -or $ipv4[0].OwningProcess -ne 777){throw 'IPv6-only listener caused a false IPv4 conflict'}
 function Get-PortBindings{param($Port)$script:queries++;if($script:mode -eq 'race' -and $script:queries -eq 1){return};[pscustomobject]@{State='Listen';OwningProcess=$script:owner}}
-function Invoke-RestMethod{param($Uri,$TimeoutSec)if($script:mode -eq 'legacy'){return [pscustomobject]@{backend='wechat-ui'}};[pscustomobject]@{project='WeChatAgent';component='adapter';statusVersion=1;backend='wechat-ui';pid=$(if($script:mode -eq 'bad-pid'){'invalid'}else{777});projectRoot=$(if($script:mode -eq 'wrong-project'){$root+'-other'}elseif($script:mode -eq 'bad-root'){[string][char]0}else{$root});ready=$true}}
+function Invoke-RestMethod{param($Uri,$TimeoutSec)if($script:mode -eq 'legacy'){return [pscustomobject]@{backend='wechat-ui'}};[pscustomobject]@{project='WeChatAgent';component='adapter';statusVersion=1;backend='wechat-ui';pid=$(if($script:mode -eq 'bad-pid'){'invalid'}else{777});projectRoot=$(if($script:mode -eq 'wrong-project'){$root+'-other'}elseif($script:mode -eq 'bad-root'){[string][char]0}else{$root});ready=$true;ob_connected=$true;reader_connected=($script:mode -ne 'reader-disconnected')}}
 if(-not(Test-ServiceReady 'adapter' 8766 777)){throw 'owned ready service was rejected'}
+$script:mode='reader-disconnected'
+if(Test-ServiceReady 'adapter' 8766 777){throw 'unconnected service became ready'}
 foreach($case in @('wrong-project','legacy','bad-pid','bad-root')){$script:mode=$case;$failed=$false;try{Test-ServiceReady 'adapter' 8766 777|Out-Null}catch{if($_.Exception.Message -notmatch 'ADAPTER_IDENTITY_MISMATCH'){throw};$failed=$true};if(-not $failed){throw 'foreign or legacy identity accepted'}}
 $script:mode='ready';$script:owner=999;$failed=$false;try{Test-ServiceReady 'adapter' 8766 777|Out-Null}catch{if($_.Exception.Message -notmatch 'SERVICE_PORT_OWNER_MISMATCH'){throw};$failed=$true};if(-not $failed){throw 'foreign listener accepted'}
 function Assert-PortBindable{param($Name,$Port)}
 function Save-Record{}
+function Owned-Process{param($Item)return $null}
 function Start-Process{$script:spawned++;$p=[pscustomobject]@{Id=777;HasExited=$false;StartTime=[DateTime]::UtcNow};$p|Add-Member ScriptMethod Refresh {};return $p}
 $script:mode='race';$script:queries=0;$failed=$false
 try{Start-ServiceProcess 'adapter' 'fixture.exe' '' $root 'fixture' 8766 $false}catch{if($_.Exception.Message -notmatch 'SERVICE_PORT_OWNER_MISMATCH'){throw};$failed=$true}
@@ -394,7 +448,7 @@ if(-not $failed -or $script:spawned -ne 1){throw 'startup race was accepted'}
 );
 
 test(
-  'supervisor starts and reuses the real owned child only after PID and HTTP identity match',
+  'supervisor reuses an owned child and stops it on its recorded port after the settings change',
   { skip: process.platform !== 'win32' },
   async t => {
     const f = fixture(t);
@@ -403,7 +457,7 @@ test(
       script = path.join(f.directory, 'supervisor-live.ps1');
     fs.writeFileSync(
       entry,
-      "import http from 'node:http';const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.url==='/desktop/shutdown'){res.end(JSON.stringify({ok:true,accepted:true}));server.close(()=>process.exit(0));return;}res.end(JSON.stringify({project:'WeChatAgent',component:'adapter',statusVersion:1,backend:'wechat-ui',pid:process.pid,projectRoot:process.cwd(),ready:true}));});server.listen(Number(process.argv[2]),'127.0.0.1');",
+      "import http from 'node:http';const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.url==='/desktop/shutdown'){res.end(JSON.stringify({ok:true,accepted:true}));server.close(()=>process.exit(0));return;}res.end(JSON.stringify({project:'WeChatAgent',component:'adapter',statusVersion:1,backend:'wechat-ui',pid:process.pid,projectRoot:process.cwd(),ready:true,ob_connected:true,reader_connected:true}));});server.listen(Number(process.argv[2]),'127.0.0.1');",
     );
     fs.mkdirSync(path.join(f.directory, 'state/desktop'), { recursive: true });
     fs.writeFileSync(path.join(f.directory, 'state/desktop/control.token'), 'fixture');
@@ -430,6 +484,19 @@ try{
  if($health.pid -ne $first -or $health.projectRoot -ne $root){throw 'wrong service became ready'}
  Start-ServiceProcess 'adapter' $Node ('"'+$Entry+'" '+$Port) $root $Entry $Port $false
  if($script:record['adapter'].pid -ne $first){throw 'owned service was duplicated'}
+ $nextPort=if($Port -eq 65535){65534}else{$Port+1}
+ $configFile=Join-Path $root 'config\wechatagent.json'
+ $config=Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+ $config.ports.adapter=$nextPort
+ $config | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $configFile
+ $failed=$false
+ try{Start-ServiceProcess 'adapter' $Node ('"'+$Entry+'" '+$nextPort) $root $Entry $nextPort $false}catch{
+   if($_.Exception.Message -notmatch 'SERVICE_RESTART_REQUIRED'){throw}
+   $failed=$true
+ }
+ if(-not $failed -or $script:record['adapter'].pid -ne $first -or $script:record['adapter'].port -ne $Port){
+   throw 'the port change replaced the running process record'
+ }
  'Real child startup and reuse passed'
 }finally{Stop-Services}
 `,
@@ -456,6 +523,119 @@ try{
     );
     assert.match(output.stdout, /Real child startup and reuse passed/);
     assert.match(output.stdout, /adapter stopped/);
+  },
+);
+
+test(
+  'failed startup rolls back its Reader and leaves a previously running Reader alone',
+  { skip: process.platform !== 'win32' },
+  async t => {
+    const { directory } = fixture(t);
+    const scripts = path.join(directory, 'scripts');
+    fs.mkdirSync(scripts);
+    fs.mkdirSync(path.join(directory, 'state/logs'), { recursive: true });
+    const manage = path.join(scripts, 'manage.ps1');
+    fs.copyFileSync(path.join(root, 'scripts/manage.ps1'), manage);
+    const temporary = net.createServer();
+    await new Promise(resolve => temporary.listen(0, '127.0.0.1', resolve));
+    const port = temporary.address().port;
+    await new Promise(resolve => temporary.close(resolve));
+    const config = {
+      runtime: { sender: 'wechat-ui', weflowMode: 'nt', python: process.execPath },
+      ports: { weflow: port },
+    };
+    fs.writeFileSync(path.join(directory, 'config/wechatagent.json'), JSON.stringify(config));
+    fs.writeFileSync(path.join(scripts, 'project-config.mjs'), '');
+    fs.writeFileSync(path.join(scripts, 'sync-weflow.cjs'), '');
+    fs.writeFileSync(path.join(scripts, 'wechat-onebot.mjs'), 'process.exit(1);');
+    const entry = path.join(scripts, 'reader-api.py');
+    fs.writeFileSync(
+      entry,
+      "require('node:net').createServer().listen(" + port + ", '127.0.0.1', () => console.log('listening'));",
+    );
+    const failure = async () => {
+      try {
+        await promisify(execFile)(
+          windowsPowerShellExecutable(),
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', manage, 'start'],
+          { windowsHide: true, env: windowsPowerShellEnvironment(), timeout: 35000 },
+        );
+      } catch (error) {
+        assert.match(error.stderr, /DESKTOP_SENDER_NOT_READY/);
+        return error.stdout;
+      }
+      assert.fail('expected startup to fail');
+    };
+    const runtime = path.join(directory, 'state/runtime.json');
+    const record = () => JSON.parse(fs.readFileSync(runtime, 'utf8').replace(/^\uFEFF/u, ''));
+    assert.match(await failure(), /reader stopped/);
+    assert.equal(record().reader, undefined);
+
+    const child = spawn(process.execPath, [entry], { cwd: directory, windowsHide: true });
+    const exited = new Promise(resolve => child.once('close', resolve));
+    try {
+      await new Promise((resolve, reject) => {
+        child.stdout.once('data', resolve);
+        child.once('error', reject);
+        child.once('exit', () => reject(Error('fixture Reader exited')));
+      });
+      fs.writeFileSync(
+        runtime,
+        JSON.stringify({ reader: { pid: child.pid, exe: process.execPath, marker: entry, port } }),
+      );
+      assert.doesNotMatch(await failure(), /reader stopped/);
+      assert.equal(record().reader.pid, child.pid);
+      assert.equal(child.exitCode, null);
+    } finally {
+      child.kill();
+      await exited;
+    }
+  },
+);
+
+test(
+  'concurrent service operations retain the current owner until its management command completes',
+  { skip: process.platform !== 'win32' },
+  async t => {
+    const { directory } = fixture(t);
+    const scripts = path.join(directory, 'scripts');
+    const runtime = path.join(directory, 'state/runtime.json');
+    const entered = path.join(scripts, 'entered');
+    const release = path.join(scripts, 'release');
+    fs.mkdirSync(scripts);
+    const manage = path.join(scripts, 'manage.ps1');
+    fs.copyFileSync(path.join(root, 'scripts/manage.ps1'), manage);
+    fs.writeFileSync(runtime, JSON.stringify({ fixture: true }));
+    fs.writeFileSync(
+      path.join(scripts, 'project-config.mjs'),
+      `import fs from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
+fs.writeFileSync(${JSON.stringify(entered)}, '');
+for (let i = 0; i < 600 && !fs.existsSync(${JSON.stringify(release)}); i++) await delay(25);
+`,
+    );
+    const run = action =>
+      promisify(execFile)(
+        windowsPowerShellExecutable(),
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', manage, action],
+        { windowsHide: true, env: windowsPowerShellEnvironment(), timeout: 18000 },
+      );
+    const active = run('prepare');
+    active.catch(() => {});
+    try {
+      for (let i = 0; i < 160 && !fs.existsSync(entered); i++) await new Promise(resolve => setTimeout(resolve, 50));
+      assert(fs.existsSync(entered), 'management command reached its configuration step');
+      await Promise.all(
+        ['start', 'stop', 'restart', 'check-desktop-stopped'].map(action =>
+          assert.rejects(run(action), error => /RUNTIME_OPERATION_BUSY/.test(error.stderr)),
+        ),
+      );
+      assert.deepEqual(JSON.parse(fs.readFileSync(runtime, 'utf8')), { fixture: true });
+    } finally {
+      fs.writeFileSync(release, '');
+      await active;
+    }
+    assert.equal((await run('check-desktop-stopped')).stdout.trim(), 'DESKTOP_STOPPED');
   },
 );
 

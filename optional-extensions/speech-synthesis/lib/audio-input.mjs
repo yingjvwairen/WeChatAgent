@@ -11,9 +11,11 @@ export async function transcribeSegments(ctx, id, transcribe) {
   let length = 0;
   for await (const wav of readVoiceSegments(ctx, id)) {
     const text = await transcribe(wav);
+    if (!text) continue;
     length += text.length + (parts.length ? 1 : 0);
     if (length > 12000) throw Error('VOICE_TTS_TRANSCRIPT');
     parts.push(text);
   }
+  if (!parts.length) throw Error('VOICE_TTS_TRANSCRIPT');
   return parts.join('\n');
 }

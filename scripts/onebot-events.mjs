@@ -5,6 +5,7 @@ import {
   PAT_TYPE,
   FORWARD_TYPE,
   QUOTE_TYPE,
+  annotateForwardedItem,
   normalizeForwardedRecord,
   normalizeQuoteReply,
 } from '../components/qq-bridge/src/core/wechat-events.js';
@@ -38,7 +39,7 @@ export function readerEvent(payload, { ownWxid, allowed }) {
     payload.talkerId === ownWxid
   )
     return null;
-  const forwardedRecord = [49, FORWARD_TYPE].includes(payload.type)
+  let forwardedRecord = [49, FORWARD_TYPE].includes(payload.type)
     ? normalizeForwardedRecord(payload.forwardedRecord)
     : null;
   const quoteReply = [49, QUOTE_TYPE].includes(payload.type) ? normalizeQuoteReply(payload.quoteReply) : null;
@@ -97,15 +98,20 @@ export function readerEvent(payload, { ownWxid, allowed }) {
     )
       return null;
     for (const ref of images) {
-      segments.push({ type: 'image', data: { file: 'wechatagent://image/' + ref.id, media_id: ref.id } });
-      const item = forwardedRecord.items[ref.index];
-      if (item.kind !== '1')
-        item.text =
-          describeVideo('转发中的视频', videos?.[ref.index]) ?? '[历史附件，画面按本条序号提供，缺失时不可见]';
+      segments.push({
+        type: 'image',
+        data: { file: 'wechatagent://image/' + ref.id, media_id: ref.id, forwardItem: ref.index + 1 },
+      });
+      if (forwardedRecord.items[ref.index].kind !== '1')
+        forwardedRecord = annotateForwardedItem(
+          forwardedRecord,
+          ref.index,
+          describeVideo('转发中的视频', videos?.[ref.index]) ?? '[历史附件，画面按本条序号提供，缺失时不可见]',
+        );
     }
     for (const [index, item] of forwardedRecord.items.entries()) {
       const description = item.kind === '1' && describeVideo('被引用的历史视频', videos?.[index]);
-      if (description) item.text = [...(description + '\n' + item.text)].slice(0, 801).join('');
+      if (description) forwardedRecord = annotateForwardedItem(forwardedRecord, index, description);
     }
     for (const ref of voices.filter(ref => videos?.[ref.index]?.audioPresent !== false))
       segments.push({
@@ -114,14 +120,11 @@ export function readerEvent(payload, { ownWxid, allowed }) {
       });
   }
   if ([43, 62].includes(payload.type)) {
-    if (
-      !Array.isArray(payload.videoFrames) ||
-      payload.videoFrames.length > 4 ||
-      payload.videoFrames.some(id => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))
-    )
-      return null;
-    for (const id of payload.videoFrames)
+    if (payload.image) {
+      const { id } = payload.image;
+      if (!/^[a-f0-9]{64}$/.test(id ?? '')) return null;
       segments.push({ type: 'image', data: { file: 'wechatagent://image/' + id, media_id: id } });
+    } else if (payload.attachmentUnavailable !== true) return null;
     const voice = payload.voice;
     if (payload.videoPlayback?.audioPresent !== false && validVoiceReference(voice, 300)) {
       segments.push({
@@ -160,15 +163,13 @@ export function readerEvent(payload, { ownWxid, allowed }) {
     quoteReply &&
     ['43', '62'].includes(quoteReply.reference.kind) &&
     attachment?.kind === 'video' &&
-    Array.isArray(attachment.frames) &&
-    attachment.frames.length <= 4 &&
-    attachment.frames.every(id => typeof id === 'string' && /^[a-f0-9]{64}$/.test(id))
+    /^[a-f0-9]{64}$/.test(attachment.id ?? '')
   ) {
-    for (const id of attachment.frames)
-      segments.push({ type: 'image', data: { file: 'wechatagent://image/' + id, media_id: id } });
+    const { id } = attachment;
+    segments.push({ type: 'image', data: { file: 'wechatagent://image/' + id, media_id: id, media_quoted: true } });
     quoteReply.reference.text =
       describeVideo('被引用的历史视频', attachment.playback) ?? '[被引用历史视频，附图为原视频的采样时刻]';
-    quoteReply.reference.unavailable = !attachment.frames.length;
+    quoteReply.reference.unavailable = false;
     const voice = attachment.voice;
     if (attachment.playback?.audioPresent !== false && validVoiceReference(voice, 300)) {
       segments.push({
@@ -187,7 +188,7 @@ export function readerEvent(payload, { ownWxid, allowed }) {
     if ((ref.kind === '3' && attachment.kind === 'image') || (ref.kind === '47' && attachment.kind === 'sticker')) {
       segments.push({
         type: 'image',
-        data: { file: 'wechatagent://image/' + attachment.id, media_id: attachment.id },
+        data: { file: 'wechatagent://image/' + attachment.id, media_id: attachment.id, media_quoted: true },
       });
       ref.text = '[被引用历史消息的附图，来源为被引用人]';
       ref.unavailable = false;

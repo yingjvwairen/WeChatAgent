@@ -4,7 +4,20 @@ import path from 'node:path';
 import { validChatId } from '../packages/wechat-identity.mjs';
 
 const fault = (message, status = 409) => Object.assign(Error(message), { status });
-// Query only contact metadata using the selected account's saved configuration.
+const validHeads = heads =>
+  heads &&
+  typeof heads === 'object' &&
+  !Array.isArray(heads) &&
+  Object.keys(heads).length > 0 &&
+  Object.entries(heads).every(
+    ([shard, head]) =>
+      /^[a-f0-9]{64}$/.test(shard) &&
+      typeof head === 'string' &&
+      /^(0|[1-9]\d{0,18})$/.test(head) &&
+      BigInt(head) <= 0x7fffffffffffffffn,
+  );
+
+// Search reads contact metadata. Saving selected contacts also reads their shard heads.
 export function localContacts(root, python, query) {
   return new Promise((resolve, reject) => {
     const child = execFile(
@@ -59,16 +72,25 @@ export function createChatTargetsApi({
     const added = targets(next).filter(
       row => !previous.wechat.whitelist[row.kind === 'group' ? 'groups' : 'private'].includes(row.id),
     );
-    if (added.length) {
-      const result = await readContacts(root, previous.runtime?.python, { ids: added.map(row => row.id) });
-      const verified = new Set(result.contacts.map(row => row.username));
-      if (
-        result.account !== expectedAccount ||
-        account() !== expectedAccount ||
-        added.some(row => !verified.has(row.id))
-      )
-        throw fault('联系人目录已变化，请重新搜索并选择可用的聊天。');
-    }
+    if (!added.length) return {};
+    const result = await readContacts(root, previous.runtime?.python, { ids: added.map(row => row.id) });
+    const verified = new Map(result.contacts.map(row => [row.username, row]));
+    if (result.account !== expectedAccount || account() !== expectedAccount || added.some(row => !verified.has(row.id)))
+      throw fault('联系人目录已变化，请重新搜索并选择可用的聊天。');
+    if (added.some(row => row.kind === 'group' && verified.get(row.id).canSend !== true))
+      throw fault('微信无法唯一定位新选的群聊。请修改群名，再重新搜索。');
+    if (
+      !Number.isSafeInteger(result.since) ||
+      result.since <= 0 ||
+      added.some(row => !validHeads(verified.get(row.id).heads))
+    )
+      throw fault('无法建立聊天收件边界，请核对读取连接后重试。', 503);
+    return Object.fromEntries(
+      added.map(({ kind, id }) => [
+        `wechat:${kind}:${id}`,
+        { account: expectedAccount, since: result.since, heads: verified.get(id).heads },
+      ]),
+    );
   }
   async function replace(body) {
     const current = snapshot();

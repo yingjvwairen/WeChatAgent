@@ -11,6 +11,21 @@ assert.throws(
   () => validateConfig({ ...example, ports: { ...example.ports, onebot: example.ports.weflow } }),
   /distinct/,
 );
+const localSpeech = {
+  asr: { enabled: true, python: 'python', modelDirectory: 'whisper' },
+  tts: { enabled: true, python: 'python', modelDirectory: 'gpt-sovits' },
+};
+const withSpeech = { ...example, runtime: { ...example.runtime, localSpeech } };
+validateConfig(withSpeech);
+localSpeech.asr.port = 9881;
+assert.throws(() => validateConfig(withSpeech), /distinct/);
+localSpeech.asr.port = example.ports.weflow;
+assert.throws(() => validateConfig(withSpeech), /distinct/);
+localSpeech.asr.port = 65536;
+assert.throws(() => validateConfig(withSpeech), /LOCAL_SPEECH_PORT_INVALID/);
+localSpeech.asr.enabled = false;
+validateConfig(withSpeech);
+assert.throws(() => validateConfig(withSpeech, { consolePort: 9881 }), /distinct/);
 assert.throws(() => validateConfig({ ...example, persona: { default: '../bad' } }), /persona/);
 assert.throws(() => validateConfig({ ...example, runtime: { ...example.runtime, sender: 'unavailable' } }), /sender/);
 assert.throws(() => validateConfig({ ...example, input: { ...example.input, expectedVersion: '4.1.15.56' } }), {

@@ -5,10 +5,13 @@ import { createRequire } from 'node:module';
 import { projectRoot } from './project-config.mjs';
 import { buildIcons, embedExecutableIcon } from './build-icons.mjs';
 import { launcherAssemblyInfo } from './release-version.mjs';
+import { prepareInstallerNode, runtimeVersions } from './prepare-installer-runtime.mjs';
+import { DESKTOP_APP_SOURCE_FILES, stageDesktopYaml } from './release-verification.mjs';
 
 const root = projectRoot;
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-const runtime = path.join(root, 'node_modules/electron/dist');
+const require = createRequire(path.join(root, 'package.json'));
+const runtime = path.dirname(require('electron'));
 if (!fs.existsSync(path.join(runtime, 'electron.exe')))
   throw new Error('未找到已有 Electron 运行环境，请先在源码目录安装开发依赖。');
 const output = path.join(root, 'release', 'WeChatAgent');
@@ -29,27 +32,12 @@ function copy(source, destination) {
 }
 for (const name of fs.readdirSync(runtime))
   copy(path.join(runtime, name), path.join(output, name === 'electron.exe' ? 'WeChatAgent.exe' : name));
-for (const name of [
-  'package.json',
-  'main.cjs',
-  'preload.cjs',
-  'shutdown.cjs',
-  'storage-location.cjs',
-  'desktop-policy.cjs',
-  'deployment.cjs',
-  'appearance.cjs',
-  'loading-preload.cjs',
-  'loading.html',
-  'loading.css',
-  'loading.js',
-])
+for (const name of ['package.json', ...DESKTOP_APP_SOURCE_FILES])
   fs.copyFileSync(path.join(root, 'apps/console-desktop', name), path.join(appDir, name));
+const desktopPackage = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf8'));
+stageDesktopYaml(appDir, root, desktopPackage.dependencies.yaml);
 fs.mkdirSync(path.join(output, 'runtime'), { recursive: true });
-copy(process.execPath, path.join(output, 'runtime', 'node.exe'));
-const nodeLicense = spawnSync(process.execPath, ['--print', 'process.release.name'], { encoding: 'utf8' });
-if (nodeLicense.status !== 0 || nodeLicense.stdout.trim() !== 'node')
-  throw new Error('Use the project Node.js executable to build the desktop app.');
-const require = createRequire(path.join(root, 'package.json'));
+fs.copyFileSync(await prepareInstallerNode(root), path.join(output, 'runtime', 'node.exe'));
 const sharp = require('sharp');
 const iconFile = await buildIcons(root, appDir, sharp);
 embedExecutableIcon(path.join(output, 'WeChatAgent.exe'), iconFile, require('resedit'));
@@ -81,7 +69,7 @@ fs.writeFileSync(
       product: 'WeChatAgent',
       version: pkg.version,
       electron: fs.readFileSync(path.join(runtime, 'version'), 'utf8').trim(),
-      node: process.version,
+      node: runtimeVersions.node,
       entry: 'WeChatAgent.exe',
       projectRelativeToRuntime: '../..',
       projectDataBundled: false,

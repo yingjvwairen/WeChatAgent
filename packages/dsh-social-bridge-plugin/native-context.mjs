@@ -2574,15 +2574,17 @@ export function apply(ctx, config = {}) {
         const body = JSON.parse(Buffer.concat(chunks)),
           key = body.conversationKey;
         if (!/^[a-f0-9]{64}$/.test(body.id ?? '')) throw Error('VOICE_REFERENCE_INVALID');
-        const settings = JSON.parse(
-          fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8').replace(/^\uFEFF/, ''),
-        );
-        if (
-          !allowedConversation(settings.wechat, key) ||
-          internalGroupChat ||
-          (readWorkMode(root, key) === 'assistant' && !assistantSenderAllowed(settings.wechat, key, body.senderWxid))
-        )
-          return reply(403, { ok: false, code: 'VOICE_INPUT_NOT_ALLOWED' });
+        const audioAllowed = () => {
+          if (internalGroupChat || !accountReady()) return false;
+          const wechat = liveWechat();
+          return (
+            matchesConversationGrant(wechat, key, body.rosterGrant) &&
+            (conversationWorkMode(wechat, key) !== 'assistant' ||
+              assistantSenderAllowed(wechat, key, body.senderWxid) ||
+              assistantGroupChatAllowed(wechat, key, body.senderWxid))
+          );
+        };
+        if (!audioAllowed()) return reply(403, { ok: false, code: 'VOICE_INPUT_NOT_ALLOWED' });
         const extension = await extensions();
         if (!extension) return reply(503, { ok: false, code: 'VOICE_HOST_UNAVAILABLE' });
         // voice-input-v1: the one plugin for this chat with audio_read and a transcribe action.
@@ -2592,9 +2594,12 @@ export function apply(ctx, config = {}) {
           { conversationKey: key, actorId: body.senderWxid ?? '', voiceIds: [body.id] },
           { signal: controller.signal, timeoutMs: VOICE_TRANSCRIPTION_TIMEOUT_MS },
         );
+        if (!audioAllowed()) return reply(403, { ok: false, code: 'VOICE_INPUT_NOT_ALLOWED' });
         return reply(
           200,
-          found.handled ? { ...found.result, plugin: found.plugin } : { ok: false, code: 'VOICE_PLUGIN_DISABLED' },
+          found.handled
+            ? { ...found.result, plugin: found.plugin, generation: String(found.generation ?? '') }
+            : { ok: false, code: 'VOICE_PLUGIN_DISABLED' },
         );
       } catch (error) {
         const code =

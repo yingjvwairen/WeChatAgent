@@ -4,6 +4,7 @@ import html
 import hashlib
 import re
 import xml.etree.ElementTree as ET
+from wechat_identity import group_username, valid_chat_id
 
 FORWARD_TYPE = (19 << 32) | 49
 MAX_XML = 512_000
@@ -76,7 +77,22 @@ def media_part(item, kind, ordinal):
             nodes = list(record_root(content).iter())
         except (ValueError, ET.ParseError):
             return None
-        source = {'reference': {'serverId': server_id, 'localType': int(source_type)}}
+        identity = {'serverId': server_id, 'localType': int(source_type)}
+        from_user, member = (child_text(quoted, field) for field in ('fromusr', 'chatusr'))
+        room = group_username(from_user)
+        sender = member if room else from_user or member
+        if sender:
+            if not valid_chat_id('private', sender):
+                return None
+            identity['senderUsername'] = sender
+        if room:
+            identity['conversation'] = from_user
+        timestamp = child_text(quoted, 'createtime', 24)
+        if timestamp:
+            if not re.fullmatch('[1-9][0-9]{0,18}', timestamp) or int(timestamp) >= 2**63:
+                return None
+            identity['createTime'] = int(timestamp)
+        source = {'reference': identity}
     if not media:
         return None
     if kind == '37':

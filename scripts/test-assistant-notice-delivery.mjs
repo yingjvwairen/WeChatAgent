@@ -8,6 +8,7 @@ import { createAssistantNoticeDelivery } from '../components/qq-bridge/src/core/
 import { assistantNotificationText } from '../components/qq-bridge/src/core/decision-format.js';
 import { AssistantNotifications } from '../packages/dsh-social-bridge-plugin/assistant-notifications.mjs';
 import { AssistantFeedback } from '../packages/dsh-social-bridge-plugin/assistant-feedback.mjs';
+import { ReplyDeliveryControls } from '../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 const key = 'wechat:private:wxid_admin',
   sender = 'wxid_admin',
   text = 'RESPOND: 时间到，该喝水了。\n\n[STICKER:S2]',
@@ -20,6 +21,10 @@ function fixture(t) {
     workModes: { [key]: 'assistant', 'wechat:group:456@chatroom': 'assistant' },
     assistant: { administrators: [sender] },
   };
+  fs.mkdirSync(path.join(root, 'config'));
+  const save = () => fs.writeFileSync(path.join(root, 'config/wechatagent.json'), JSON.stringify({ wechat: w }));
+  save();
+  const controls = new ReplyDeliveryControls(root, 'legacy');
   const queue = new AssistantNotifications(path.join(root, 'notices.json'), () => true),
     adapter = new WechatOneBotAdapter(),
     sent = [],
@@ -36,14 +41,20 @@ function fixture(t) {
       assistantTask: async (_key, action, body) => {
         requests.push({ action, body });
         if (action === 'notification-ack') queue.ack(body.id);
-        return { ok: true, notifications: queue.list() };
+        return { ok: true, notifications: queue.list({ advance: action === 'notifications' }) };
       },
     },
-    delivery = createAssistantNoticeDelivery({ adapter, plugin, settingsFor: () => w, log: line => logs.push(line) });
+    delivery = createAssistantNoticeDelivery({
+      adapter,
+      plugin,
+      settingsFor: () => w,
+      deliveryControls: controls,
+      log: line => logs.push(line),
+    });
   t.after(() => delivery.stop());
   const add = (extra = {}) =>
     queue.queue({ id: 'schedule-' + Object.keys(queue.messages).length, key, sender, kind: 'result', text, ...extra });
-  return { root, w, queue, adapter, sent, logs, requests, plugin, delivery, add };
+  return { root, w, save, controls, queue, adapter, sent, logs, requests, plugin, delivery, add };
 }
 
 test('scheduled text survives stale sticker hints, reaches the real adapter contract, and acknowledges once', async t => {
@@ -94,6 +105,25 @@ test('unconfirmed or missing server receipts never acknowledge a scheduled notic
   assert.equal(f.requests.filter(item => item.action === 'notification-ack').length, 0);
 });
 
+test('a queued notice loses native input permission when its task administrator is revoked', async t => {
+  const f = fixture(t),
+    id = f.add();
+  f.adapter.server.action = async (_action, params) => {
+    const grant = params.wechatagent_roster_grant;
+    assert.equal(params.wechatagent_delivery_id, id);
+    assert.equal(f.controls.inputWithdrawn(key, grant, id), false);
+    f.w.assistant.administrators = [];
+    f.save();
+    assert.equal(f.controls.inputWithdrawn(key, grant, id), true);
+    return { data: { pending: true, delivery_id: id } };
+  };
+  await f.delivery.tick();
+  assert.equal(f.queue.messages[id].state, 'queued');
+  const restored = new ReplyDeliveryControls(f.root, 'legacy');
+  assert.equal(restored.inputWithdrawn(key, 'legacy', id), true);
+  assert.equal(restored.inputWithdrawn(key, 'legacy', 'f'.repeat(64)), false);
+});
+
 test('legacy queued notices keep their original immutable payload when completing an already confirmed generic delivery', async t => {
   const f = fixture(t),
     id = f.add();
@@ -136,6 +166,38 @@ test('a failed notice cannot starve later reminders in the same poll', async t =
   assert.deepEqual(f.sent, ['first notice', 'second notice']);
   assert.equal(f.queue.messages[bad].state, 'queued');
   assert.equal(f.queue.messages[good].state, 'delivered');
+});
+
+test('twenty deferred notices leave later reminders eligible after the notification store restarts', async t => {
+  const f = fixture(t);
+  const deferred = new Set(Array.from({ length: 20 }, (_, i) => f.add({ text: 'RESPOND: waiting ' + i })));
+  const later = Array.from({ length: 21 }, (_, i) => f.add({ text: 'RESPOND: later reminder ' + i }));
+  const attempts = [];
+  f.adapter.server.action = async (_action, params) => {
+    const id = params.wechatagent_delivery_id;
+    attempts.push(id);
+    if (deferred.has(id)) throw Object.assign(Error('fixture unavailable'), { code: 'BACKEND_UNAVAILABLE' });
+    return { data: { receipt: 'wechat-server-id' } };
+  };
+
+  await f.delivery.tick();
+  assert.deepEqual(attempts, [...deferred]);
+  assert.equal(f.queue.messages[later[0]].state, 'queued');
+
+  let restored = new AssistantNotifications(f.queue.file, () => true);
+  f.plugin.assistantTask = async (_key, action, body) => {
+    if (action === 'notification-ack') restored.ack(body.id);
+    return { ok: true, notifications: restored.list({ advance: action === 'notifications' }) };
+  };
+  await f.delivery.tick();
+  assert.deepEqual(attempts.slice(20), later.slice(0, 20));
+  assert.equal(restored.messages[later[19]].state, 'delivered');
+
+  restored = new AssistantNotifications(f.queue.file, () => true);
+  await f.delivery.tick();
+  assert.equal(attempts[40], later[20]);
+  assert.equal(restored.messages[later[20]].state, 'delivered');
+  for (const id of deferred) assert.equal(restored.messages[id].state, 'queued');
 });
 
 test('an acknowledgement failure retries the same delivery ID and body without another native submission', async t => {

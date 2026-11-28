@@ -497,7 +497,7 @@ async function verify() {
         item => item.mediaKind === 'image' && item.description === '单色校验图片',
       );
       if (candidates.length !== 1) throw Error('REPLY_IMAGE_CANDIDATE_UNAVAILABLE');
-      const result = await adapter.sendSticker('private', target, candidates[0].id, deliveryId);
+      const result = await adapter.sendSticker('private', target, candidates[0].id, { deliveryId });
       if (
         result.media_type !== 'wechat-image' ||
         result.receipt !== 'wechat-server-id' ||

@@ -12,6 +12,7 @@ import time
 POLL_GAP_SECONDS = 290
 RESCAN_INTERVAL = 30
 RESCAN_SECONDS = 300
+ACK_RETENTION_SECONDS = 86400
 MAX_PENDING = 1024
 
 
@@ -29,9 +30,13 @@ def event_media_ids(payload):
     forward = payload.get('forwardAttachments') or {}
     refs.extend([quoted.get('voice'), *forward.get('images', []), *forward.get('voices', [])])
     ids = [ref.get('id') for ref in refs if isinstance(ref, dict)]
-    ids.extend(payload.get('videoFrames', []))
-    ids.extend(quoted.get('frames', []))
     return {ref for ref in ids if isinstance(ref, str) and re.fullmatch('[a-f0-9]{64}', ref)}
+
+
+def touch_media_record(records, identifier, record):
+    # A new reference may reuse an old ID before the inbox can pin it.
+    records.pop(identifier, None)
+    records[identifier] = record
 
 
 def cache_evictions(records, pinned_media):
@@ -48,7 +53,12 @@ class ReaderIntake:
         if not isinstance(account_ref, str) or not re.fullmatch('[a-f0-9]{64}', account_ref):
             raise ValueError('Invalid Reader account scope')
         self.account_ref = account_ref
+        self.consumer_generation = secrets.token_hex(16)
         self.file = directory / (account_ref + '.sqlite')
+        self.bridge_buffers = (
+            directory.parent / 'social-messages.json',
+            directory.parent / 'accounts' / account_ref / 'assistant-group-chat.json',
+        )
         with self.connection() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS events(
                 sequence INTEGER PRIMARY KEY, recipient TEXT NOT NULL, grant_id TEXT NOT NULL,
@@ -67,6 +77,10 @@ class ReaderIntake:
             db.execute(
                 'CREATE INDEX IF NOT EXISTS pending_by_chat ON events(recipient,grant_id) WHERE payload IS NOT NULL'
             )
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS acknowledged_by_chat ON events(recipient,grant_id,captured) '
+                'WHERE payload IS NULL'
+            )
             db.execute("""CREATE TABLE IF NOT EXISTS scans(
                 recipient TEXT PRIMARY KEY, grant_id TEXT NOT NULL, baseline INTEGER NOT NULL,
                 through INTEGER NOT NULL, restart INTEGER NOT NULL)""")
@@ -80,6 +94,7 @@ class ReaderIntake:
             db.execute(
                 'CREATE TABLE IF NOT EXISTS boundary(recipient TEXT, shard TEXT, local_id INTEGER, PRIMARY KEY(recipient,shard,local_id))'
             )
+            db.execute('CREATE TABLE IF NOT EXISTS incomplete_consumer_boundary(recipient TEXT PRIMARY KEY)')
             db.execute(
                 'CREATE TABLE IF NOT EXISTS provisional(recipient TEXT, grant_id TEXT, stamp INTEGER, shard TEXT, local_id INTEGER, PRIMARY KEY(recipient,grant_id,stamp,shard,local_id))'
             )
@@ -115,8 +130,12 @@ class ReaderIntake:
         row = db.execute('SELECT cutoff FROM consumer WHERE singleton=1').fetchone()
         return row[0] if row else 0
 
-    def connect(self, session, now, eligible, boundary_rows):
+    def connect(self, session, now, eligible, boundary_rows, incomplete=()):
         """Recover pending rows when a new bridge connection takes over."""
+        # The adapter may keep its WebSocket and session across a Reader restart.
+        session = self.consumer_generation + ':' + session
+        boundary_rows = set(boundary_rows)
+        incomplete = set(incomplete)
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             if db.execute('SELECT session FROM consumer WHERE singleton=1').fetchone() == (session,):
@@ -125,19 +144,46 @@ class ReaderIntake:
                 raise ReaderClockMovedBackward()
             db.execute('DELETE FROM boundary')
             db.executemany('INSERT OR IGNORE INTO boundary VALUES(?,?,?)', boundary_rows)
+            db.execute('DELETE FROM incomplete_consumer_boundary')
+            db.executemany('INSERT INTO incomplete_consumer_boundary VALUES(?)', ((chat,) for chat in incomplete))
             db.execute('INSERT OR REPLACE INTO consumer VALUES(1,?,?)', (session, now + 1))
             db.execute('DELETE FROM candidates')
-            rows = db.execute("""SELECT e.sequence,e.recipient,e.grant_id,e.payload,w.decided_through
+            rows = db.execute("""SELECT e.sequence,e.recipient,e.grant_id,e.token,e.payload,w.decided_through
                 FROM events e JOIN scans s USING(recipient, grant_id) JOIN replay_windows w USING(recipient, grant_id)
                 WHERE e.payload IS NOT NULL ORDER BY sequence""").fetchall()
-            for seq, recipient, grant, body, decided in rows:
+            for seq, recipient, grant, token, body, decided in rows:
                 payload = json.loads(body)
-                closed_window = payload.get('timestamp', now) <= decided
-                can_reply = payload.get('_route') != 'realtime' and eligible(recipient, payload)
-                # Retrying a released candidate reuses its original downstream identity.
-                if closed_window and can_reply and payload.get('offlineReplay') == 'reply':
+                stamp = payload.get('timestamp', now)
+                replay = payload.get('offlineReplay')
+                uncertain = stamp == now and recipient in incomplete
+                source_row = payload.get('_sourceRow')
+                # Scans can capture fresh rows while another chat's reconnect boundary is being read.
+                if replay is None and (
+                    stamp > now
+                    or (stamp == now and not uncertain and source_row and (recipient, *source_row) not in boundary_rows)
+                ):
                     continue
-                self.stage_replay(db, seq, recipient, grant, payload, can_reply and not closed_window)
+                closed_window = stamp <= decided
+                can_reply = (
+                    payload.get('_route') != 'realtime'
+                    and payload.get('contextOnly') is not True
+                    and eligible(recipient, payload)
+                )
+                # Retrying a released candidate reuses its original downstream identity.
+                if closed_window and can_reply and replay == 'reply':
+                    continue
+                if uncertain:
+                    self.keep_as_context(db, token)
+                else:
+                    self.stage_replay(db, seq, recipient, grant, payload, can_reply and not closed_window)
+
+    @staticmethod
+    def keep_as_context(db, token):
+        db.execute(
+            """UPDATE events SET payload=json_set(payload,'$.offlineReplay','context',
+               '$.contextOnly',json('true')) WHERE token=?""",
+            (token,),
+        )
 
     @staticmethod
     def stage_replay(db, seq, recipient, grant, payload, eligible):
@@ -158,52 +204,80 @@ class ReaderIntake:
                     )
         db.execute("UPDATE events SET payload=json_set(payload,'$.offlineReplay',?) WHERE sequence=?", (replay, seq))
 
-    def scan(self, recipient, grant, started, now, *, boundary_rows=None, initial_heads=None):
-        with self.connection() as db:
-            db.execute('BEGIN IMMEDIATE')
-            if now < started:
+    @staticmethod
+    def scan_state(db, recipient):
+        consumer = db.execute('SELECT session,cutoff FROM consumer WHERE singleton=1').fetchone()
+        previous = db.execute(
+            'SELECT grant_id,baseline,through,restart FROM scans WHERE recipient=?', (recipient,)
+        ).fetchone()
+        return consumer, previous
+
+    def scan(self, recipient, grant, started, now, *, boundary_rows=None, initial_heads=None, grant_start=None):
+        if now < started:
+            raise ReaderClockMovedBackward()
+        while True:
+            with self.connection() as db:
+                db.execute('BEGIN')
+                basis = self.scan_state(db, recipient)
+            consumer, previous = basis
+            cutoff = max(started, consumer[1] if consumer else 0, previous[3] if previous else 0)
+            if now < max(cutoff - 1, previous[2] if previous else 0):
                 raise ReaderClockMovedBackward()
-            started = max(started, self.consumer_cutoff(db))
-            previous = db.execute(
-                'SELECT grant_id,baseline,through,restart FROM scans WHERE recipient=?', (recipient,)
-            ).fetchone()
-            if now < max(started - 1, previous[2] if previous else 0, previous[3] - 1 if previous else 0):
+
+            new_grant = previous is None or previous[0] != grant
+            resumed = not new_grant and previous[2] >= cutoff - 1 and now - previous[2] > POLL_GAP_SECONDS
+            baseline = (grant_start['since'] if grant_start is not None else now) if new_grant else previous[1]
+            if baseline > now:
                 raise ReaderClockMovedBackward()
-            if previous is None or previous[0] != grant:
-                db.execute('DELETE FROM shard_progress WHERE recipient=?', (recipient,))
-                if initial_heads is not None:
-                    self.save_shard_heads(db, recipient, initial_heads(), initial=True)
-                # Rows already present in the baseline second precede this grant, including rows awaiting a server ID.
-                db.execute('DELETE FROM initial_rows WHERE recipient=?', (recipient,))
-                if boundary_rows is not None:
-                    db.executemany(
-                        'INSERT OR IGNORE INTO initial_rows VALUES(?,?,?,?,?)',
-                        ((chat, grant, now, shard, local_id) for chat, shard, local_id in boundary_rows()),
+            heads, boundary = None, ()
+            # The client database may be slow. Keep scans, captures and acknowledgements
+            # for other conversations free of its I/O and validate this plan before writing.
+            if new_grant:
+                if grant_start is not None:
+                    heads = {shard: int(head) for shard, head in grant_start['heads'].items()}
+                elif initial_heads is not None:
+                    heads = initial_heads()
+            if boundary_rows is not None and (resumed or (new_grant and grant_start is None)):
+                boundary = list(boundary_rows())
+
+            with self.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if self.scan_state(db, recipient) != basis:
+                    continue
+                if new_grant:
+                    cutoff = max(started, consumer[1] if consumer else 0)
+                    self.start_scan(db, recipient, grant, baseline, cutoff, heads, boundary)
+                elif resumed:
+                    cutoff = now + 1
+                    db.execute('DELETE FROM boundary WHERE recipient=?', (recipient,))
+                    db.executemany('INSERT OR IGNORE INTO boundary VALUES(?,?,?)', boundary)
+                    db.execute(
+                        'UPDATE replay_windows SET poll_cutoff=? WHERE recipient=? AND grant_id=?',
+                        (cutoff, recipient, grant),
                     )
-                db.execute('DELETE FROM provisional WHERE recipient=?', (recipient,))
-                db.execute('DELETE FROM candidates WHERE recipient=?', (recipient,))
-                db.execute('INSERT OR REPLACE INTO replay_windows(recipient,grant_id) VALUES(?,?)', (recipient, grant))
-                db.execute('INSERT OR REPLACE INTO scans VALUES(?,?,?,?,?)', (recipient, grant, now, now, started))
-                return now, now, False
-            _, baseline, through, restart = previous
-            cutoff = max(started, restart)
-            if through >= cutoff - 1 and now - through > POLL_GAP_SECONDS:
-                cutoff = now + 1
-                db.execute('DELETE FROM boundary WHERE recipient=?', (recipient,))
-                if boundary_rows is not None:
-                    db.executemany('INSERT OR IGNORE INTO boundary VALUES(?,?,?)', boundary_rows())
-                db.execute(
-                    'UPDATE replay_windows SET poll_cutoff=? WHERE recipient=? AND grant_id=?',
-                    (cutoff, recipient, grant),
-                )
-            if cutoff != restart:
-                db.execute('UPDATE scans SET restart=? WHERE recipient=?', (cutoff, recipient))
-            offline = through < cutoff - 1
-            upper = min(now, through + 3600, cutoff - 1 if offline else now)
-            # A row can first appear with an older create_time and a complete server ID.
-            # Crossing a checkpoint retries the wider scan until finish_scan commits it.
-            overlap = RESCAN_SECONDS if upper // RESCAN_INTERVAL > through // RESCAN_INTERVAL else 3
-            return max(baseline, through - overlap), max(through, upper), offline
+                if not new_grant and cutoff != previous[3]:
+                    db.execute('UPDATE scans SET restart=? WHERE recipient=?', (cutoff, recipient))
+                through = baseline if new_grant else previous[2]
+                offline = through < cutoff - 1
+                upper = min(now, through + 3600, cutoff - 1 if offline else now)
+                # Crossing a checkpoint retries the wider scan until finish_scan commits it.
+                overlap = RESCAN_SECONDS if upper // RESCAN_INTERVAL > through // RESCAN_INTERVAL else 3
+                return max(baseline, through - overlap), max(through, upper), offline
+
+    def start_scan(self, db, recipient, grant, baseline, cutoff, heads, boundary):
+        db.execute('DELETE FROM events WHERE recipient=? AND grant_id<>?', (recipient, grant))
+        db.execute('DELETE FROM shard_progress WHERE recipient=?', (recipient,))
+        if heads is not None:
+            self.save_shard_heads(db, recipient, heads, initial=True)
+        db.execute('DELETE FROM initial_rows WHERE recipient=?', (recipient,))
+        db.executemany(
+            'INSERT OR IGNORE INTO initial_rows VALUES(?,?,?,?,?)',
+            ((chat, grant, baseline, shard, local_id) for chat, shard, local_id in boundary),
+        )
+        db.execute('DELETE FROM provisional WHERE recipient=?', (recipient,))
+        db.execute('DELETE FROM candidates WHERE recipient=?', (recipient,))
+        db.execute('INSERT OR REPLACE INTO replay_windows(recipient,grant_id) VALUES(?,?)', (recipient, grant))
+        db.execute('INSERT OR REPLACE INTO scans VALUES(?,?,?,?,?)', (recipient, grant, baseline, baseline, cutoff))
 
     @staticmethod
     def save_shard_heads(db, recipient, heads, *, initial=False):
@@ -238,6 +312,7 @@ class ReaderIntake:
                 db.execute('DELETE FROM scans WHERE recipient=?', (chat,))
                 db.execute('DELETE FROM replay_windows WHERE recipient=?', (chat,))
                 db.execute('DELETE FROM boundary WHERE recipient=?', (chat,))
+                db.execute('DELETE FROM incomplete_consumer_boundary WHERE recipient=?', (chat,))
                 db.execute('DELETE FROM candidates WHERE recipient=?', (chat,))
                 db.execute('DELETE FROM events WHERE recipient=?', (chat,))
 
@@ -250,8 +325,15 @@ class ReaderIntake:
             ).fetchone()
             if scan is None:
                 return
-            if heads:
+            if heads is not None:
                 self.save_shard_heads(db, recipient, heads)
+                # Catch-up pages have no head snapshot. Keep acknowledgements
+                # until this chat has passed both the time and append scans.
+                cutoff = min(through - RESCAN_SECONDS, int(time.time()) - ACK_RETENTION_SECONDS)
+                db.execute(
+                    'DELETE FROM events WHERE recipient=? AND grant_id=? AND payload IS NULL AND captured<?',
+                    (recipient, grant, cutoff),
+                )
             end = max(started, scan[0], self.consumer_cutoff(db)) - 1
             if through >= end:
                 # Deliver the wake candidate after its accumulated context, including
@@ -300,15 +382,28 @@ class ReaderIntake:
                     (recipient, grant, *key),
                 )
 
+    def has_event(self, recipient, grant, rawid):
+        with self.connection() as db:
+            return (
+                db.execute(
+                    'SELECT 1 FROM events WHERE recipient=? AND grant_id=? AND rawid=?', (recipient, grant, rawid)
+                ).fetchone()
+                is not None
+            )
+
     def capture(
         self, payload, grant, *, offline=False, eligible=False, sort_key='', local_row=None, history_only=False
     ):
-        if sort_key:
-            payload = {**payload, '_order': sort_key}
+        payload = {
+            **payload,
+            **({'_order': sort_key} if sort_key else {}),
+            **({'_sourceRow': local_row} if local_row is not None else {}),
+        }
         body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         if len(body.encode()) > 131072:
             raise RuntimeError('READER_EVENT_TOO_LARGE')
         now = int(time.time())
+        stamp = payload.get('timestamp', now)
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             key = (payload['sessionId'], grant, payload['rawid'])
@@ -319,7 +414,7 @@ class ReaderIntake:
             token = secrets.token_hex(32)
             seq = db.execute(
                 'INSERT INTO events(recipient,grant_id,rawid,token,captured,payload) VALUES(?,?,?,?,?,?)',
-                (*key, token, now, body),
+                (*key, token, max(now, stamp), body),
             ).lastrowid
             db.executemany('INSERT INTO event_media VALUES(?,?)', ((token, ref) for ref in event_media_ids(payload)))
             consumer = self.consumer_cutoff(db)
@@ -330,9 +425,16 @@ class ReaderIntake:
             ).fetchone()
             restart, poll_cutoff, decided = window or (0, 0, -1)
             cutoff = max(restart, consumer)
-            stamp = payload.get('timestamp', now)
             if cutoff and stamp == cutoff - 1 and cutoff in (consumer, poll_cutoff):
-                offline = (
+                uncertain = (
+                    cutoff == consumer
+                    and db.execute('SELECT 1 FROM incomplete_consumer_boundary WHERE recipient=?', (key[0],)).fetchone()
+                    is not None
+                )
+                # Without a snapshot at the handshake, this second cannot
+                # reliably trigger a new reply, including an assistant task.
+                history_only = history_only or uncertain
+                offline = uncertain or (
                     local_row is not None
                     and db.execute(
                         'SELECT 1 FROM boundary WHERE recipient=? AND shard=? AND local_id=?', (key[0], *local_row)
@@ -342,19 +444,64 @@ class ReaderIntake:
             elif stamp < cutoff:
                 offline = True
             offline = offline or history_only
-            if offline:
-                self.stage_replay(db, seq, key[0], grant, payload, eligible and not history_only and stamp > decided)
-            db.execute('DELETE FROM events WHERE payload IS NULL AND captured<?', (now - 86400,))
+            if history_only:
+                self.keep_as_context(db, token)
+            elif offline:
+                self.stage_replay(db, seq, key[0], grant, payload, eligible and stamp > decided)
             return 'offline' if offline else 'live'
 
     def pinned_media(self):
         with self.connection() as db:
-            return {ref for (ref,) in db.execute('SELECT DISTINCT ref FROM event_media')}
+            references = {ref for (ref,) in db.execute('SELECT DISTINCT ref FROM event_media')}
+        # Read the durable bridge state after the inbox snapshot. An ACK can
+        # only remove its inbox pin after publishing the bridge's references.
+        for file in self.bridge_buffers:
+            try:
+                pins = json.loads(file.read_text(encoding='utf-8')).get('readerMediaPins')
+            except FileNotFoundError:
+                continue
+            if pins and pins.get('account') == self.account_ref:
+                references.update(pins['ids'])
+        return references
 
-    def next(self, current_grant, busy_tokens=()):
+    @staticmethod
+    def delivery_heads(db, scope=()):
+        # At capacity, available heads precede events held for catch-up.
+        full = db.execute('SELECT COUNT(*) FROM events WHERE payload IS NOT NULL').fetchone()[0] >= MAX_PENDING
+        cutoff = ReaderIntake.consumer_cutoff(db)
+        recipient_filter = ' AND e.recipient=? AND e.grant_id=?' if scope else ''
+        return db.execute(
+            f"""WITH pending AS (
+                    SELECT e.*, json_extract(payload,'$.offlineReplay') AS replay,
+                        COALESCE(json_extract(payload,'$._order'),
+                                 printf('%020d-%020d',json_extract(payload,'$.timestamp'),sequence)) AS sort_key
+                    FROM events e WHERE payload IS NOT NULL{recipient_filter}
+                ), heads AS (
+                    SELECT e.sequence AS sequence,
+                        e.sequence IS c.sequence AS held,
+                        e.sequence IS c.sequence OR (e.replay IS NULL AND
+                            (c.sequence IS NOT NULL OR COALESCE(s.through < MAX(s.restart,b.cutoff)-1,0))) AS fenced,
+                        ROW_NUMBER() OVER (
+                        PARTITION BY e.recipient,e.grant_id ORDER BY
+                        (e.sequence IS c.sequence),
+                        CASE e.replay WHEN 'context' THEN 0 WHEN 'reply' THEN 1 ELSE 2 END,
+                        e.sort_key, e.sequence
+                    ) AS position
+                    FROM pending e LEFT JOIN scans s USING(recipient,grant_id)
+                                  LEFT JOIN candidates c USING(recipient,grant_id)
+                                  CROSS JOIN (SELECT ? AS cutoff) b
+                    WHERE (e.sequence IS NOT c.sequence OR ?)
+                      AND (c.sequence IS NULL OR e.sort_key < c.sort_key OR ?)
+                      AND (e.replay IS NOT NULL OR
+                           (c.sequence IS NULL AND COALESCE(s.through >= MAX(s.restart,b.cutoff)-1,1)) OR ?)
+                ) SELECT e.sequence,e.recipient,e.grant_id,e.token,h.fenced,h.held FROM heads h
+                  JOIN events e USING(sequence) WHERE position=1 ORDER BY h.held,h.fenced,e.sequence""",
+            (*scope, cutoff, full, full, full),
+        )
+
+    def next(self, current_grant, busy_tokens=(), exclude_routes=()):
         with self.connection() as db:
-            # An unacknowledged item is replayed until a downstream consumer
-            # records its decision. Re-adding a chat cannot revive its old grant.
+            db.execute('BEGIN')
             busy_chats = {
                 chat
                 for (chat,) in db.execute(
@@ -362,39 +509,38 @@ class ReaderIntake:
                     (json.dumps(busy_tokens),),
                 )
             }
-            # Hold the context following a candidate until the scanner either
-            # demotes it or closes the window. At capacity let context drain so
-            # the scanner can advance; the bridge uses the saved row order.
-            full = db.execute('SELECT COUNT(*) FROM events WHERE payload IS NOT NULL').fetchone()[0] >= MAX_PENDING
-            for seq, recipient, grant, token, body in db.execute(
-                """WITH pending AS (
-                    SELECT e.*, json_extract(payload,'$.offlineReplay') AS replay,
-                        COALESCE(json_extract(payload,'$._order'),
-                                 printf('%020d-%020d',json_extract(payload,'$.timestamp'),sequence)) AS sort_key
-                    FROM events e WHERE payload IS NOT NULL
-                ), heads AS (
-                    SELECT e.sequence AS sequence, ROW_NUMBER() OVER (
-                        PARTITION BY e.recipient,e.grant_id ORDER BY
-                        CASE e.replay WHEN 'context' THEN 0 WHEN 'reply' THEN 1 ELSE 2 END,
-                        e.sort_key, e.sequence
-                    ) AS position
-                    FROM pending e LEFT JOIN scans s USING(recipient,grant_id)
-                                  LEFT JOIN candidates c USING(recipient,grant_id)
-                    WHERE e.sequence IS NOT c.sequence
-                      AND (c.sequence IS NULL OR e.sort_key < c.sort_key OR ?)
-                      AND (e.replay IS NOT NULL OR (c.sequence IS NULL AND COALESCE(s.through >= s.restart-1,1)))
-                ) SELECT e.sequence,e.recipient,e.grant_id,e.token,e.payload FROM heads
-                  JOIN events e USING(sequence) WHERE position=1 ORDER BY e.sequence""",
-                (full,),
-            ):
-                if recipient in busy_chats:
+            candidates = self.delivery_heads(db).fetchall()
+        # Resolving a grant can read local configuration. Release the inbox snapshot first.
+        for _, recipient, grant, token, _, _ in candidates:
+            if recipient in busy_chats:
+                continue
+            if current_grant(recipient) != grant:
+                with self.connection() as db:
+                    db.execute('UPDATE events SET payload=NULL WHERE token=? AND payload IS NOT NULL', (token,))
+                continue
+            with self.connection() as db:
+                # The original token must still be at the front of the same grant.
+                db.execute('BEGIN IMMEDIATE')
+                head = self.delivery_heads(db, (recipient, grant)).fetchone()
+                if head is None or head[3] != token:
                     continue
-                if current_grant(recipient) != grant:
-                    db.execute('UPDATE events SET payload=NULL WHERE sequence=?', (seq,))
-                    continue
+                sequence, _, _, _, fenced, held = head
+                (body,) = db.execute('SELECT payload FROM events WHERE token=?', (token,)).fetchone()
                 item = json.loads(body)
-                order = item.pop('_order', None)
                 route = item.pop('_route', None)
+                if route in exclude_routes or (fenced and 'dsh' in exclude_routes):
+                    continue
+                if fenced:
+                    # The live head query applied the current capacity and candidate rules in this transaction.
+                    self.keep_as_context(db, token)
+                    if held:
+                        db.execute(
+                            'DELETE FROM candidates WHERE recipient=? AND grant_id=? AND sequence=?',
+                            (recipient, grant, sequence),
+                        )
+                    item.update(offlineReplay='context', contextOnly=True)
+                order = item.pop('_order', None)
+                item.pop('_sourceRow', None)
                 return {
                     **item,
                     'readerIntake': {

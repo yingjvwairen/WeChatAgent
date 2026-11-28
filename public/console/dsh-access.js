@@ -46,7 +46,7 @@ export function createDshAccessUI({ api, modal, closeModal, escapeHtml: esc, ico
       },
     });
     const results = await Promise.allSettled([
-      api('/api/config'),
+      api('/api/chat-targets'),
       api('/api/dsh-catalog' + (typeof key === 'string' ? '?conversationKey=' + encodeURIComponent(key) : '')),
     ]);
     if (!current()) return;
@@ -469,7 +469,12 @@ export function createDshAccessUI({ api, modal, closeModal, escapeHtml: esc, ico
         if (payload.settings.workMode !== 'assistant')
           for (const field of ['mode', 'preset', 'remoteApproval', 'timeoutMinutes', 'toolLimit'])
             delete payload.access[field];
-        const result = await api('/api/chat-settings', { revision: saved.revision, key, ...payload });
+        const result = await api('/api/chat-settings', {
+          account: saved.account,
+          revision: saved.revision,
+          key,
+          ...payload,
+        });
         if (!current()) return;
         onSave(result, key);
         closeModal({ force: true });

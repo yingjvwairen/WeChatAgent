@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { attachOcrQuote } from './desktop-sender/qt-quote-ocr.mjs';
 import {
   quoteHistoryQuery,
   historyNavigationResult,
@@ -15,6 +16,21 @@ import {
 
 const missing = () =>
   Object.assign(Error('QT_QUOTE_SOURCE_NOT_VISIBLE'), { code: 'QT_QUOTE_SOURCE_NOT_VISIBLE', attempted: false });
+
+test('OCR refuses a plain quote without Reader uniqueness before capturing or applying input', async () => {
+  const driver = {
+    region: name =>
+      name === 'header' ? { left: 0, top: 0, right: 500, bottom: 40 } : { left: 0, top: 300, right: 500, bottom: 400 },
+    capture: () => assert.fail('ambiguous quote reached capture'),
+    requestNative: () => assert.fail('ambiguous quote reached native input'),
+  };
+  await assert.rejects(attachOcrQuote(driver, { quote: { text: 'goodmorning' } }, {}, undefined), error => {
+    assert.equal(error.code, 'QT_QUOTE_SOURCE_NOT_VISIBLE');
+    assert.equal(error.attempted, false);
+    assert.equal(error.quoteDraftUntouched, true);
+    return true;
+  });
+});
 const result = (fields = {}) => ({
   ok: true,
   mode: 'navigate-history',

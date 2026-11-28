@@ -44,6 +44,9 @@ test('desktop deployment bundles runtimes and verified native tools without sele
   assert.equal(config.runtime.sender, 'wechat-ui');
   assert.equal(config.input.wechatExecutable, '');
   assert.equal(config.input.expectedVersion, '4.2.0.53');
+  const profile = JSON.parse(fs.readFileSync(path.join(installed.root, 'release-profile.json')));
+  assert.equal(config.input.expectedVersion, profile.wechatVersion);
+  assert.equal(distribution.wechatVersion, profile.wechatVersion);
   assert.equal(distribution.desktopRuntime, true);
   assert.deepEqual(distribution.bundledWechatVersions, []);
   assert.equal(distribution.dshBundled, false);
@@ -75,6 +78,11 @@ test('desktop upgrades preserve user program selection, persona, targets, and lo
 });
 test('wrong client manifests and corrupted native executables are rejected', async t => {
   const f = fixture(t);
+  const expectedVersion = f.manifest.wechatVersion;
+  f.manifest.wechatVersion = '4.2.0.12';
+  f.write('project/deployment.json', JSON.stringify(f.manifest));
+  await assert.rejects(deployment.bootstrapDeployment(f.resources, f.home), /版本无效/);
+  f.manifest.wechatVersion = expectedVersion;
   f.manifest.bundledWechatVersions = ['4.2.0.53'];
   f.write('project/deployment.json', JSON.stringify(f.manifest));
   await assert.rejects(deployment.bootstrapDeployment(f.resources, f.home), /版本无效/);
@@ -112,8 +120,8 @@ test('both preinstalled voice plugins are builtin and disabled until configured'
       chats,
     })),
     [
-      { id, version: '1.7.1', builtin: true, enabled: false, permissions: [], chats: [] },
-      { id: dialogue, version: '1.8.1', builtin: true, enabled: false, permissions: [], chats: [] },
+      { id, version: '1.7.2', builtin: true, enabled: false, permissions: [], chats: [] },
+      { id: dialogue, version: '1.8.2', builtin: true, enabled: false, permissions: [], chats: [] },
     ],
   );
   assert.equal(fs.existsSync(path.join(fresh.root, 'config/plugins.json')), false);
@@ -146,7 +154,7 @@ test('both preinstalled voice plugins are builtin and disabled until configured'
     pluginCatalog(priorRoot).plugins.map(({ id, version, builtin, enabled }) => ({ id, version, builtin, enabled })),
     [
       { id, version: '1.5.0', builtin: false, enabled: true },
-      { id: dialogue, version: '1.8.1', builtin: true, enabled: false },
+      { id: dialogue, version: '1.8.2', builtin: true, enabled: false },
     ],
   );
 });
@@ -161,7 +169,7 @@ test('updating a verified bundled copy preserves grants and archives its old cod
       [prefix + 'plugin.json']: JSON.stringify({ id, name: 'Fixture', host: 'wechatagent', apiVersion: 2, version }),
       [prefix + 'index.mjs']: code,
     };
-    f.manifest.files = ['config/wechatagent.example.json', ...Object.keys(files)];
+    f.manifest.files = ['release-profile.json', 'config/wechatagent.example.json', ...Object.keys(files)];
     f.manifest.sourceHashes = Object.fromEntries(Object.entries(files).map(([name, value]) => [name, hash(value)]));
     for (const [name, value] of Object.entries(files)) f.write('project/' + name, value);
     f.write('project/deployment.json', JSON.stringify(f.manifest));

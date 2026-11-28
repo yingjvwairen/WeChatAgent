@@ -1,6 +1,8 @@
 import { featurePlugins } from '../../../packages/plugin-api/catalog.mjs';
 import { writeVoiceAttempt } from '../../../packages/plugin-api/voice-status.mjs';
 import { VoiceIngress } from './core/voice-ingress.js';
+import { boundedTask } from '../../../packages/dsh-social-bridge-plugin/deadline.mjs';
+import { validReaderOrder } from '../../../packages/wechat-identity.mjs';
 import { replyMessageLimit } from '../../../packages/dsh-social-bridge-plugin/reply-layout-policy.mjs';
 import { AssistantFeedback } from '../../../packages/dsh-social-bridge-plugin/assistant-feedback.mjs';
 import { createAssistantNoticeDelivery } from './core/assistant-notice-delivery.js';
@@ -8,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { WechatOneBotAdapter } from './adapters/wechat/wechat-onebot-adapter.js';
 import { MessageBuffer } from './core/message-buffer.js';
-import { DshConnectionGuard, acceptsReaderMessage } from './core/dsh-connection.js';
+import { DshConnectionGuard } from './core/dsh-connection.js';
 import { SocialEngine, assistantChatRequest } from './core/social-engine.js';
 import { DshPluginClient } from './dsh/plugin-client.js';
 import { buildConversationKey } from './core/conversation-key.js';
@@ -19,7 +21,7 @@ import { searchPolicy } from '../../../packages/dsh-social-bridge-plugin/search-
 import { ProactiveEngine } from './core/proactive-engine.js';
 import { ContextMaintenance } from './core/context-maintenance.js';
 import { HistoryStore } from '../../../packages/dsh-social-bridge-plugin/history-store.mjs';
-import { scopeHistory } from '../../../packages/dsh-social-bridge-plugin/work-modes.mjs';
+import { historyScopeKey, scopeHistory } from '../../../packages/dsh-social-bridge-plugin/work-modes.mjs';
 import { activeReaderAccount } from '../../../scripts/reader-account-state.mjs';
 import { ReplyDeliveryControls } from '../../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 
@@ -42,19 +44,23 @@ const historyRoot = path.resolve(
     (config.search_policy_file ? path.dirname(path.dirname(config.search_policy_file)) : path.resolve(root, '../..')),
 );
 const historyAccount = activeReaderAccount(historyRoot);
+const readerAccountIsCurrent = () => {
+  const live = activeReaderAccount(historyRoot);
+  return live.id === historyAccount.id && (live.id !== '' || live.legacyId === historyAccount.legacyId);
+};
 const baseHistoryStore = new HistoryStore(historyRoot, historyAccount.id || historyAccount.legacyId);
 const historyStore = scopeHistory(baseHistoryStore, (_key, row) => row?.work_mode ?? 'social');
 const historyArchive = {
   backfill: (...args) => historyStore.backfill(...args),
   append: (...args) => {
-    if (activeReaderAccount(historyRoot).id !== historyAccount.id)
-      throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
+    if (!readerAccountIsCurrent()) throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
     return historyStore.append(...args);
   },
 };
 const buffer = new MessageBuffer(path.resolve(root, config.message_buffer?.path ?? 'state/social-messages.json'), {
   maxPerChat: config.message_buffer?.max_messages_per_chat ?? 300,
   archive: historyArchive,
+  readerAccount: historyAccount.id,
 });
 const plugin = new DshPluginClient(
   {
@@ -74,11 +80,13 @@ import {
   assistantSenderAllowed,
   assistantGroupChatAllowed,
   verifiedAssistantSender,
+  assistantReplayAllowed,
 } from '../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import {
   conversationGrant,
   conversationMode,
   conversationWorkMode,
+  naturalGroupWakeEpoch,
 } from '../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 const currentWechat = () =>
   config.search_policy_file
@@ -116,11 +124,15 @@ const deliveryTarget = message => ({
   target: message.conversation_id,
   rosterGrant: message.readerGrant,
 });
+const deliveryControls = new ReplyDeliveryControls(
+  historyRoot,
+  historyAccount.id || historyAccount.legacyId || 'legacy',
+);
 const engine = new SocialEngine({
   buffer,
   connection,
   roleFor: key => personaFor(key).persona,
-  deliveryControls: new ReplyDeliveryControls(historyRoot, historyAccount.id || historyAccount.legacyId || 'legacy'),
+  deliveryControls,
   personaNameFor: key => personaFor(key).personaName,
   workModeFor,
   assistantControl: (key, action, message, command) =>
@@ -139,12 +151,13 @@ const engine = new SocialEngine({
   wakeWords: wechat.wake_words ?? [],
   mode: wechat.wake_mode ?? 'hybrid',
   modeFor,
+  naturalGroupEpochFor: key => naturalGroupWakeEpoch(currentWechat(), key),
   batchMs: config.social?.batch_ms ?? 3000,
   minIntervalMs: config.social?.min_interval_ms ?? 15000,
   privateMinIntervalMs: config.social?.private_min_interval_ms ?? 1000,
   maxPerMinute: config.social?.max_per_minute ?? 3,
   maxPerTenMinutes: config.social?.max_per_ten_minutes ?? 10,
-  decide: (key, prompt, metadata) => plugin.followup(key, prompt, metadata),
+  decide: (...args) => plugin.followup(...args),
   modelSearchReady: () => plugin.modelSearchReady(),
   searchFor: searchStateFor,
   searchPolicyFor: message =>
@@ -178,6 +191,7 @@ const engine = new SocialEngine({
       receiptOnly: options?.receiptOnly,
     }),
   voiceReplyFor: message => adapter.voiceCapability(deliveryTarget(message)).then(result => result.voice === true),
+  prepareVoiceRows: (...args) => voiceIngress.prepareRows(...args),
   send: (message, text, options) =>
     adapter.sendText({
       ...deliveryTarget(message),
@@ -191,8 +205,7 @@ const memberHistory = scopeHistory(baseHistoryStore, () => 'assistant-chat', { f
 const memberArchive = {
   backfill: (...args) => memberHistory.backfill(...args),
   append: (...args) => {
-    if (activeReaderAccount(historyRoot).id !== historyAccount.id)
-      throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
+    if (!readerAccountIsCurrent()) throw Error('ACCOUNT_SWITCH_REQUIRES_BRIDGE_RESTART');
     return memberHistory.append(...args);
   },
 };
@@ -203,7 +216,7 @@ const memberBuffer = new MessageBuffer(
     historyAccount.id || historyAccount.legacyId || 'legacy',
     'assistant-group-chat.json',
   ),
-  { maxPerChat: buffer.maxPerChat, archive: memberArchive },
+  { maxPerChat: buffer.maxPerChat, archive: memberArchive, readerAccount: historyAccount.id },
 );
 const memberConnection = new DshConnectionGuard({
   buffer: memberBuffer,
@@ -226,7 +239,7 @@ const proactive = new ProactiveEngine({
       ? JSON.parse(fs.readFileSync(config.proactive_policy_file, 'utf8').replace(/^\uFEFF/, ''))
       : { wechat },
   personaFor,
-  decide: (key, prompt, metadata) => plugin.followup(key, prompt, metadata),
+  decide: (...args) => plugin.followup(...args),
   searchFor: searchStateFor,
   send: (message, text, options) =>
     adapter.sendText({
@@ -245,7 +258,10 @@ const contextMaintenance = new ContextMaintenance({
     config.context_policy_file
       ? JSON.parse(fs.readFileSync(config.context_policy_file, 'utf8').replace(/^\uFEFF/, ''))
       : { wechat },
-  maintain: (key, version) => plugin.maintainContext(key, version),
+  maintain: (key, version) =>
+    boundedTask(signal => plugin.maintainContext(key, version, { signal, ...connection.metadata() }), {
+      signal: connection.signal,
+    }),
   proactivePending: key => !!proactive.state.chats[key]?.job,
   isReady: () => connection.ready && adapter.stats.connected && !!adapter.selfId,
   log,
@@ -257,113 +273,123 @@ const voicePluginsFor = message =>
     'voice-input-v1',
     buildConversationKey(message.platform, message.kind, message.conversation_id),
   );
+const sameVoicePlugin = (first, second) => first.id === second.id && first.generation === second.generation;
 const voiceIngress = new VoiceIngress({
-  // Settings generations in effect when the voice arrived. The status goes to the
-  // plugin DSH reports as the handler, else to every candidate (e.g. a conflict).
+  // Report the attempt against the settings generation that supplied it.
   generationFor: voicePluginsFor,
-  onResult: (_message, result, plugins) => {
+  onResult: (message, result, plugins) => {
+    const current = voicePluginsFor(message);
     for (const item of plugins)
-      if (!result.plugin || result.plugin === item.id) writeVoiceAttempt(historyRoot, item.id, result, item.generation);
+      if ((!result.plugin || result.plugin === item.id) && current.some(plugin => sameVoicePlugin(plugin, item)))
+        writeVoiceAttempt(historyRoot, item.id, result, item.generation);
   },
   recognize: (message, options) =>
     plugin.recognizeVoice(
       buildConversationKey(message.platform, message.kind, message.conversation_id),
       message.voice,
       verifiedAssistantSender(message),
-      options,
+      { ...options, rosterGrant: message.readerGrant },
     ),
-  async canRecognize(message) {
+  canRecognize(message, providers = []) {
     const key = buildConversationKey(message.platform, message.kind, message.conversation_id);
-    if (activeReaderAccount(historyRoot).id !== historyAccount.id || !voicePluginsFor(message).length) return false;
-    if (!(await connection.check({ force: true })) || !acceptsReaderMessage(connection, message)) return false;
-    return (
-      engine.workModeFor(key) !== 'assistant' ||
-      engine.assistantAllowed(key, message) ||
-      (message.kind === 'group' && memberEngine.assistantAllowed(key, message))
-    );
+    if (!readerAccountIsCurrent() || conversationGrant(currentWechat(), key) !== message.readerGrant) return false;
+    const current = voicePluginsFor(message);
+    return current.length > 0 && providers.every(provider => current.some(plugin => sameVoicePlugin(plugin, provider)));
   },
-  deliver: routeIncoming,
   log,
 });
+function hasReceivedInput(key, message) {
+  return (
+    buffer.confirmBuffered(message) ||
+    memberBuffer.confirmBuffered(message) ||
+    ['social', 'assistant', 'assistant-chat'].some(mode =>
+      baseHistoryStore.hasIncoming(historyScopeKey(key, mode), message),
+    )
+  );
+}
 adapter.onMessage(message => {
-  void voiceIngress.push(message).catch(() => log('[Voice] inbound_failed'));
+  void routeIncoming(message);
 });
 adapter.acceptPersisted = async (message, intake) => {
   const key = buildConversationKey(message.platform, message.kind, message.conversation_id);
-  const current = activeReaderAccount(historyRoot);
-  if ((current.id || current.legacyId) !== (historyAccount.id || historyAccount.legacyId)) return false;
-  if (current.id && intake.account !== current.id) return false;
-  if (conversationGrant(currentWechat(), key) !== intake.grant) return true;
-  // A restarted reader may offer an already persisted voice. Check source ID
-  // before contacting an ASR provider or scheduling another model request.
-  const mode = engine.workModeFor(key);
-  if (historyStore.hasIncoming(key, { ...message, work_mode: mode }) || memberHistory.hasIncoming(key, message))
-    return true;
-  if (buffer.confirmBuffered(message) || memberBuffer.confirmBuffered(message)) return true;
+  if (!readerAccountIsCurrent()) return false;
+  if (historyAccount.id && intake.account !== historyAccount.id) return false;
+  const live = currentWechat();
+  if (conversationGrant(live, key) !== intake.grant) return true;
+  if (hasReceivedInput(key, message)) return true;
   if (intake.offlineReplay !== undefined && !['context', 'reply'].includes(intake.offlineReplay)) return false;
   const scoped = {
     ...message,
     readerReplay: intake.offlineReplay,
     readerGrant: intake.grant,
     readerRole: intake.readerRole,
-    ...(/^\d{20}-\d{20}-[a-f0-9]{64}$/.test(intake.order ?? '') ? { readerOrder: intake.order } : {}),
+    ...(validReaderOrder(intake.order) ? { readerOrder: intake.order } : {}),
   };
-  if (!applyReplayPolicy(scoped, key)) return true;
-  if (scoped.readerReplay === 'context') return (await routeIncoming(scoped)) === true;
-  return (await voiceIngress.push(scoped)) === true;
+  if (!applyReplayPolicy(scoped, key, live)) return true;
+  return (await routeIncoming(scoped)) === true;
 };
-function applyReplayPolicy(message, key) {
+function applyReplayPolicy(message, key, live) {
   if (!message.readerReplay) return true;
-  const live = currentWechat();
   const assistant = conversationWorkMode(live, key) === 'assistant';
   const currentRole = assistant
-    ? engine.assistantAllowed(key, message)
+    ? assistantSenderAllowed(live, key, verifiedAssistantSender(message))
       ? 'assistant-admin'
       : 'assistant-member'
     : 'social';
   // Never move an event recorded in one role into another role's history.
   if (message.readerRole && message.readerRole !== currentRole) return false;
-  if (assistant && (!live.assistant?.replayOffline || !message.readerRole)) message.readerReplay = 'context';
+  if (assistant && (!message.readerRole || !assistantReplayAllowed(live, key, message.timestamp)))
+    message.readerReplay = 'context';
   return true;
 }
 
 async function routeIncoming(message) {
   try {
     const key = buildConversationKey(message.platform, message.kind, message.conversation_id);
-    const grant = conversationGrant(currentWechat(), key);
+    if (!readerAccountIsCurrent()) return false;
+    let live = currentWechat();
+    const grant = conversationGrant(live, key);
     if (!grant || (message.readerGrant !== undefined && message.readerGrant !== grant)) {
       log('[WeChat] denied ' + key);
       return true;
     }
     message = { ...message, readerGrant: grant };
     log('[WeChat] accepted ' + key);
-    if (
-      buffer.findIncoming(message) ||
-      memberBuffer.findIncoming(message) ||
-      (message.kind === 'group' &&
-        engine.workModeFor(key) === 'assistant' &&
-        engine.assistantAllowed(key, message) &&
-        memberHistory.hasIncoming(key, message))
-    ) {
+    const memberLaneFor = settings =>
+      message.kind === 'group' &&
+      conversationWorkMode(settings, key) === 'assistant' &&
+      (!assistantSenderAllowed(settings, key, verifiedAssistantSender(message)) ||
+        assistantChatRequest(message, wechat.wake_words ?? []));
+    let memberLane;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      memberLane = memberLaneFor(live);
+      await (memberLane ? memberConnection : connection).check({ force: true });
+      if (!readerAccountIsCurrent()) {
+        log('[WeChat] account_changed_before_intake ' + key);
+        return false;
+      }
+      live = currentWechat();
+      if (conversationGrant(live, key) !== grant) return true;
+      if (memberLane === memberLaneFor(live)) break;
+    }
+    // Let durable intake retry if the role changed again during the second probe.
+    if (memberLane !== memberLaneFor(live)) return false;
+    if (hasReceivedInput(key, message)) {
       log('[WeChat] ' + key + ' duplicate_routed_input_ignored');
       return true;
     }
-    const memberLane =
-      message.kind === 'group' &&
-      engine.workModeFor(key) === 'assistant' &&
-      (!engine.assistantAllowed(key, message) || assistantChatRequest(message, wechat.wake_words ?? []));
-    await (memberLane ? memberConnection : connection).check({ force: true });
-    const live = currentWechat();
-    if (conversationGrant(live, key) !== grant) return true;
-    if (!applyReplayPolicy(message, key)) return true;
-    if (memberLane) memberEngine.receive({ ...message, assistant_chat_only: true });
-    else engine.receive(message);
+    if (!applyReplayPolicy(message, key, live)) return true;
+    // Queue the reply or start the local command before writing the archive.
+    // If the archive write fails, intake retries it without rerunning the command.
+    if (memberLane) memberEngine.receive({ ...message, assistant_chat_only: true }, { deferArchive: true });
+    else engine.receive(message, { deferArchive: true });
+    if ((memberLane ? memberBuffer : buffer).confirmBuffered(message)) return true;
     if (
       (message.files?.length && engine.workModeFor(key) !== 'assistant') ||
       (message.kind === 'private' && engine.workModeFor(key) === 'assistant' && !engine.assistantAllowed(key, message))
     )
       return true;
-    return Boolean(buffer.findIncoming(message) || memberBuffer.findIncoming(message));
+    return false;
   } catch (error) {
     log(`[Social] inbound error=${error?.message ?? error}`);
   }
@@ -394,13 +420,22 @@ await adapter.start();
 log(
   `[Social] reverse OneBot listening on 127.0.0.1:${wechat.onebot?.server?.port ?? 11229}${wechat.onebot?.server?.path ?? '/ws'}`,
 );
+const archiveRecovery = new AbortController();
 const replayTimer = setInterval(() => {
+  for (const store of [buffer, memberBuffer])
+    void store
+      .retryPendingArchives({ signal: archiveRecovery.signal, isCurrent: readerAccountIsCurrent })
+      .then(failures => {
+        if (failures) log('[Social] archive_retry_pending count=' + failures);
+      })
+      .catch(error => log('[Social] archive_retry_failed code=' + (error?.code ?? 'STATE_UNAVAILABLE')));
   for (const key of buffer.keys()) engine.replay(key);
   for (const key of memberBuffer.keys()) memberEngine.replay(key);
 }, 30000);
 const noticeDelivery = createAssistantNoticeDelivery({
   adapter,
   plugin,
+  deliveryControls,
   settingsFor: () => currentWechat(),
   isReady: () => connection.ready,
   log,
@@ -411,6 +446,7 @@ void proactive.tick();
 const contextTimer = setInterval(() => void contextMaintenance.tick(), 30000);
 void contextMaintenance.tick();
 const stop = async () => {
+  archiveRecovery.abort();
   voiceIngress.stop();
   clearInterval(contextTimer);
   contextMaintenance.stop();

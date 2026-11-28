@@ -1,9 +1,15 @@
 import { formatAssistantTask } from '../../../../packages/dsh-social-bridge-plugin/assistant-tasks.mjs';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { historyQuoteRefs } from '../../../../packages/dsh-social-bridge-plugin/native-quote-source.mjs';
 import { MAX_RPC_BYTES } from '../../../../packages/dsh-social-bridge-plugin/local-policy.mjs';
 import { VOICE_TRANSCRIPTION_TIMEOUT_MS } from '../../../../packages/dsh-social-bridge-plugin/deadline.mjs';
+
+function requestSignal(timeoutMs, signal) {
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([deadline, signal]) : deadline;
+}
 
 export class DshPluginClient {
   constructor(
@@ -45,12 +51,13 @@ export class DshPluginClient {
     };
   }
 
-  async searchReady() {
+  async searchReady({ signal } = {}) {
+    signal?.throwIfAborted();
     if (this.searchHealthAt && Date.now() - this.searchHealthAt < 3000) return this.searchSupported;
     try {
       const response = await fetch(this.url + '/health', {
         headers: { authorization: 'Bearer ' + this.token },
-        signal: AbortSignal.timeout(2000),
+        signal: requestSignal(2000, signal),
       });
       const health = await response.json();
       this.searchSupported =
@@ -62,6 +69,7 @@ export class DshPluginClient {
         health.searchTool === 'model-search-v1' &&
         health.searchRoute === 'dsh-native-only-v1';
     } catch {
+      signal?.throwIfAborted();
       this.searchSupported = false;
       this.modelSearchSupported = false;
     }
@@ -74,11 +82,11 @@ export class DshPluginClient {
     return this.modelSearchSupported === true;
   }
 
-  async recognizeVoice(conversationKey, voice, senderWxid, { signal } = {}) {
+  async recognizeVoice(conversationKey, voice, senderWxid, { signal, rosterGrant } = {}) {
     const response = await fetch(this.url + '/voice-input', {
       method: 'POST',
       headers: { authorization: 'Bearer ' + this.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ conversationKey, id: voice.id, senderWxid }),
+      body: JSON.stringify({ conversationKey, id: voice.id, senderWxid, rosterGrant }),
       signal: AbortSignal.any([
         AbortSignal.timeout(VOICE_TRANSCRIPTION_TIMEOUT_MS + 1000),
         ...(signal ? [signal] : []),
@@ -87,10 +95,19 @@ export class DshPluginClient {
     const body = await response.json();
     if (!response.ok)
       return { ok: false, code: /^VOICE_[A-Z0-9_]+$/.test(body.code ?? '') ? body.code : 'VOICE_INPUT_UNAVAILABLE' };
+    if (
+      body?.ok === true &&
+      (typeof body.plugin !== 'string' ||
+        !/^[a-z][a-z0-9-]{0,39}$/.test(body.plugin) ||
+        typeof body.generation !== 'string' ||
+        body.generation.length > 200)
+    )
+      return { ok: false, code: 'VOICE_INPUT_UNAVAILABLE' };
     return body;
   }
 
-  async followup(conversationKey, message, metadata = {}, { busyRetries = 0 } = {}) {
+  async followup(conversationKey, message, metadata = {}, { busyRetries = 0, signal } = {}) {
+    signal?.throwIfAborted();
     // The server reads the owner's persona locally. Send only its digest to
     // detect stale settings without duplicating up to 60 KB in every RPC.
     const { persona, ...requestMetadata } = metadata;
@@ -114,7 +131,7 @@ export class DshPluginClient {
           method: 'POST',
           headers: { authorization: 'Bearer ' + this.token, 'content-type': 'application/json' },
           body: requestBody,
-          signal: AbortSignal.timeout(45000),
+          signal: requestSignal(45000, signal),
         });
         if (question.status !== 404) {
           const result = await question.json();
@@ -125,26 +142,30 @@ export class DshPluginClient {
           }
         }
       } catch {
+        signal?.throwIfAborted();
         return 'RESPOND: 小本本这页还在整理，稍后再来看看吧。';
       }
     }
     const chatOnly = metadata.workMode === 'assistant' && metadata.assistantChatOnly === true;
-    const remoteAssistant = metadata.workMode === 'assistant' && !chatOnly && (await this.controllerReady());
+    const remoteAssistant = metadata.workMode === 'assistant' && !chatOnly && (await this.controllerReady({ signal }));
     const response = remoteAssistant
-      ? await this.assistantFollowup(requestBody, metadata)
+      ? await this.assistantFollowup(requestBody, metadata, signal)
       : await fetch(`${this.url}/${chatOnly ? 'assistant-chat' : 'followup'}`, {
           method: 'POST',
           headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
           body: requestBody,
-          signal: AbortSignal.timeout(
+          signal: requestSignal(
             (metadata.workMode === 'assistant' && !chatOnly ? Math.max(this.timeoutMs, 605000) : this.timeoutMs) +
               (metadata.images?.length ? 80000 : 0),
+            signal,
           ),
         });
     const body = await response.json();
-    if (!response.ok && body.error === 'agent_unavailable' && body.detail === 'session_busy' && busyRetries > 0) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-      return this.followup(conversationKey, message, metadata, { busyRetries: busyRetries - 1 });
+    const busy =
+      !response.ok && body.error === 'agent_unavailable' && body.detail === 'session_busy' && body.admitted !== true;
+    if (busy && busyRetries > 0) {
+      await sleep(100, undefined, { signal });
+      return this.followup(conversationKey, message, metadata, { busyRetries: busyRetries - 1, signal });
     }
     const rejectedVision =
       !response.ok &&
@@ -191,7 +212,7 @@ export class DshPluginClient {
         conversationKey,
         message.replace(/\n<sticker_label_request>[\s\S]*?<\/sticker_label_request>/g, '') + notice,
         fallbackMetadata,
-        { busyRetries: rejectedVision ? 10 : 0 },
+        { busyRetries: rejectedVision ? 10 : 0, signal },
       );
       if (metadata.allowHistoryQuote) metadata.historyQuoteRefs = fallbackMetadata.historyQuoteRefs;
       return output.split(/STICKER_LABELS:/)[0].trim();
@@ -208,6 +229,7 @@ export class DshPluginClient {
           : '';
       throw Object.assign(new Error(`DSH plugin: ${body.error ?? response.status}${detail}`), {
         admitted: body.admitted === true,
+        ...(busy ? { code: 'DSH_SESSION_BUSY' } : {}),
       });
     }
     if (Array.isArray(body.memeChoices))
@@ -227,15 +249,23 @@ export class DshPluginClient {
     return String(body.text ?? '');
   }
 
-  async controllerReady() {
-    await this.searchReady();
+  async controllerReady({ signal } = {}) {
+    await this.searchReady({ signal });
     return this.controllerSupported === true;
   }
 
-  async assistantFollowup(requestBody, metadata) {
+  async assistantFollowup(requestBody, metadata, signal) {
+    signal?.throwIfAborted();
     const request = JSON.parse(requestBody),
       body = { ...request, senderWxid: request.assistantSender };
-    let result = await this.assistantTask(body.conversationKey, 'submit', body),
+    const readTask = taskId =>
+      this.assistantTask(
+        body.conversationKey,
+        'result',
+        { senderWxid: body.senderWxid, rosterGrant: body.rosterGrant, taskId, dshInstanceId: body.dshInstanceId },
+        { signal },
+      );
+    let result = await this.assistantTask(body.conversationKey, 'submit', body, { signal }),
       job = result.task,
       lastState = '',
       lastNotice = 0;
@@ -254,6 +284,7 @@ export class DshPluginClient {
       }
     };
     while (job && ['queued', 'running', 'waiting_approval', 'waiting_input', 'cancelling'].includes(job.state)) {
+      signal?.throwIfAborted();
       const stamp = job.state + '|' + (job.approval?.id ?? job.question?.id ?? '');
       if (this.feedback) await notify(job);
       else if (stamp !== lastState || Date.now() - lastNotice >= 60000) {
@@ -263,23 +294,13 @@ export class DshPluginClient {
         lastNotice = Date.now();
       }
       if (Date.now() > deadline) throw Object.assign(Error('ASSISTANT_RESULT_WAIT_EXPIRED'), { admitted: false });
-      await new Promise(resolve => setTimeout(resolve, this.taskPollMs ?? 1000));
-      result = await this.assistantTask(body.conversationKey, 'result', {
-        senderWxid: body.senderWxid,
-        rosterGrant: body.rosterGrant,
-        taskId: job.id,
-      });
+      await sleep(this.taskPollMs ?? 1000, undefined, { signal });
+      result = await readTask(job.id);
       job = result.task;
     }
     if (!job) throw Error('ASSISTANT_TASK_NOT_FOUND');
-    if (job.state === 'completed' && !job.output)
-      job = (
-        await this.assistantTask(body.conversationKey, 'result', {
-          senderWxid: body.senderWxid,
-          rosterGrant: body.rosterGrant,
-          taskId: job.id,
-        })
-      ).task;
+    if (job.state === 'completed' && !job.output) job = (await readTask(job.id)).task;
+    signal?.throwIfAborted();
     if (this.feedback) await notify(job);
     if (job.state === 'completed')
       return new Response(JSON.stringify(job.output ?? { text: 'RESPOND: 任务已完成。' }), { status: 200 });
@@ -298,13 +319,13 @@ export class DshPluginClient {
     );
   }
 
-  async assistantTask(conversationKey, action, options = {}) {
+  async assistantTask(conversationKey, action, options = {}, { signal } = {}) {
     if (!/^[a-z-]{2,30}$/.test(action)) throw Error('ASSISTANT_INVALID_ACTION');
     const response = await fetch(this.url + '/assistant-task/' + action, {
       method: 'POST',
       headers: { authorization: 'Bearer ' + this.token, 'content-type': 'application/json' },
       body: JSON.stringify({ ...options, conversationKey }),
-      signal: AbortSignal.timeout(action === 'workspace-confirm' ? 25000 : 5000),
+      signal: requestSignal(action === 'workspace-confirm' ? 25000 : 5000, signal),
     });
     const body = await response.json();
     if (!response.ok)
@@ -315,18 +336,18 @@ export class DshPluginClient {
     return body;
   }
 
-  async maintainContext(conversationKey, bufferVersion) {
+  async maintainContext(conversationKey, bufferVersion, { signal, dshInstanceId } = {}) {
     const health = await fetch(this.url + '/health', {
       headers: { authorization: 'Bearer ' + this.token },
-      signal: AbortSignal.timeout(2000),
+      signal: requestSignal(2000, signal),
     }).then(r => r.json());
     if (health.contextMaintenance !== 'idle-threshold-v1')
       throw Object.assign(Error('CONTEXT_PLUGIN_NOT_READY'), { code: 'CONTEXT_PLUGIN_NOT_READY' });
     const response = await fetch(this.url + '/context-maintenance', {
       method: 'POST',
       headers: { authorization: 'Bearer ' + this.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ conversationKey, bufferVersion }),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      body: JSON.stringify({ conversationKey, bufferVersion, dshInstanceId }),
+      signal: requestSignal(this.timeoutMs, signal),
     });
     const body = await response.json();
     if (!response.ok || body.error)

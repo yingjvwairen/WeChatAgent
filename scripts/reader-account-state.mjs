@@ -63,6 +63,7 @@ export function accountChatSettings(config) {
     assistant: structuredClone(config.wechat.assistant ?? {}),
     whitelist: structuredClone(config.wechat.whitelist),
     rosterGrants: structuredClone(config.wechat.rosterGrants ?? {}),
+    rosterStarts: structuredClone(config.wechat.rosterStarts ?? {}),
     personaChats: structuredClone(config.persona.chats ?? {}),
     workModes: structuredClone(config.wechat.workModes ?? {}),
     modeSettings: structuredClone(config.wechat.modeSettings ?? {}),
@@ -132,8 +133,10 @@ export function applyReaderAccount(root, previousReader, nextReader, config) {
     const chats = incoming?.chats ?? { whitelist: { private: [], groups: [] }, personaChats: {}, featureChats: {} };
     selectedConfig.wechat.assistant = structuredClone(chats.assistant ?? {});
     selectedConfig.wechat.whitelist = structuredClone(chats.whitelist);
-    if (chats.rosterGrants) selectedConfig.wechat.rosterGrants = structuredClone(chats.rosterGrants);
-    else delete selectedConfig.wechat.rosterGrants;
+    for (const field of ['rosterGrants', 'rosterStarts']) {
+      if (chats[field]) selectedConfig.wechat[field] = structuredClone(chats[field]);
+      else delete selectedConfig.wechat[field];
+    }
     selectedConfig.persona.chats = structuredClone(chats.personaChats ?? {});
     selectedConfig.wechat.workModes = structuredClone(chats.workModes ?? {});
     selectedConfig.wechat.modeSettings = structuredClone(chats.modeSettings ?? {});

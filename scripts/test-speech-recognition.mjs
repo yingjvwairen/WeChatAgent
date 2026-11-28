@@ -25,8 +25,10 @@ import { PluginInstaller } from '../packages/plugin-api/installer.mjs';
 import { PluginRuntime } from '../packages/plugin-api/index.mjs';
 import { packZip } from '../packages/plugin-api/zip.mjs';
 import { createAudioReader } from '../packages/plugin-api/audio.mjs';
+import { pcmWav, validateSilk } from './decode-wechat-voice.mjs';
 import { buildPrivatePrompt } from '../components/qq-bridge/src/core/social-engine.js';
 import { VoiceIngress } from '../components/qq-bridge/src/core/voice-ingress.js';
+import { DshPluginClient } from '../components/qq-bridge/src/dsh/plugin-client.js';
 import { normalizeOneBotEvent } from '../components/qq-bridge/src/onebot/normalize.js';
 
 const source = path.resolve('optional-extensions/speech-recognition'),
@@ -128,6 +130,28 @@ test('multipart calls the configured complete endpoint with custom fields and au
   assert.equal(reads, 1);
 });
 
+test('a transcription marked no-store can change with the active local profile', async t => {
+  let transcript = '原方案',
+    calls = 0;
+  const endpoint = await server(t, (req, res) => {
+    calls++;
+    assert.equal(req.url, '/v1/audio/transcriptions');
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ text: transcript }));
+  });
+  const ctx = context({
+    endpoint: new URL('/v1', endpoint).href,
+    apiProtocol: 'openai-transcriptions',
+    model: 'default',
+    cacheResults: true,
+  });
+  assert.equal((await recognize(ctx, { id })).text, '原方案');
+  transcript = '新方案';
+  assert.equal((await recognize(ctx, { id })).text, '新方案');
+  assert.equal(calls, 2);
+});
+
 test('JSON templates preserve nested structure, escaping and numeric placeholders; plain responses are supported', async t => {
   const endpoint = await server(t, async (req, res) => {
     let raw = '';
@@ -201,6 +225,21 @@ test('a five-minute message is transcribed in five authorized chunks and returns
   });
 });
 
+test('a silent segment keeps later speech, while all-silent media has no transcript', async t => {
+  const responses = ['', 'later speech', '', ''];
+  const endpoint = await server(t, (_req, res) => res.end(JSON.stringify({ text: responses.shift() })));
+  const ctx = context({ endpoint, cacheResults: false }, async (_voice, { segment = 0 }) => ({
+    ...audio,
+    durationSeconds: 60,
+    totalDurationSeconds: 120,
+    segmentCount: 2,
+    segmentIndex: segment,
+  }));
+  assert.deepEqual(await recognize(ctx, { id }), { ok: true, id, text: 'later speech' });
+  assert.deepEqual(await recognize(ctx, { id }), { ok: false, code: 'VOICE_API_EMPTY_TRANSCRIPT', stage: 'api' });
+  assert.deepEqual(responses, []);
+});
+
 test('revoking permission between video chunks prevents the next upload and discards partial text', async t => {
   let uploads = 0,
     reads = 0;
@@ -246,6 +285,60 @@ test('audio chunk metadata is validated against the requested index and duration
   assert.equal((await reader(id, key, 'speech-recognition', { segment: 2 })).segmentCount, 3);
   body.segmentIndex = 1;
   await assert.rejects(reader(id, key, 'speech-recognition', { segment: 2 }), /VOICE_AUDIO_INVALID/);
+});
+
+test('the host encodes authorized WAV segments for a SILK provider and preserves their order', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-silk-segments-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'state'));
+  atomicJson(path.join(root, 'state/wechat-io-config.json'), {
+    reader_base_url: 'http://127.0.0.1:8765',
+    reader_token: 'fixture',
+  });
+  const requests = [];
+  let refused = false;
+  const read = createAudioReader(root, {
+    fetchImpl: async url => {
+      const query = new URL(url).searchParams;
+      const format = query.get('format');
+      const segmentIndex = Number(query.get('segment'));
+      assert.equal(query.get('conversationKey'), key);
+      assert.equal(query.get('pluginId'), 'speech-recognition');
+      requests.push([format, segmentIndex]);
+      if (refused) return Response.json({ error: 'VOICE_AUDIO_ACCESS_REVOKED' }, { status: 403 });
+      if (format === 'silk') return Response.json({ error: 'VOICE_FORMAT_UNSUPPORTED' }, { status: 503 });
+      const durationSeconds = segmentIndex === 0 ? 60 : 1;
+      const wav = pcmWav(Buffer.alloc(32000 * durationSeconds));
+      return Response.json({
+        ...audio,
+        b64: wav.toString('base64'),
+        sha256: crypto.createHash('sha256').update(wav).digest('hex'),
+        conversationKey: key,
+        durationSeconds,
+        segmentIndex,
+        segmentCount: 2,
+        totalDurationSeconds: 61,
+      });
+    },
+  });
+  const segments = audioSegments((id, options) => read(id, key, 'speech-recognition', options), id, { format: 'silk' });
+  const indexes = [];
+  for await (const segment of segments) {
+    assert.equal(segment.mime, 'audio/silk');
+    assert.equal(segment.filename, 'voice.silk');
+    validateSilk(Buffer.from(segment.b64, 'base64'));
+    indexes.push(segment.segmentIndex);
+  }
+  assert.deepEqual(indexes, [0, 1]);
+  assert.deepEqual(requests, [
+    ['silk', 0],
+    ['wav', 0],
+    ['wav', 1],
+  ]);
+  refused = true;
+  await assert.rejects(read(id, key, 'speech-recognition', { format: 'silk' }), /VOICE_AUDIO_ACCESS_REVOKED/);
+  assert.deepEqual(requests.at(-1), ['silk', 0]);
+  assert.equal(requests.length, 4);
 });
 
 test('HTTP errors never echo provider bodies or credentials; redirects are not followed', async t => {
@@ -515,6 +608,96 @@ test('asynchronous permission checks cannot exceed the two-upload concurrency li
   release();
   await Promise.all(jobs);
   assert.equal(delivered.filter(msg => msg.text.includes('语音转写')).length, 0);
+});
+
+test('the voice client accepts transcripts with an identified plugin generation', async t => {
+  const client = new DshPluginClient({ token: 'fixture-token' });
+  const reply = { ok: true, text: 'fixture transcript', plugin: 'voice-fixture' };
+  let body = reply;
+  t.mock.method(globalThis, 'fetch', async () => Response.json(body));
+  const request = () => client.recognizeVoice('wechat:private:123', { id: 'a'.repeat(64) }, '123');
+  assert.deepEqual(await request(), { ok: false, code: 'VOICE_INPUT_UNAVAILABLE' });
+  body = { ...reply, generation: { value: 'invalid' } };
+  assert.deepEqual(await request(), { ok: false, code: 'VOICE_INPUT_UNAVAILABLE' });
+  body = { ...reply, generation: 'fixture-generation' };
+  assert.deepEqual(await request(), body);
+});
+
+test('a queued voice reports the provider generation that actually ran after the slots opened', async t => {
+  const busy = Promise.withResolvers();
+  const queued = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let started = 0;
+  let selected = { id: 'first-speech-plugin', generation: 'original-settings' };
+  const diagnostics = [];
+  const ingress = new VoiceIngress({
+    generationFor: () => [selected],
+    canRecognize: (_message, providers = []) =>
+      providers.every(provider => provider.id === selected.id && provider.generation === selected.generation),
+    async recognize(message) {
+      if (message.message_id !== 'queued') {
+        if (++started === 2) busy.resolve();
+        await release.promise;
+        return { ok: false, code: 'VOICE_API_HTTP_503' };
+      }
+      return { ok: true, text: 'current settings transcript', plugin: selected.id, generation: selected.generation };
+    },
+    onResult(message, result, providers) {
+      if (message.message_id === 'queued') diagnostics.push([result.plugin, providers]);
+    },
+  });
+  t.after(() => ingress.stop());
+  const acquire = ingress.acquire.bind(ingress);
+  t.mock.method(ingress, 'acquire', signal => {
+    const result = acquire(signal);
+    if (ingress.waiters.length) queued.resolve();
+    return result;
+  });
+  const blockers = [ingress.push(message('first', true, '101')), ingress.push(message('second', true, '102'))];
+  let pending;
+  try {
+    await busy.promise;
+    pending = ingress.push(message('queued', true, '103'));
+    await Promise.race([queued.promise, pending]);
+    assert.equal(ingress.waiters.length, 1);
+    selected = { id: 'second-speech-plugin', generation: 'second-settings' };
+  } finally {
+    release.resolve();
+    await Promise.all([...blockers, pending]);
+  }
+  assert.match((await pending).text, /current settings transcript/);
+  assert.deepEqual(diagnostics, [[selected.id, [selected]]]);
+});
+
+test('a chat withdrawn during diagnostics cannot receive the prepared transcript', async t => {
+  const diagnosing = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  let permitted = true;
+  const delivered = [];
+  const ingress = new VoiceIngress({
+    recognize: async () => ({ ok: true, text: 'late fixture transcript' }),
+    onResult: async () => {
+      diagnosing.resolve();
+      await resume.promise;
+    },
+    deliver: msg => delivered.push(msg),
+  });
+  t.after(() => ingress.stop());
+  const work = ingress.push(message('one', true), { permitted: () => permitted });
+  try {
+    await Promise.race([diagnosing.promise, work]);
+    permitted = false;
+  } finally {
+    resume.resolve();
+    await work;
+  }
+
+  assert.deepEqual(delivered, []);
+  await ingress.push(message('two'));
+  assert.deepEqual(
+    delivered.map(msg => msg.message_id),
+    ['two'],
+  );
 });
 
 test('normalization admits only bounded reader references, never arbitrary audio URLs', () => {

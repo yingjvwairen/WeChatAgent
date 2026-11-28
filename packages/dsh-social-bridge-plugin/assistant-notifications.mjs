@@ -17,6 +17,7 @@ export class AssistantNotifications {
     this.bindings = {};
     this.schedules = {};
     this.messages = {};
+    this.lastListedId = null;
     if (fs.existsSync(file)) {
       const stat = fs.lstatSync(file);
       if (stat.isSymbolicLink() || stat.size > 16 * 1024 * 1024) throw Error('ASSISTANT_NOTIFICATIONS_INVALID');
@@ -26,6 +27,7 @@ export class AssistantNotifications {
         bindings: data.bindings ?? {},
         schedules: data.schedules ?? {},
         messages: data.messages ?? {},
+        lastListedId: data.lastListedId ?? null,
       });
     }
   }
@@ -36,7 +38,13 @@ export class AssistantNotifications {
     const temp = this.file + '.' + process.pid + '.tmp';
     fs.writeFileSync(
       temp,
-      JSON.stringify({ version: 1, bindings: this.bindings, schedules: this.schedules, messages: this.messages }),
+      JSON.stringify({
+        version: 1,
+        bindings: this.bindings,
+        schedules: this.schedules,
+        messages: this.messages,
+        lastListedId: this.lastListedId,
+      }),
       { mode: 0o600 },
     );
     fs.renameSync(temp, this.file);
@@ -65,10 +73,12 @@ export class AssistantNotifications {
     }
     return hash;
   }
-  list() {
+  list({ advance = false } = {}) {
     let changed = false;
     const result = [];
-    for (const item of Object.values(this.messages)) {
+    const messages = Object.values(this.messages);
+    const offset = advance ? messages.findIndex(item => item.id === this.lastListedId) + 1 : 0;
+    for (const item of [...messages.slice(offset), ...messages.slice(0, offset)]) {
       if (item.state !== 'queued') continue;
       if (
         isSilentAssistantNotification(item) ||
@@ -79,8 +89,13 @@ export class AssistantNotifications {
         changed = true;
       } else result.push(item);
     }
+    const page = result.slice(0, 20);
+    if (advance && result.length > page.length) {
+      this.lastListedId = page.at(-1).id;
+      changed = true;
+    }
     if (changed) this.persist();
-    return result.slice(0, 20);
+    return page;
   }
   ack(id) {
     const item = this.messages[id];

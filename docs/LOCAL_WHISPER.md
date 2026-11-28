@@ -12,7 +12,7 @@ npm run media:check -- --model small
 $asrPython = '.\state\local-whisper\venv\Scripts\python.exe'
 ```
 
-可选 tiny、base 或 small，文件逐项校验固定版本的摘要。已有环境和权重可通过 --python、--model-directory 指定；media:check 完全离线。Small 权重约需 484 MB 磁盘。也可将以下命令中的模型目录指向自己准备的 CTranslate2 权重。
+可选 tiny、base 或 small，文件逐项校验固定版本的摘要。准备和检查都会用当前权重转写一段内置短句。已有环境和权重可通过 `--python`、`--model-directory` 指定，`media:check` 完全离线。Small 权重约需 484 MB 磁盘。也可将以下命令中的模型目录指向自己准备的 CTranslate2 权重。
 
 Windows 本地识别进程默认使用 `CT2_USE_MKL=0` 和 `OMP_NUM_THREADS=1`，减少加载 Small 权重时的内存占用。运行环境显式设置的值优先。
 
@@ -22,7 +22,7 @@ Windows 本地识别进程默认使用 `CT2_USE_MKL=0` 和 `OMP_NUM_THREADS=1`�
 
 点击“保存并使用”会立即加载选定模型，完成后才显示就绪；切换不等待下一条消息。相同权重只改变语言或词表时复用模型，并清除旧的短期转写缓存。插件模型填 `default` 跟随界面选择，显式模型 ID 则固定使用该方案。
 
-桌面和独立机器人共同持有后台服务，只有最后一个使用者退出或失联时才释放本项目拥有的模型。预热不增加任何聊天的语音识别授权。
+桌面和独立机器人共同持有后台服务。使用者全部退出或失联时，程序会释放本项目拥有的模型。已获聊天授权的识别路线全部改为云端时，后台也会释放本机 Whisper。仍有聊天使用本机识别时会保留服务。云端期间可以保存并选定本机方案，切回本机识别时会自动加载。预热不增加任何聊天的语音识别授权。
 
 ## 可选的独立启动
 

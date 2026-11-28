@@ -49,6 +49,22 @@ export const voiceRequest = row => ({
   text: 'voice:' + row.job.id,
   selectionScope: row.scope,
 });
+export const voiceReceiptSegment = job => ({
+  id: job.id,
+  attemptId: job.id,
+  index: job.index,
+  audioSha256: job.audioSha256,
+  durationMs: job.durationMs,
+  path: job.path,
+});
+export const readerVoiceReceipt = (job, receipt) => ({
+  ...receipt,
+  type: 'desktop-reader-voice-v1',
+  deliveryId: job.id,
+  account: job.account,
+  target: job.target,
+  audioSha256: job.audioSha256,
+});
 export async function installVoice(engine, context) {
   if (context.voice) return context.voice;
   const transport = await context.driver.createVoiceTransport({
@@ -56,14 +72,7 @@ export async function installVoice(engine, context) {
     receiptsFactory: ({ job }) => {
       const canonical = engine.callbackJob(context, {
         id: job.deliveryId,
-        segment: {
-          id: job.id,
-          attemptId: job.id,
-          index: job.index,
-          audioSha256: job.audioSha256,
-          durationMs: job.durationMs,
-          path: job.path,
-        },
+        segment: voiceReceiptSegment(job),
       });
       return {
         prepare: (_native, options) => engine.receipt(canonical, { ...options, phase: 'prepare' }),
@@ -74,14 +83,7 @@ export async function installVoice(engine, context) {
           if (result?.confirmed !== true) return result ?? { confirmed: false };
           return {
             confirmed: true,
-            receipt: {
-              ...result.receipt,
-              type: 'desktop-reader-voice-v1',
-              deliveryId: job.id,
-              account: job.account,
-              target: job.target,
-              audioSha256: job.audioSha256,
-            },
+            receipt: readerVoiceReceipt(job, result.receipt),
           };
         },
       };

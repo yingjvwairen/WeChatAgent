@@ -3,9 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { createDesktopRuntimeDriver } from './desktop-sender/runtime-driver.mjs';
+import {
+  createDesktopRuntimeDriver,
+  inspectCableEndpoints,
+  readCableEndpoints,
+} from './desktop-sender/runtime-driver.mjs';
 import { QtActionsClient } from './desktop-sender/qt-visual-driver.mjs';
 import { unborrowedLayoutRefusal } from './desktop-sender/qt-auto-layout.mjs';
+import { acquireDesktopQueue } from './desktop-sender/delivery-lock.mjs';
+import { DesktopSender } from './desktop-sender.mjs';
 const rect = (left, top, right, bottom) => ({ left, top, right, bottom });
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-layout-lazy-'));
@@ -89,6 +95,82 @@ test('OCR health does not acquire focus or require an unobscured screenshot', as
   assert.equal(prepares, 1);
   assert.equal((await driver.health()).layoutPending, false);
   await driver.close();
+});
+test('read-only sender preflight can run while the running service owns the queue', async t => {
+  const f = fixture(t);
+  const sender = new DesktopSender(f.root);
+  sender.config = () => ({ runtime: { sender: 'wechat-ui' }, input: f.settings });
+  sender.probeAccount = async () => f.account;
+  const lease = acquireDesktopQueue(f.root);
+  assert.ok(lease);
+  try {
+    const result = await sender.request('health', { probeOnly: true, account: f.account.account });
+    assert.equal(result.ready, true);
+    assert.equal(result.readOnly, true);
+    assert.equal(result.layoutPending, true);
+    assert.equal(acquireDesktopQueue(f.root), null);
+  } finally {
+    await sender.close();
+    lease.release();
+  }
+});
+test('the explicit layout check reports proof or a refusal without preparing input', async t => {
+  const f = fixture(t);
+  let reject = true;
+  const driver = await createDesktopRuntimeDriver({
+    ...f,
+    ensureAccessibility: () => assert.fail('a diagnostic never enables accessibility'),
+    createDriver: () => assert.fail('a diagnostic must never create the input driver'),
+    bootstrap: async options => {
+      assert.equal(options.persistLayout, false);
+      assert.equal(options.allowFocusCapture, undefined);
+      assert.equal(options.ensureAccessibility, undefined);
+      if (reject) throw Object.assign(Error(), { code: 'UI_QT_LAYOUT_THEME_UNSUPPORTED' });
+      return { layoutSource: 'ocr' };
+    },
+  });
+  try {
+    const refused = await driver.health({ verifyLayout: true });
+    assert.equal(refused.layoutPending, true);
+    assert.deepEqual(refused.layoutCheck, { verified: false, reason: 'UI_QT_LAYOUT_THEME_UNSUPPORTED' });
+    reject = false;
+    const checked = await driver.health({ verifyLayout: true });
+    assert.equal(checked.layoutPending, false);
+    assert.deepEqual(checked.layoutCheck, { verified: true, source: 'ocr' });
+    assert.equal(driver.observe({}).ready, false);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('a fixed CABLE pair detects re-enumerated endpoints and still requires all default roles', async () => {
+  const pair = { renderId: 'fixture-render', captureId: 'fixture-capture' };
+  const report = {
+    ok: true,
+    mode: 'list',
+    audioStarted: false,
+    devices: [
+      { flow: 'render', eligible: true, id: pair.renderId },
+      { flow: 'capture', eligible: true, id: pair.captureId },
+    ],
+    defaultCapture: Object.fromEntries(
+      ['console', 'multimedia', 'communications'].map(role => [role, { device: { id: pair.captureId } }]),
+    ),
+  };
+  const executeImpl = async (_program, args) => {
+    assert.deepEqual(args, ['--list']);
+    return { stdout: JSON.stringify(report) };
+  };
+  assert.deepEqual(await inspectCableEndpoints('fixture', { executeImpl }), { pair, defaultsReady: true });
+  assert.deepEqual(await readCableEndpoints('fixture', { executeImpl, binding: pair }), pair);
+  await assert.rejects(
+    readCableEndpoints('fixture', { executeImpl, binding: { ...pair, renderId: 'old-render' } }),
+    /DESKTOP_CABLE_BINDING_CHANGED/,
+  );
+  report.defaultCapture.communications.device.id = 'fixture-microphone';
+  await assert.rejects(readCableEndpoints('fixture', { executeImpl }), /AUDIO_DEFAULT_CAPTURE_NOT_CABLE/);
+  report.devices.push({ flow: 'render', eligible: true, id: 'ambiguous-render' });
+  await assert.rejects(readCableEndpoints('fixture', { executeImpl }), /DESKTOP_CABLE_ENDPOINT_REQUIRED/);
 });
 test('a layout-only calibration client refuses every message/clipboard action before starting', async t => {
   const f = fixture(t);

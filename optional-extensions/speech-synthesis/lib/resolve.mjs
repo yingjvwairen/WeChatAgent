@@ -66,6 +66,7 @@ export function resolveService(settings, capability) {
     instructions: typeof settings.instructions === 'string' ? settings.instructions : '',
     speed: profile.speed ?? 1,
     endpoint: String(profile.endpoint ?? ''),
+    endpointMode: entry === 'custom' && definition.kind === 'openai-speech' ? profile.endpointMode : undefined,
     realtimeEndpoint: String(profile.endpoint ?? ''),
     realtimeProtocol: profile.protocol || 'auto',
     realtimeModel: String((definition.kind === 'realtime-session' ? profile.sessionModel : profile.model) ?? ''),

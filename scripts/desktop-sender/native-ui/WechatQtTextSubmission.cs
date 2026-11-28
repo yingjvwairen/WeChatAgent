@@ -393,8 +393,10 @@ internal static partial class WechatDraftProbe
         case "pasteUiaImage":
         case "pasteUiaFile":
             return QtPasteUiaImage(clipboard, request, owner, action == "pasteUiaFile");
-        case "submitUiaFileDialog":
-            return QtSubmitUiaFileDialog(request);
+        case "captureOcrFileDialog":
+            return QtCaptureOcrFileDialog(request);
+        case "submitFileDialog":
+            return QtSubmitFileDialog(request);
         case "submitUiaImage":
             return QtSubmitUiaImage(request);
         case "resumeUiaImage":

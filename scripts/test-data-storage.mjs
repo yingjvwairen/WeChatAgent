@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parse as parseYaml } from 'yaml';
 import storage from '../apps/console-desktop/storage-location.cjs';
 import deployment from '../apps/console-desktop/deployment.cjs';
 const {
@@ -187,6 +189,62 @@ test('busy source, changed files, verification failure and occupied targets do n
     assert(fs.existsSync(path.join(f.sourceRoot, 'config/wechatagent.json')));
   }
 });
+
+test('an explicitly selected source can be retried after its configuration becomes available', async t => {
+  const f = fixture(t);
+  const source = path.join(f.sourceRoot, 'config/wechatagent.json');
+  const unavailable = source + '.fixture-offline';
+  fs.renameSync(source, unavailable);
+  assert.throws(() => migrationPlan(f.location), /旧数据.*配置/);
+  assert.equal(fs.existsSync(path.join(f.home, '.wechatagent-data.json')), false);
+
+  fs.renameSync(unavailable, source);
+  const result = await prepareDataHome(migrationPlan(f.location), { checkIdle: async () => {} });
+  assert.equal(result.migrated, true);
+  assert.equal(result.report.source, f.old);
+});
+
+test('desktop preferences copied by an aborted migration are rolled back before retry', async t => {
+  const f = fixture(t);
+  const marker = path.join(f.home, '.wechatagent-data.json');
+  const oldBackground = path.join(f.old, 'desktop/background.png');
+  const copiedBackground = path.join(f.home, 'desktop/background.png');
+  const existingWindow = path.join(f.home, 'desktop/window.json');
+  const editedBackground = path.join(f.home, 'desktop/background.jpg');
+  f.write(oldBackground, 'first source background');
+  f.write(path.join(f.old, 'desktop/background.jpg'), 'previous photo');
+  f.write(path.join(f.old, 'desktop/window.json'), { x: 20 });
+  f.write(existingWindow, { x: 70 });
+  const original = fs.renameSync;
+  let refuseCommit = true;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === marker && refuseCommit) {
+      fs.writeFileSync(editedBackground, 'a replacement desktop background');
+      throw Error('fixture migration commit unavailable');
+    }
+    return original(from, to);
+  });
+  await assert.rejects(
+    prepareDataHome(migrationPlan(f.location), { checkIdle: async () => {} }),
+    /fixture migration commit unavailable/,
+  );
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(fs.existsSync(path.join(f.home, 'workspace')), false);
+  assert.equal(fs.existsSync(copiedBackground), false);
+  assert.ok(!fs.readdirSync(f.home).some(name => name.startsWith('.wechatagent-data.json.')));
+  assert.deepEqual(JSON.parse(fs.readFileSync(existingWindow)), { x: 70 });
+  assert.equal(fs.readFileSync(editedBackground, 'utf8'), 'a replacement desktop background');
+  assert.equal(fs.readFileSync(oldBackground, 'utf8'), 'first source background');
+
+  f.write(oldBackground, 'updated source background');
+  refuseCommit = false;
+  const result = await prepareDataHome(migrationPlan(f.location), { checkIdle: async () => {} });
+  assert.equal(result.migrated, true);
+  assert.equal(fs.readFileSync(copiedBackground, 'utf8'), 'updated source background');
+  assert.deepEqual(JSON.parse(fs.readFileSync(existingWindow)), { x: 70 });
+  assert.equal(fs.readFileSync(editedBackground, 'utf8'), 'a replacement desktop background');
+});
+
 test('managed DSH copies opaque history and attachments while independent DSH only rebinds project paths with a backup', async t => {
   for (const managed of [true, false]) {
     const f = fixture(t);
@@ -197,10 +255,28 @@ test('managed DSH copies opaque history and attachments while independent DSH on
     const journal = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0, 1, 2, 3]);
     f.write(path.join(f.dsh, 'sessions/old-project/social-test/session.v4.jsonl.zstd'), journal);
     f.write(path.join(f.dsh, 'attachments/file.png'), 'image');
-    f.write(
-      path.join(f.dsh, 'profiles/desktop/cordis.patch.yml'),
-      'name: ' + path.join(f.sourceRoot, 'packages/dsh-social-bridge-plugin/cordis.patch.yml'),
-    );
+    const relativeProfile = 'profiles/desktop/cordis.patch.yml';
+    const neighboringRoot = managed ? f.old : f.sourceRoot;
+    const sibling = path.join(neighboringRoot + '-shared', 'plugin.mjs');
+    const siblingWithSpace = path.join(neighboringRoot + ' shared', 'plugin.mjs');
+    const profile = root => {
+      const plugin = path.join(root, 'packages/dsh-social-bridge-plugin/index.js');
+      return [
+        `name: ${plugin}`,
+        `quoted: ${JSON.stringify(plugin)}`,
+        `portable: ${plugin.replaceAll('\\', '/')}`,
+        `url: ${pathToFileURL(plugin).href}`,
+        `root: ${root} # keep this comment`,
+        `roots: [${JSON.stringify(root)}, ${JSON.stringify(sibling)}]`,
+        `sibling: ${sibling}`,
+        `siblingWithSpace: ${siblingWithSpace}`,
+        `siblingUrl: ${pathToFileURL(sibling).href}`,
+        '',
+      ].join('\r\n');
+    };
+    const original = profile(f.sourceRoot);
+    const newRoot = path.join(f.home, 'workspace');
+    f.write(path.join(f.dsh, relativeProfile), original);
     const plan = migrationPlan(f.location, { legacyDshHome: f.dsh });
     const result = await prepareDataHome(plan, { checkIdle: async () => {} });
     assert.equal(result.report.dshCopied, managed);
@@ -210,17 +286,195 @@ test('managed DSH copies opaque history and attachments while independent DSH on
         journal,
       );
       assert(fs.existsSync(path.join(f.home, 'dsh/attachments/file.png')));
+      assert.equal(fs.readFileSync(path.join(f.home, 'dsh', relativeProfile), 'utf8'), profile(newRoot));
+      assert.equal(fs.readFileSync(path.join(f.dsh, relativeProfile), 'utf8'), original);
     } else {
-      await rebindExternalDsh(result.report, path.join(f.home, 'workspace'), f.home);
-      assert(
-        fs
-          .readFileSync(path.join(f.dsh, 'profiles/desktop/cordis.patch.yml'), 'utf8')
-          .includes(path.join(f.home, 'workspace')),
-      );
-      assert(fs.existsSync(path.join(f.home, 'backups/external-dsh/desktop/cordis.patch.yml')));
+      const backup = path.join(f.home, 'backups/external-dsh/desktop/cordis.patch.yml');
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await rebindExternalDsh(result.report, newRoot, f.home);
+        assert.equal(fs.readFileSync(path.join(f.dsh, relativeProfile), 'utf8'), profile(newRoot));
+        assert.equal(fs.readFileSync(backup, 'utf8'), original);
+      }
       assert(!fs.existsSync(path.join(f.home, 'dsh')));
     }
   }
+});
+
+test('migration rebinds the DSH home-wide patch even without a profiles directory', async t => {
+  for (const managed of [false, true]) {
+    await t.test(managed ? 'copied DSH' : 'independent DSH', async t => {
+      const f = fixture(t);
+      if (managed) {
+        f.cfg.runtime.dshDesktop = path.join(f.old, 'runtimes/old/dsh/Harness.exe');
+        f.write(path.join(f.sourceRoot, 'config/wechatagent.json'), f.cfg);
+      }
+      const name = 'cordis.patch.yml';
+      const original = path.join(f.dsh, name);
+      const patch = root =>
+        '- id: wechatagent\n  name: ' +
+        pathToFileURL(path.join(root, 'packages/dsh-social-bridge-plugin/index.js')).href +
+        '\n';
+      const newRoot = path.join(f.home, 'workspace');
+      f.write(original, patch(f.sourceRoot));
+      f.write(path.join(f.dsh, 'other.yml'), patch(f.sourceRoot));
+      const { report } = await prepareDataHome(migrationPlan(f.location, { legacyDshHome: f.dsh }), {
+        checkIdle: async () => {},
+      });
+      assert.equal(report.dshCopied, managed);
+      await rebindExternalDsh(report, newRoot, f.home);
+      const dshHome = managed ? path.join(f.home, 'dsh') : f.dsh;
+      assert.equal(fs.readFileSync(path.join(dshHome, name), 'utf8'), patch(newRoot));
+      assert.equal(fs.readFileSync(path.join(dshHome, 'other.yml'), 'utf8'), patch(f.sourceRoot));
+      const backup = managed ? original : path.join(f.home, 'backups/external-dsh', name);
+      assert.equal(fs.readFileSync(backup, 'utf8'), patch(f.sourceRoot));
+    });
+  }
+});
+
+test('DSH migration rebases YAML paths without breaking quoted or flow scalars', async t => {
+  const f = fixture(t);
+  const source = f.sourceRoot;
+  const home = path.join(f.base, "Ying's new #data [offline]");
+  const target = path.join(home, 'workspace');
+  const profile = path.join(f.dsh, 'profiles/desktop/cordis.patch.yml');
+  const malformed = path.join(f.dsh, 'profiles/desktop/cordis.yml');
+  const sibling = path.join(source + ', shared', 'plugin.mjs');
+  const note = 'Keep an offline backup of ' + source;
+  const sourceUrl = pathToFileURL(process.platform === 'win32' ? source.toLowerCase() : source).href;
+  const options = '?profile=desktop#patch';
+  const original = [
+    '# desktop config',
+    "quoted: &workspace '" + source.replaceAll("'", "''") + "'  # keep the comment",
+    'flow: [' + source + ', *workspace]',
+    'url: ' + sourceUrl + options,
+    'base: ' + sourceUrl + '/' + options,
+    'sibling: ' + sibling,
+    'note: ' + note,
+    'block: |- # keep the block comment',
+    '  ' + source,
+    '',
+  ].join('\r\n');
+  const malformedText = 'working: ' + source + '\nunfinished: [\n';
+  f.write(profile, original);
+  f.write(malformed, malformedText);
+  const { report } = await prepareDataHome(migrationPlan({ ...f.location, dataHome: home }, { legacyDshHome: f.dsh }), {
+    checkIdle: async () => {},
+  });
+  await rebindExternalDsh(report, target, home);
+  const result = fs.readFileSync(profile, 'utf8');
+  assert.deepEqual(parseYaml(result), {
+    quoted: target,
+    flow: [target, target],
+    url: pathToFileURL(target).href + options,
+    base: pathToFileURL(target).href + '/' + options,
+    sibling,
+    note,
+    block: target,
+  });
+  assert.match(result, /  # keep the comment\r\n/);
+  assert.match(result, /block: \|- # keep the block comment\r\n/);
+  assert.equal(fs.readFileSync(malformed, 'utf8'), malformedText);
+  assert.equal(fs.readFileSync(path.join(home, 'backups/external-dsh/desktop/cordis.patch.yml'), 'utf8'), original);
+});
+
+test('an interrupted DSH backup is not reused as a complete backup on retry', async t => {
+  const f = fixture(t);
+  const profile = path.join(f.dsh, 'profiles/desktop/cordis.patch.yml');
+  const backup = path.join(f.home, 'backups/external-dsh/desktop/cordis.patch.yml');
+  const newRoot = path.join(f.home, 'workspace');
+  const original = root => 'projectRoot: ' + root + '\n';
+  f.write(profile, original(f.sourceRoot));
+  const { report } = await prepareDataHome(migrationPlan(f.location, { legacyDshHome: f.dsh }), {
+    checkIdle: async () => {},
+  });
+  const writeFile = fs.promises.writeFile;
+  let fail = true;
+  t.mock.method(fs.promises, 'writeFile', async (file, bytes, options) => {
+    if (fail && (file === backup || file.startsWith(backup + '.'))) {
+      fail = false;
+      await writeFile(file, 'partial backup', options);
+      throw Error('test: short backup write');
+    }
+    return writeFile(file, bytes, options);
+  });
+
+  await assert.rejects(rebindExternalDsh(report, newRoot, f.home), /short backup write/);
+  assert.equal(fs.readFileSync(profile, 'utf8'), original(f.sourceRoot));
+  assert.deepEqual(fs.readdirSync(path.dirname(backup)), []);
+
+  await rebindExternalDsh(report, newRoot, f.home);
+  assert.equal(fs.readFileSync(profile, 'utf8'), original(newRoot));
+  assert.equal(fs.readFileSync(backup, 'utf8'), original(f.sourceRoot));
+});
+
+test('an external DSH profile write failure preserves both originals and allows a retry', async t => {
+  const f = fixture(t);
+  const profileDir = path.join(f.dsh, 'profiles/desktop');
+  const config = path.join(profileDir, 'cordis.yml');
+  const patch = path.join(profileDir, 'cordis.patch.yml');
+  const original = root => 'projectRoot: ' + root + '\n';
+  f.write(config, original(f.sourceRoot));
+  f.write(patch, original(f.sourceRoot));
+  const plan = migrationPlan(f.location, { legacyDshHome: f.dsh });
+  const { report } = await prepareDataHome(plan, { checkIdle: async () => {} });
+  const newRoot = path.join(f.home, 'workspace');
+  const writeFile = fs.promises.writeFile;
+  let fail = true;
+  t.mock.method(fs.promises, 'writeFile', async (file, bytes, options) => {
+    if (fail && (file === patch || (typeof file === 'string' && file.startsWith(patch + '.')))) {
+      fail = false;
+      await writeFile(file, 'partial write', options);
+      throw Error('test: short profile write');
+    }
+    return writeFile(file, bytes, options);
+  });
+
+  await assert.rejects(rebindExternalDsh(report, newRoot, f.home), /short profile write/);
+  for (const file of [config, patch]) {
+    assert.equal(fs.readFileSync(file, 'utf8'), original(f.sourceRoot));
+    assert.equal(
+      fs.readFileSync(path.join(f.home, 'backups/external-dsh/desktop', path.basename(file)), 'utf8'),
+      original(f.sourceRoot),
+    );
+  }
+  assert.deepEqual(fs.readdirSync(profileDir).sort(), ['cordis.patch.yml', 'cordis.yml']);
+
+  await rebindExternalDsh(report, newRoot, f.home);
+  for (const file of [config, patch]) assert.equal(fs.readFileSync(file, 'utf8'), original(newRoot));
+});
+
+test('an external DSH profile rollback preserves edits made after the profile was replaced', async t => {
+  const f = fixture(t);
+  const profileDir = path.join(f.dsh, 'profiles/desktop');
+  const config = path.join(profileDir, 'cordis.yml');
+  const patch = path.join(profileDir, 'cordis.patch.yml');
+  const original = 'projectRoot: ' + f.sourceRoot + '\n';
+  const newRoot = path.join(f.home, 'workspace');
+  const edited = 'projectRoot: ' + newRoot + '\nkeepMyEdit: true\n';
+  f.write(config, original);
+  f.write(patch, original);
+  const { report } = await prepareDataHome(migrationPlan(f.location, { legacyDshHome: f.dsh }), {
+    checkIdle: async () => {},
+  });
+  const writeFile = fs.promises.writeFile;
+  let fail = true;
+  t.mock.method(fs.promises, 'writeFile', async (file, bytes, options) => {
+    if (fail && (file === patch || (typeof file === 'string' && file.startsWith(patch + '.')))) {
+      fail = false;
+      await writeFile(config, edited);
+      throw Error('test: profile write interrupted');
+    }
+    return writeFile(file, bytes, options);
+  });
+
+  await assert.rejects(rebindExternalDsh(report, newRoot, f.home), /部分 DSH 配置未回滚/);
+  assert.equal(fs.readFileSync(config, 'utf8'), edited);
+  assert.equal(fs.readFileSync(patch, 'utf8'), original);
+  assert.deepEqual(fs.readdirSync(profileDir).sort(), ['cordis.patch.yml', 'cordis.yml']);
+
+  await rebindExternalDsh(report, newRoot, f.home);
+  assert.equal(fs.readFileSync(config, 'utf8'), edited);
+  assert.equal(fs.readFileSync(patch, 'utf8'), 'projectRoot: ' + newRoot + '\n');
 });
 
 test('retaining DSH leaves its history, external links, config and executable binding in place across migration and restart', async t => {
@@ -246,10 +500,13 @@ test('retaining DSH leaves its history, external links, config and executable bi
       externalDshHome: dsh,
     });
     const history = path.join(dsh, 'sessions/old-project/social-test/session.v4.jsonl.zstd'),
-      profile = path.join(dsh, 'profiles/desktop/cordis.patch.yml');
+      profile = path.join(dsh, 'profiles/desktop/cordis.patch.yml'),
+      homePatch = path.join(dsh, 'cordis.patch.yml');
     const journal = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0, 1, 2, 3]);
     f.write(history, journal);
-    f.write(profile, 'plugin: ' + path.join(f.sourceRoot, 'packages/dsh-social-bridge-plugin'));
+    const originalPatch = 'plugin: ' + path.join(f.sourceRoot, 'packages/dsh-social-bridge-plugin');
+    f.write(profile, originalPatch);
+    f.write(homePatch, originalPatch);
     f.write(path.join(dsh, 'attachments/image.png'), 'image');
     const outside = path.join(f.base, 'external plugin');
     f.write(path.join(outside, 'keep.txt'), 'external data');
@@ -261,7 +518,6 @@ test('retaining DSH leaves its history, external links, config and executable bi
       decryptKey: 'userdpapi:protected',
     });
     const originalConfig = fs.readFileSync(path.join(f.sourceRoot, 'config/wechatagent.json')),
-      originalProfile = fs.readFileSync(profile),
       originalLink = fs.readlinkSync(link);
     const plan = retainDsh(migrationPlan(f.location, { legacyDshHome: dsh })),
       result = await prepareDataHome(plan, { checkIdle: async () => {} });
@@ -314,7 +570,8 @@ test('retaining DSH leaves its history, external links, config and executable bi
       assert(fs.existsSync(exe));
       assert(cfg.runtime.python.startsWith(path.join(f.home, 'runtimes')));
       assert.deepEqual(fs.readFileSync(history), journal);
-      assert.deepEqual(fs.readFileSync(profile), originalProfile);
+      assert.equal(fs.readFileSync(profile, 'utf8'), originalPatch);
+      assert.equal(fs.readFileSync(homePatch, 'utf8'), originalPatch);
       assert.equal(fs.readlinkSync(link), originalLink);
       assert.equal(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8'), 'external data');
       assert(!fs.existsSync(path.join(f.home, 'backups/external-dsh')));
@@ -343,7 +600,7 @@ test('a DSH external-link failure can retry with retention without bypassing lin
     error =>
       error.code === 'DSH_EXTERNAL_LINK' &&
       error.message.includes(link) &&
-      error.message.includes(fs.realpathSync(outside)),
+      error.message.includes(fs.realpathSync.native(outside)),
   );
   assert(!fs.existsSync(path.join(f.home, '.wechatagent-data.json')));
   assert(!fs.existsSync(path.join(f.home, 'workspace')));

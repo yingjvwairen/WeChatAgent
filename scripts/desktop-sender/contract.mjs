@@ -1,4 +1,6 @@
 import { validChatId } from '../../packages/wechat-identity.mjs';
+import { TERMINAL_DELIVERY_STATES as TERMINAL_STATES } from '../../packages/delivery-contract.mjs';
+export { TERMINAL_STATES };
 /** Public boundary of the desktop sender. The authorized peer must match the exact WeChat target.
  *
  * createDesktopSenderEngine({root, config, authorize, authorizeCurrent,
@@ -12,7 +14,7 @@ import { validChatId } from '../../packages/wechat-identity.mjs';
  * probeAccount(options) supplies {account,accountDirectory,accountWxid,
  *   accountRef,dbPath,executable,executableSha256,executableVersion}; when passed
  * a native binding it may supply {accountRef,accountScopeHash,evidence} instead.
- * receipt(job,{phase:'prepare'|'submitted'|'image-input-applied'|'not-attempted'|'query',signal,...}) prepares a durable
+ * receipt(job,{phase:'prepare'|'submitted'|'not-attempted'|'query',signal,...}) prepares a durable
  * baseline, records submission or queries it. prepare returns
  * {prepared:true,submissionAllowed:true,baselineId}; query returns
  * {confirmed:false,reason?} or {confirmed:true,receipt:{serverId,...}}.
@@ -20,7 +22,8 @@ import { validChatId } from '../../packages/wechat-identity.mjs';
  * native performed:false+attempted:false result can release it through
  * not-attempted with {baselineId,proof:{performed:false,attempted:false}}.
  * Voice queries include job.segment={id,attemptId,index,audioSha256,durationMs,path} so
- * each split part has its own baseline and server receipt.
+ * each split part has its own baseline and server receipt. A query can also
+ * restore the saved native recording window on the existing voice reservation.
  * inputDeadlineAt optionally stops further text/attachment input. Submitted
  * attempts keep their independent receipt window; partial drafts require review.
  * ensureAccessibility({root,binding,config,signal}) prepares UIA for the bound client version.
@@ -38,7 +41,6 @@ export const DESKTOP_OPERATIONS = Object.freeze([
   'control',
   'close',
 ]);
-export const TERMINAL_STATES = new Set(['confirmed', 'unconfirmed', 'cancelled', 'failed']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value =>
   typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f]/u.test(value);
@@ -105,6 +107,19 @@ export function deliveryResult(job, state, extra = {}) {
   };
 }
 
+export function withDeliveryReview(view, reviewed) {
+  if (!reviewed && view.reviewed !== true && view.recovery?.recovered !== true) return view;
+  const { recovery: _recovery, focusRecoveryRequired: _focusRecoveryRequired, ...result } = view;
+  return {
+    ...result,
+    state: TERMINAL_STATES.has(result.state) ? result.state : 'unconfirmed',
+    pending: false,
+    reviewed: true,
+  };
+}
+
+export const voicePartNeedsReceipt = part => ['record-intent', 'submitted', 'unknown'].includes(part.state);
+
 const publicStates = { unknown: 'unconfirmed', sending: 'recording', prepared: 'queued' };
 
 function voiceOutcome(job, state) {
@@ -145,10 +160,7 @@ export function deliverySnapshot(row, job, recovery) {
   const inputStarted = voice
     ? job.segments.some(part => !['prepared', 'retry-wait', 'cancelled'].includes(part.state))
     : Boolean(job.index > 0 || job.pendingInput || job.inputPending || job.imageDraftPresent);
-  const betweenBubbles =
-    voice &&
-    job.state === 'sending' &&
-    !job.segments.some(part => ['record-intent', 'submitted', 'unknown'].includes(part.state));
+  const betweenBubbles = voice && job.state === 'sending' && !job.segments.some(voicePartNeedsReceipt);
   let state = publicStates[job.state] ?? job.state;
   if (row.cancelled && !inputStarted) state = 'cancelled';
   else if (row.paused && (betweenBubbles || job.state === 'prepared' || ['queued', 'waiting'].includes(state)))
@@ -162,6 +174,7 @@ export function deliverySnapshot(row, job, recovery) {
     // Progress and repeated observations must not invalidate a displayed command.
     reason: reason ?? null,
     inputStarted,
+    ...(job.inputReleased === true ? { inputReleased: true } : {}),
     revision: row.revision ?? 0,
     ...(recovery ? { recovery } : {}),
     ...(job.focusRecoveryRequired ? { focusRecoveryRequired: true } : {}),

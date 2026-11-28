@@ -1,6 +1,7 @@
 import { AdapterError } from './desktop-message-delivery.mjs';
 import { normalizeDesktopText, validDesktopText } from './desktop-sender/text-contract.mjs';
 import { validChatId } from '../packages/wechat-identity.mjs';
+const maxActiveActions = 8;
 const fail = code => {
   throw new AdapterError(code);
 };
@@ -29,14 +30,30 @@ export async function executeOnebotAction(adapter, request) {
     data: {},
     ...(request?.echo === undefined ? {} : { echo: request.echo }),
   };
-  adapter.activeActions++;
+  const action = request?.action,
+    params = request?.params ?? {};
+  const messageSend = ['send_msg', 'send_private_msg', 'send_group_msg'].includes(action);
+  const receiptLookup = messageSend && params.wechatagent_receipt_only === true;
+  const intakeAck = action === 'ack_wechatagent_intake';
+  let counter =
+    receiptLookup || action === 'get_text_delivery' || action === 'get_voice_delivery'
+      ? 'activeReceiptActions'
+      : 'activeActions';
+  // A saved attempt only needs an admission slot once lookup proves the native job is missing.
+  const reserveAdmission = () => {
+    const active = adapter.activeActions ?? 0;
+    if (active >= maxActiveActions) fail('SENDER_BUSY');
+    adapter[counter]--;
+    counter = 'activeActions';
+    adapter[counter] = active + 1;
+  };
+  // Intake acknowledgements only update the matching in-memory receipt.
+  if (!intakeAck) adapter[counter] = (adapter[counter] ?? 0) + 1;
   try {
-    if (adapter.activeActions > 8) fail('SENDER_BUSY');
+    if (!intakeAck && adapter[counter] > maxActiveActions) fail('SENDER_BUSY');
     adapter.reload();
-    const action = request?.action,
-      params = request?.params ?? {};
     let data;
-    if (action === 'ack_wechatagent_intake') {
+    if (intakeAck) {
       const pending = adapter.intakePending.get(params.token);
       if (
         !pending ||
@@ -51,12 +68,7 @@ export async function executeOnebotAction(adapter, request) {
       const kind = params.kind,
         target = params.target,
         id = params.wechatagent_delivery_id;
-      if (
-        !validChatId(kind, target) ||
-        !adapter.allowed(kind, target) ||
-        !/^[a-f0-9]{64}$/.test(id) ||
-        !Array.isArray(params.message)
-      )
+      if (!validChatId(kind, target) || !/^[a-f0-9]{64}$/.test(id) || !Array.isArray(params.message))
         fail('INVALID_RECEIPT_QUERY');
       const quoted = params.message[0]?.type === 'reply' ? params.message[0].data?.id : undefined;
       const text = textSegments(quoted ? params.message.slice(1) : params.message);
@@ -71,18 +83,17 @@ export async function executeOnebotAction(adapter, request) {
         params.wechatagent_observe_only === true,
         undefined,
         params.wechatagent_roster_grant,
+        reserveAdmission,
       );
-    } else if (['send_msg', 'send_private_msg', 'send_group_msg'].includes(action)) {
+    } else if (messageSend) {
       const kind =
         action === 'send_group_msg' || (action === 'send_msg' && params.message_type === 'group') ? 'group' : 'private';
       if (action === 'send_msg' && !['group', 'private'].includes(params.message_type)) fail('MESSAGE_TYPE_REQUIRED');
       const target = params[kind === 'group' ? 'group_id' : 'user_id'];
-      if (!validChatId(kind, target) || !adapter.allowed(kind, target)) fail('CONVERSATION_NOT_ALLOWED');
+      if (!validChatId(kind, target)) fail('CONVERSATION_NOT_ALLOWED');
       const deliveryId = params.wechatagent_delivery_id;
       if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) fail('INVALID_DELIVERY_ID');
       if (params.wechatagent_receipt_only !== undefined && typeof params.wechatagent_receipt_only !== 'boolean')
-        fail('INVALID_RECEIPT_QUERY');
-      if (params.wechatagent_defer_receipt !== undefined && typeof params.wechatagent_defer_receipt !== 'boolean')
         fail('INVALID_RECEIPT_QUERY');
       if (
         params.wechatagent_abandon_delivery !== undefined &&
@@ -91,10 +102,11 @@ export async function executeOnebotAction(adapter, request) {
       )
         fail('INVALID_RECEIPT_QUERY');
       if (
-        params.wechatagent_deadline_at !== undefined &&
-        (!Number.isSafeInteger(params.wechatagent_deadline_at) ||
-          params.wechatagent_deadline_at < 0 ||
-          params.wechatagent_deadline_at > Date.now() + 60000)
+        [params.wechatagent_deadline_at, params.wechatagent_admission_deadline_at].some(
+          deadline =>
+            deadline !== undefined &&
+            (!Number.isSafeInteger(deadline) || deadline < 0 || deadline > Date.now() + 60000),
+        )
       )
         fail('INVALID_DELIVERY_DEADLINE');
       if (
@@ -105,6 +117,7 @@ export async function executeOnebotAction(adapter, request) {
           params.message[0]?.type !== 'wechat_sticker')
       )
         fail('INVALID_RECEIPT_QUERY');
+      if (!receiptLookup && !adapter.allowed(kind, target)) fail('CONVERSATION_NOT_ALLOWED');
       if (params.wechatagent_source !== undefined && params.wechatagent_source !== 'proactive')
         fail('INVALID_SEND_SOURCE');
       if (
@@ -134,19 +147,17 @@ export async function executeOnebotAction(adapter, request) {
         params.message.length === 1 &&
         params.message[0]?.type === 'wechat_sticker'
       ) {
-        data = await adapter.sendSticker(
-          kind,
-          target,
-          String(params.message[0].data?.id ?? ''),
+        data = await adapter.sendSticker(kind, target, String(params.message[0].data?.id ?? ''), {
           deliveryId,
           proactive,
-          params.wechatagent_receipt_only === true,
-          params.wechatagent_defer_receipt === true,
-          params.wechatagent_deadline_at,
-          params.wechatagent_abandon_delivery === true,
-          params.wechatagent_receipt_only === true && params.wechatagent_observe_only === true,
-          params.wechatagent_roster_grant,
-        );
+          receiptOnly: params.wechatagent_receipt_only === true,
+          deadlineAt: params.wechatagent_deadline_at,
+          admissionDeadlineAt: params.wechatagent_admission_deadline_at,
+          abandon: params.wechatagent_abandon_delivery === true,
+          observeOnly: params.wechatagent_receipt_only === true && params.wechatagent_observe_only === true,
+          expectedRosterGrant: params.wechatagent_roster_grant,
+          reserveAdmission: receiptLookup ? reserveAdmission : undefined,
+        });
       } else {
         const reply = Array.isArray(params.message) && params.message[0]?.type === 'reply';
         const sourceId = reply ? params.message[0].data?.id : undefined;
@@ -179,7 +190,8 @@ export async function executeOnebotAction(adapter, request) {
     } else if (action === 'get_voice_capability' || action === 'send_voice_text' || action === 'get_voice_delivery') {
       const kind = params.kind,
         target = params.target;
-      if (!validChatId(kind, target) || !adapter.allowed(kind, target)) fail('CONVERSATION_NOT_ALLOWED');
+      if (!validChatId(kind, target) || (action !== 'get_voice_delivery' && !adapter.allowed(kind, target)))
+        fail('CONVERSATION_NOT_ALLOWED');
       if (action === 'get_voice_capability')
         data = await adapter.voiceSend.capability(kind, target, params.wechatagent_roster_grant);
       else {
@@ -230,6 +242,6 @@ export async function executeOnebotAction(adapter, request) {
       message: code,
     };
   } finally {
-    adapter.activeActions--;
+    if (!intakeAck) adapter[counter]--;
   }
 }

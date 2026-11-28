@@ -61,15 +61,7 @@ def resolve(descriptor):
         pass  # The XML can still identify a verified local copy.
     ids = list(dict.fromkeys(value.lower() for value in ids if re.fullmatch(r'[a-fA-F0-9]{32}', value)))
     settings = reader_api.read_json(reader.settings_file)
-    keys = []
-    try:
-        saved = reader_api.local_secret(str(settings.get('imageAesKey') or ''))
-        aes = bytes.fromhex(saved) if re.fullmatch(r'[a-fA-F0-9]{32}', saved) else saved.encode('ascii')
-        xor = int(reader_api.local_secret(str(settings.get('imageXorKey') or '0')), 0) & 255
-        if len(aes) == 16:
-            keys.append((xor, aes))
-    except Exception:
-        pass
+    keys = media.configured_image_keys(settings, reader_api.local_secret)
     derived = media.resolve_v2_media_key(str(reader.account), reader.own_wxid)
     if derived and derived not in keys:
         keys.append(derived)

@@ -10,15 +10,18 @@ export async function boundedTask(action, { timeoutMs, signal, code = 'OPERATION
   const abort = () => controller.abort(signal.reason);
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort, { once: true });
-  const timer = setTimeout(
-    () => controller.abort(Object.assign(new Error(code), { name: 'TimeoutError', code })),
-    timeoutMs,
-  );
+  const timer =
+    timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => controller.abort(Object.assign(new Error(code), { name: 'TimeoutError', code })), timeoutMs);
   let listener;
   try {
     controller.signal.throwIfAborted();
     return await Promise.race([
-      Promise.resolve().then(() => action(controller.signal)),
+      Promise.resolve().then(() => {
+        controller.signal.throwIfAborted();
+        return action(controller.signal);
+      }),
       new Promise((_, reject) => {
         listener = () => reject(controller.signal.reason);
         controller.signal.addEventListener('abort', listener, { once: true });

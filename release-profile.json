@@ -1,7 +1,7 @@
 {
   "profile": "wechatagent-source-and-installer-release",
-  "version": "0.4.5",
-  "packageVersion": "0.4.5",
+  "version": "0.4.6",
+  "packageVersion": "0.4.6",
   "repository": "sourcepro5/WeChatAgent",
   "dshSdkVersion": "0.2.0-rc.2",
   "dshBundled": false,
@@ -14,8 +14,8 @@
   ],
   "sourcePluginPackages": [
     "optional-extensions/packages/fish-notebook-1.1.1.zip",
-    "optional-extensions/packages/speech-recognition-1.7.1.zip",
-    "optional-extensions/packages/speech-synthesis-1.8.1.zip"
+    "optional-extensions/packages/speech-recognition-1.7.2.zip",
+    "optional-extensions/packages/speech-synthesis-1.8.2.zip"
   ],
   "status": "development",
   "publication": "not-published",

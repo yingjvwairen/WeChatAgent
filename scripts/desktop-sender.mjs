@@ -6,6 +6,7 @@ import { desktopSettings, DESKTOP_BACKEND } from './desktop-settings.mjs';
 import { readerAccountDirectory } from './reader-account-state.mjs';
 import { acquireDesktopQueue } from './desktop-sender/delivery-lock.mjs';
 import { probeDesktopAccount } from './desktop-account.mjs';
+import { desktopDeliveryStatus } from '../packages/delivery-contract.mjs';
 
 const execute = promisify(execFile);
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/u, ''));
@@ -70,6 +71,7 @@ export class DesktopSender {
               ...this.callbacks,
               probeAccount: options => this.probeAccount(options),
               ensureAccessibility: options => this.ensureAccessibility(options),
+              fingerprintImage: (file, sha256) => this.fingerprintImage(file, sha256),
             });
             this.lease = lease;
             return engine;
@@ -83,6 +85,28 @@ export class DesktopSender {
           throw error;
         });
     return this.loading;
+  }
+  async fingerprintImage(file, sha256) {
+    try {
+      const { stdout } = await execute(
+        this.settings().python,
+        ['-IB', path.join(this.root, 'scripts/wechat_image_receipt.py'), file, sha256],
+        { windowsHide: true, timeout: 5000, maxBuffer: 8192, encoding: 'utf8' },
+      );
+      const value = JSON.parse(stdout);
+      if (
+        !Number.isSafeInteger(value.width) ||
+        value.width < 1 ||
+        !Number.isSafeInteger(value.height) ||
+        value.height < 1 ||
+        !/^[a-f0-9]{64}$/.test(value.pixels) ||
+        !/^[A-Za-z0-9+/]{4096}$/.test(value.sample)
+      )
+        throw Error('Invalid image fingerprint');
+      return value;
+    } catch {
+      throw fault('DESKTOP_IMAGE_FINGERPRINT_UNAVAILABLE');
+    }
   }
   async ensureAccessibility({ binding }) {
     const settings = this.settings();
@@ -108,6 +132,19 @@ export class DesktopSender {
   async request(operation, payload = {}, options) {
     if (payload.accountRef && payload.accountWxid)
       this.identity = { accountRef: payload.accountRef, accountWxid: payload.accountWxid };
+    if (operation === 'health' && payload.probeOnly === true) {
+      if (this.closed) throw fault('DESKTOP_SENDER_CLOSED');
+      const account = await this.probeAccount();
+      if (payload.account && payload.account.toLowerCase() !== account.account.toLowerCase())
+        throw fault('DESKTOP_ACCOUNT_CHANGED');
+      const { createDesktopRuntimeDriver } = await import('./desktop-sender/runtime-driver.mjs');
+      const driver = await createDesktopRuntimeDriver({ root: this.root, settings: this.config().input, account });
+      try {
+        return await driver.health({ verifyLayout: payload.verifyLayout === true });
+      } finally {
+        await driver.close();
+      }
+    }
     const engine = await this.engine();
     if (operation === 'health') {
       const state = await engine.health(payload);
@@ -121,7 +158,8 @@ export class DesktopSender {
     this.pending++;
     try {
       const result = await engine.request(operation, payload, options);
-      if (['failed', 'cancelled'].includes(result.state) && result.submission === 'not-started')
+      const status = desktopDeliveryStatus(result);
+      if (status === 'rejected')
         throw fault('API_HTTP_409', { senderCode: result.reason ?? 'DESKTOP_DELIVERY_REJECTED', attempted: false });
       if (result.state === 'unconfirmed')
         throw fault('DESKTOP_SEND_UNCONFIRMED', { senderCode: result.reason, attempted: true });

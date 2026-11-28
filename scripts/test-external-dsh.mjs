@@ -5,7 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import deployment from '../apps/console-desktop/deployment.cjs';
-import { DSH_INSTALL_URL, DSH_SDK_VERSION, dshInstallCard } from '../public/console/dsh-install.mjs';
+import {
+  DSH_INSTALL_URL,
+  DSH_SDK_VERSION,
+  DSH_VERIFIED_DESKTOP_VERSION,
+  dshInstallCard,
+} from '../public/console/dsh-install.mjs';
 import { taskFailureMessage } from './console-process.mjs';
 
 function fixture(t) {
@@ -92,7 +97,8 @@ test('setup provides one official installation link, program selection and the e
   assert(html.includes('copy-plugin-path'));
   assert.equal(fields[0].key, 'runtime.dshDesktop');
   assert.equal(fields[0].options.browse, 'exe');
-  assert(html.includes('不再内置'));
+  assert(html.includes('已验证的桌面版本为 ' + DSH_VERIFIED_DESKTOP_VERSION));
+  assert(html.includes('随包 SDK 为 ' + DSH_SDK_VERSION));
 });
 
 test('missing programs and unavailable plugins report actionable setup instructions', () => {

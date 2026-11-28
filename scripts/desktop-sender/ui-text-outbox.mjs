@@ -5,6 +5,10 @@ import { archiveDelivery, readArchivedDelivery, boundedDeliveryNames, deliverySe
 import { clipboardBackupDiagnostic, clipboardBackupRefusal } from './clipboard-backup-diagnostic.mjs';
 import { acquireDeliveryLock } from './delivery-lock.mjs';
 import { validDesktopText as validText, textGraphemes } from './text-contract.mjs';
+import {
+  RECEIPT_BASELINE_UNAVAILABLE,
+  TERMINAL_DELIVERY_STATES as terminal,
+} from '../../packages/delivery-contract.mjs';
 
 export const UI_TEXT_STATES = Object.freeze([
   'queued',
@@ -19,7 +23,6 @@ export const UI_TEXT_STATES = Object.freeze([
   'cancelled',
   'failed',
 ]);
-const terminal = new Set(['confirmed', 'unconfirmed', 'cancelled', 'failed']);
 const submitted = new Set(['submitting', 'submitted']);
 const idPattern = /^[a-f0-9]{64}$/;
 const reasonPattern = /^[A-Z][A-Z0-9_]{2,79}$/;
@@ -69,6 +72,7 @@ const JOB_FIELDS = new Set([
   'pendingInput',
   'submittedAt',
   'deadlineAt',
+  'inputReleased',
   'receipt',
   'clipboardBackup',
 ]);
@@ -91,7 +95,10 @@ export function validUiQuote(quote, target) {
         .digest('hex')
   )
     return false;
-  if (!Object.hasOwn(quote, 'kind')) return Object.keys(quote).length === 5;
+  if (!Object.hasOwn(quote, 'kind'))
+    return Object.hasOwn(quote, 'ocrTextUnique')
+      ? quote.ocrTextUnique === true && Object.keys(quote).length === 6
+      : Object.keys(quote).length === 5;
   if (!mediaQuoteKinds.has(quote.kind) || Object.keys(quote).length !== 7) return false;
   const locator = quote.locator;
   if (
@@ -228,6 +235,8 @@ function validateJob(job, id) {
   if (
     (job.receipt !== undefined && !validReceipt(job.receipt)) ||
     (job.state === 'confirmed' && !validReceipt(job.receipt)) ||
+    (job.inputReleased !== undefined &&
+      (job.inputReleased !== true || !['submitted', 'confirmed', 'unconfirmed'].includes(job.state))) ||
     (job.clipboardBackup !== undefined && !clipboardBackupDiagnostic(job.clipboardBackup))
   )
     throw fault('UI_OUTBOX_STATE_INVALID');
@@ -589,11 +598,51 @@ export class UiTextOutbox {
   async reconcileReceipt(id) {
     const job = this.get(id);
     if (!job || this.isRetired(id)) return job;
+    // The active native submit can still return definitive no-input proof.
+    // On restart there is no active tick, so the saved intent can be queried.
+    if (job.state === 'submitting' && this.activeTick) return job;
     if (submitted.has(job.state)) return this.#receipt(job);
     return job.state === 'unconfirmed' ? this.#receipt(job, true) : job;
   }
 
-  async #receipt(job, late = false) {
+  #pauseUnsubmitted(job, reason) {
+    return (
+      this.#change(
+        job.id,
+        value => {
+          value.state = 'paused';
+          delete value.submittedAt;
+          delete value.deadlineAt;
+          value.reason = safeReason(reason);
+          if (value.reason === RECEIPT_BASELINE_UNAVAILABLE) value.nextActionAt = this.#time() + 1000;
+          if (value.reason === 'UI_QT_FILE_DIALOG_UNVERIFIED') value.manualPause = true;
+        },
+        job.revision,
+      ) ?? this.get(job.id)
+    );
+  }
+
+  #recoverUnsubmitted(job, workerLease) {
+    if (job.state !== 'submitting' || typeof this.driver.recordedSubmission !== 'function') return null;
+    const lease = workerLease ?? this.#lock('worker');
+    if (!lease) return this.get(job.id) ?? job;
+    try {
+      let recorded;
+      try {
+        recorded = this.driver.recordedSubmission(copy(job));
+      } catch {
+        return null;
+      }
+      // A matching unused baseline proves the submit stopped before desktop input.
+      return recorded === false && lease.owns() ? this.#pauseUnsubmitted(job, 'DESKTOP_RECEIPT_NOT_SUBMITTED') : null;
+    } finally {
+      if (!workerLease) lease.release();
+    }
+  }
+
+  async #receipt(job, late = false, workerLease) {
+    const recovered = this.#recoverUnsubmitted(job, workerLease);
+    if (recovered) return recovered;
     const expired = () =>
       this.#change(
         job.id,
@@ -657,7 +706,14 @@ export class UiTextOutbox {
     if (deliveryId === undefined) return jobs[0];
     const job = jobs.find(item => item.id === deliveryId);
     if (!job) return null;
-    if (jobs.some(item => item.id !== deliveryId && (item.index > 0 || item.pendingInput || submitted.has(item.state))))
+    if (
+      jobs.some(
+        item =>
+          item.id !== deliveryId &&
+          !item.inputReleased &&
+          (item.index > 0 || item.pendingInput || submitted.has(item.state)),
+      )
+    )
       throw fault('UI_OUTBOX_DESKTOP_OCCUPIED');
     return job;
   }
@@ -670,7 +726,7 @@ export class UiTextOutbox {
       return this.get(pastedJobId);
     if (!job || this.stopped) return job ?? null;
     this.currentJobId = job.id;
-    if (submitted.has(job.state)) return this.#receipt(job);
+    if (submitted.has(job.state)) return this.#receipt(job, false, lease);
     if (job.state === 'conflict') return job;
     if (this.control().paused || job.manualPause) {
       if (job.state !== 'paused')
@@ -814,18 +870,17 @@ export class UiTextOutbox {
       }
       if (result?.performed === false && result?.attempted === false)
         return (
-          this.#change(
-            job.id,
-            value => {
-              delete value.pendingInput;
-              value.state = 'paused';
-              value.reason = safeReason(result.reason);
-              if (clipboardBackupRefusal(result.reason)) value.manualPause = true;
-              const diagnostic = clipboardBackupDiagnostic(result.clipboardBackup);
-              if (diagnostic) value.clipboardBackup = diagnostic;
-            },
-            intention.revision,
-          ) ?? this.get(job.id)
+          this.#change(job.id, value => {
+            // A control can change the revision while the same input is in flight.
+            if (JSON.stringify(value.pendingInput) !== JSON.stringify(intention.pendingInput)) return;
+            delete value.pendingInput;
+            if (value.revision !== intention.revision) return;
+            value.state = 'paused';
+            value.reason = safeReason(result.reason);
+            if (clipboardBackupRefusal(result.reason)) value.manualPause = true;
+            const diagnostic = clipboardBackupDiagnostic(result.clipboardBackup);
+            if (diagnostic) value.clipboardBackup = diagnostic;
+          }) ?? this.get(job.id)
         );
       // The durable paste intention already exists. An explicit applied result
       // can re-enter the same guarded step immediately, retaining its worker
@@ -876,27 +931,16 @@ export class UiTextOutbox {
           intention.revision,
         ) ?? this.get(job.id)
       );
-    } finally {
-      await this.releaseFocus();
     }
     if (result?.performed === false && result?.attempted === false)
-      return (
-        this.#change(
-          job.id,
-          value => {
-            value.state = 'paused';
-            delete value.submittedAt;
-            delete value.deadlineAt;
-            value.reason = safeReason(result.reason);
-          },
-          intention.revision,
-        ) ?? this.get(job.id)
-      );
+      return this.#pauseUnsubmitted(intention, result.reason);
     return (
       this.#change(
         job.id,
         value => {
           value.state = 'submitted';
+          if (result?.performed === true && result.attempted === true && result.inputReleased === true)
+            value.inputReleased = true;
         },
         intention.revision,
       ) ?? this.get(job.id)
@@ -922,7 +966,7 @@ export class UiTextOutbox {
           // durable submit may still be resolved by the read-only DB receipt.
           const job = this.#selectedJob(deliveryId);
           if (!job || !submitted.has(job.state)) throw this.focusFailure;
-          result = await this.#receipt(job);
+          result = await this.#receipt(job, false, lease);
         } else result = await this.#step(lease, deliveryId);
         return result;
       } finally {

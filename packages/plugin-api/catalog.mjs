@@ -376,7 +376,7 @@ export function pluginCatalog(root, runtime = []) {
     }),
   };
 }
-function enabledFor(root, id, key, policy) {
+function enabledPlugin(root, id, policy) {
   if (!ID.test(id ?? '')) return null;
   try {
     const folder = path.join(root, 'plugins', id),
@@ -386,10 +386,7 @@ function enabledFor(root, id, key, policy) {
     if (fs.statSync(file).size > 65536) return null;
     const item = manifest(json(file)),
       saved = policy.config.plugins[id];
-    return item.id === id &&
-      saved?.enabled === true &&
-      item.permissions.every(p => saved.permissions?.includes(p)) &&
-      pluginChatAllowed(policy, saved, key)
+    return item.id === id && saved?.enabled === true && item.permissions.every(p => saved.permissions?.includes(p))
       ? { item, saved }
       : null;
   } catch {
@@ -399,16 +396,20 @@ function enabledFor(root, id, key, policy) {
 export function pluginEnabled(root, id, key) {
   if (!ID.test(id ?? '')) return false;
   try {
-    return !!enabledFor(root, id, key, configuration(root));
+    const policy = configuration(root);
+    const found = enabledPlugin(root, id, policy);
+    return !!found && pluginChatAllowed(policy, found.saved, key);
   } catch {
     return false;
   }
 }
+function offersFeature({ item, saved }, feature) {
+  return featureConfigured(item, saved, feature) && saved.permissions.includes(FEATURE_ENTRIES[feature].permission);
+}
 // Enabled plugins for this chat that opted into a FEATURE_ENTRIES host feature,
 // with the settings generation each one runs under. Sorted by id.
 export function featurePlugins(root, feature, key) {
-  const entry = FEATURE_ENTRIES[feature];
-  if (!entry) return [];
+  if (!Object.hasOwn(FEATURE_ENTRIES, feature)) return [];
   let policy;
   try {
     policy = configuration(root);
@@ -418,13 +419,26 @@ export function featurePlugins(root, feature, key) {
   return Object.keys(policy.config.plugins)
     .sort()
     .flatMap(id => {
-      const found = enabledFor(root, id, key, policy);
-      return found &&
-        featureConfigured(found.item, found.saved, feature) &&
-        found.saved.permissions.includes(entry.permission)
+      const found = enabledPlugin(root, id, policy);
+      return found && offersFeature(found, feature) && pluginChatAllowed(policy, found.saved, key)
         ? [{ id, generation: String(found.saved.generation ?? '') }]
         : [];
     });
+}
+
+/** Configured providers that can receive these features in the active account. */
+export function rosterFeatureSettings(root, features) {
+  const policy = configuration(root);
+  const { private: users = [], groups = [] } = policy.roster.whitelist ?? {};
+  const keys = [...users.map(id => 'wechat:private:' + id), ...groups.map(id => 'wechat:group:' + id)];
+  if (!keys.length) return [];
+  return Object.keys(policy.config.plugins).flatMap(id => {
+    const found = enabledPlugin(root, id, policy);
+    if (!found || !keys.some(key => pluginChatAllowed(policy, found.saved, key))) return [];
+    return features
+      .filter(feature => offersFeature(found, feature))
+      .map(feature => ({ id, feature, settings: { ...found.item.settings, ...found.saved.settings } }));
+  });
 }
 export function runtimeCatalog(catalog, live) {
   const connected = !!live && (live.runtime ?? live.pluginRuntime) === HOST_RUNTIME;

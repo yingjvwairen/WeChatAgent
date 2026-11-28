@@ -73,7 +73,8 @@ def push_payload(talker, message, names, own_wxid):
         if token and token[0] == 'file':
             file_display = token[1]
     voice = (voice_info(message.get('fullText', '')) or {}) if kind == 34 else None
-    video = video_metadata(message.get('fullText')) if kind in (43, 62) else None
+    is_video = kind in (43, 62)
+    video = video_metadata(message.get('fullText')) if is_video else None
     sticker = (
         kind == 47
         or kind in (49, APPMSG_STICKER_TYPE)
@@ -82,7 +83,7 @@ def push_payload(talker, message, names, own_wxid):
     card = parse_extra_card(kind, message.get('fullText', ''))
     link = parse_link_card(kind, message.get('fullText', ''))
     other = None
-    if kind not in (1, 3, 34) and not any((video, sticker, card, link, pat, file_display, forwarded, quote_reply)):
+    if kind not in (1, 3, 34, 43, 62) and not any((sticker, card, link, pat, file_display, forwarded, quote_reply)):
         other = parse_other_message(kind, message.get('fullText', ''))
     # Unsupported cards/notices contribute display-only context. In particular,
     # a system row without a person as sender must never become an assistant task.
@@ -116,8 +117,12 @@ def push_payload(talker, message, names, own_wxid):
         content = '[链接] ' + link['title'] + ' ' + link['url']
     elif other:
         content = card_text(other)
-    if video:
-        content = '[视频：附图为按时间采样的画面，仅代表采样时刻。]'
+    if is_video:
+        content = (
+            '[视频：附图为按时间采样的画面，仅代表采样时刻。]'
+            if video
+            else '[已收到视频，但附件元数据无法验证或不在支持范围内，本轮无法读取视频内容。]'
+        )
     if not content.strip():
         return None
     group = group_username(talker)
@@ -141,19 +146,20 @@ def push_payload(talker, message, names, own_wxid):
         'type': FILE_TYPE if file_info else 1 if file_display or card or link or other else 47 if sticker else kind,
         'timestamp': message.get('createTime', 0),
         **({'contextOnly': True} if context_only else {}),
+        **({'attachmentUnavailable': True} if is_video and not video else {}),
         **(
             {
                 'quoteKind': 'voice'
                 if voice is not None
                 else 'video'
-                if video
+                if is_video
                 else 'file'
                 if file_display
                 else 'link'
                 if link
                 else 'card'
             }
-            if voice is not None or video or file_display or link or card
+            if voice is not None or is_video or file_display or link or card
             else {}
         ),
         **(

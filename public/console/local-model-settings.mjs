@@ -78,10 +78,12 @@ export async function bindLocalModelSettings({
           '后台服务：' +
           ({
             ready: model?.loadedProfile ? '已加载 ' + model.loadedProfile : '已就绪',
+            saved: '新设置已保存，后台仍使用上次加载的设置。选择“保存并使用”应用更改。',
             starting: '正在预热',
             loading: '正在加载模型',
             failed: '模型加载失败，请检查环境和模型路径',
             unavailable: '暂时无法确认模型状态',
+            standby: '当前聊天使用云端服务，本机模型已释放',
             stopped: '未启动',
           }[model?.phase] || '未启动');
     }
@@ -191,7 +193,11 @@ export async function bindLocalModelSettings({
           if (panel.isConnected) {
             paint();
             panel.querySelector('[data-model-status]').textContent =
-              action === 'use' ? '模型已加载，可以立即使用。' : '方案已保存。';
+              action !== 'use'
+                ? '方案已保存。'
+                : result.loaded?.phase === 'standby'
+                  ? `已选定本机方案，切回本机${kind === 'asr' ? '识别' : '合成'}时加载。`
+                  : '模型已加载，可以立即使用。';
           }
         }
       } catch (error) {

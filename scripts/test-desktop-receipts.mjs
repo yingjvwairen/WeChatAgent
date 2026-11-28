@@ -3,8 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { DesktopReceipts } from './desktop-receipts.mjs';
+import { DesktopReceipts, savedDesktopReceipt } from './desktop-receipts.mjs';
 import { pcmWave } from './desktop-sender/engine-voice.mjs';
+import { DeliveryStore } from './desktop-sender/delivery-store.mjs';
+import { savedChatDeliveries } from './desktop-sender/delivery-list.mjs';
+import { DesktopSenderEngine } from './desktop-sender/engine.mjs';
+import { deliveryResult } from './desktop-sender/contract.mjs';
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-receipts-'));
@@ -73,29 +77,28 @@ const submit = async (f, job = f.job, extra = {}) =>
   f.receipts.observe(job, { phase: 'submitted', submittedAt: f.now(), ...extra });
 const query = (f, job = f.job) => f.receipts.observe(job, { phase: 'query' });
 
+const receiptMd5 = 'b'.repeat(32);
+const receiptCases = [
+  ['text', {}, {}],
+  [
+    'quote',
+    { deliveryId: 'quote', quote: { serverId: '25' } },
+    { localType: 49, quoteSourceServerId: '25', quoteReplyText: '正文' },
+  ],
+  ['image', { operation: 'image', path: 'fixture.png', md5: receiptMd5 }, { localType: 3, imageMd5: receiptMd5 }],
+  ['GIF', { operation: 'sticker', path: 'fixture.gif', md5: receiptMd5 }, { localType: 47, stickerMd5: receiptMd5 }],
+  [
+    'file',
+    { operation: 'file', fileName: 'fixture.txt', size: 10, md5: receiptMd5 },
+    { localType: 49, fileKind: 'appmsg-6', fileName: 'fixture.txt', fileSize: 10, fileMd5: receiptMd5 },
+  ],
+];
+
 test('late database rows from the preceding second cannot confirm ordinary sends', async t => {
   const f = fixture(t);
-  const md5 = 'b'.repeat(32);
   let nextId = 801;
-  for (const [job, matching] of [
-    [f.job, {}],
-    [
-      { ...f.job, operation: 'text', deliveryId: 'quote', quote: { serverId: '25' } },
-      { localType: 49, quoteSourceServerId: '25', quoteReplyText: f.job.text },
-    ],
-    [
-      { ...f.job, operation: 'image', path: 'fixture.png', md5 },
-      { localType: 3, imageMd5: md5 },
-    ],
-    [
-      { ...f.job, operation: 'sticker', path: 'fixture.gif', md5 },
-      { localType: 47, stickerMd5: md5 },
-    ],
-    [
-      { ...f.job, operation: 'file', fileName: 'fixture.txt', size: 10, md5 },
-      { localType: 49, fileKind: 'appmsg-6', fileName: 'fixture.txt', fileSize: 10 },
-    ],
-  ]) {
+  for (const [, fields, matching] of receiptCases) {
+    const job = { ...f.job, ...fields };
     f.setRows([]);
     await prepare(f, job);
     await submit(f, job);
@@ -117,6 +120,108 @@ test('the baseline alone cannot confirm a manual message, but a persisted native
   const restarted = new DesktopReceipts(f.root, f.options);
   assert.equal((await restarted.observe(f.job, { phase: 'prepare' })).submissionAllowed, false);
   assert.equal((await restarted.observe(f.job, { phase: 'query' })).confirmed, true);
+});
+
+for (const [name, fields, evidence] of receiptCases) {
+  test('a resuming ' + name + ' must not accept an identical row sent before submission', async t => {
+    const f = fixture(t);
+    const job = { ...f.job, ...fields };
+    const beforePause = await prepare(f, job);
+    f.advance(20000);
+    const manual = f.row(evidence);
+    f.setRows([manual]);
+    f.receipts = new DesktopReceipts(f.root, f.options);
+    const afterPause = await prepare(f, job);
+    assert.equal(afterPause.submissionAllowed, true);
+    await submit(f, job, { baselineId: afterPause.baselineId });
+    const early = await query(f, job);
+    assert.equal(early.confirmed, false, 'a row visible before the reservation is not its receipt');
+    assert.notEqual(afterPause.baselineId, beforePause.baselineId);
+    f.setRows([manual, f.row({ ...evidence, localId: 2, serverId: '101' })]);
+    assert.equal((await query(f, job)).receipt.serverId, '101');
+  });
+}
+
+test('a baseline outage preserves an active reservation and allows new preparation only after release', async t => {
+  const f = fixture(t);
+  const first = await prepare(f);
+  await submit(f, f.job, { baselineId: first.baselineId });
+  f.advance(20000);
+  const timeout = new DOMException('Reader timed out', 'TimeoutError');
+  f.afterRead(() => {
+    throw timeout;
+  });
+
+  const reserved = await prepare(f);
+  assert.deepEqual(reserved, { prepared: true, submissionAllowed: false, baselineId: first.baselineId });
+  await assert.rejects(query(f), error => error === timeout);
+  await f.receipts.observe(f.job, {
+    phase: 'not-attempted',
+    baselineId: first.baselineId,
+    proof: { performed: false, attempted: false },
+  });
+  assert.deepEqual(await prepare(f), {
+    prepared: false,
+    submissionAllowed: false,
+    performed: false,
+    attempted: false,
+    reason: 'DESKTOP_RECEIPT_BASELINE_UNAVAILABLE',
+  });
+  f.afterRead(undefined);
+  const next = await prepare(f);
+  assert.equal(next.submissionAllowed, true);
+  assert.notEqual(next.baselineId, first.baselineId);
+});
+
+test('reservation refusal requires the unused baseline and the saved receipt scope', async t => {
+  const f = fixture(t);
+  let inputAllowed = true;
+  let originalAccount = true;
+  f.receipts.authorize = (_job, forInput) => originalAccount && (!forInput || inputAllowed);
+  const first = await prepare(f);
+  inputAllowed = false;
+  await assert.rejects(submit(f, f.job, { baselineId: 'wrong' }), /PERMISSION_CHANGED/);
+  assert.deepEqual(await submit(f, f.job, { baselineId: first.baselineId }), {
+    recorded: false,
+    performed: false,
+    attempted: false,
+    reason: 'DESKTOP_RECEIPT_PERMISSION_CHANGED',
+  });
+  originalAccount = false;
+  await assert.rejects(submit(f, f.job, { baselineId: first.baselineId }), /PERMISSION_CHANGED/);
+
+  originalAccount = inputAllowed = true;
+  const next = await prepare(f);
+  await submit(f, f.job, { baselineId: next.baselineId });
+  inputAllowed = false;
+  await assert.rejects(prepare(f), /PERMISSION_CHANGED/);
+  await assert.rejects(submit(f, f.job, { baselineId: next.baselineId }), /PERMISSION_CHANGED/);
+  f.setRows([f.row()]);
+  assert.equal((await query(f)).receipt.serverId, '100');
+});
+
+test('a unique file receipt completes without MD5 and can only be claimed once', async t => {
+  const f = fixture(t);
+  const job = { ...f.job, operation: 'file', fileName: 'fixture.txt', size: 7, md5: 'b'.repeat(32) };
+  const second = { ...job, deliveryId: 'another-file' };
+  for (const item of [job, second]) {
+    await prepare(f, item);
+    await submit(f, item);
+  }
+  const row = f.row({ localType: 49, fileKind: 'appmsg-6', fileName: job.fileName, fileSize: job.size });
+  f.setRows([{ ...row, fileMd5: 'c'.repeat(32) }]);
+  assert.equal((await query(f, job)).confirmed, false);
+  f.setRows([row, { ...row, localId: 2, serverId: '0' }]);
+  assert.equal((await query(f, job)).reason, 'DESKTOP_RECEIPT_AMBIGUOUS');
+  f.setRows([row]);
+  const result = await query(f, job);
+  assert.equal(result.confirmed, true);
+  assert.equal(result.receipt.serverId, row.serverId);
+  assert.equal(result.receipt.fileContentMd5Matched, false);
+  assert.equal((await query(f, second)).reason, 'DESKTOP_RECEIPT_ALREADY_CLAIMED');
+  f.receipts = new DesktopReceipts(f.root, f.options);
+  f.setRows([{ ...row, localId: 2, serverId: '200', fileMd5: job.md5 }]);
+  assert.deepEqual(await query(f, job), result);
 });
 test('definite no-input proof releases an intent and refreshes the baseline before continuation', async t => {
   const f = fixture(t),
@@ -153,6 +258,131 @@ test('definite no-input proof releases an intent and refreshes the baseline befo
   f.setRows([f.row(), f.row({ localId: 2, serverId: '101' })]);
   assert.equal((await query(f)).receipt.serverId, '101');
 });
+
+test('a late observation cannot overwrite a released intent', async t => {
+  const f = fixture(t);
+  const reservation = await prepare(f);
+  await submit(f);
+  const started = Promise.withResolvers();
+  const result = Promise.withResolvers();
+  const observer = new DesktopReceipts(f.root, {
+    ...f.options,
+    messages: () => {
+      started.resolve();
+      return result.promise;
+    },
+  });
+  const late = observer.observe(f.job, { phase: 'query' });
+  await started.promise;
+  await f.receipts.observe(f.job, {
+    phase: 'not-attempted',
+    baselineId: reservation.baselineId,
+    proof: { performed: false, attempted: false },
+  });
+  result.resolve({ messages: [f.row()] });
+  assert.deepEqual(await late, { confirmed: false, reason: 'DESKTOP_RECEIPT_BASELINE_CHANGED' });
+  assert.equal(savedDesktopReceipt(f.root, f.job), undefined);
+  const next = await prepare(f);
+  assert.equal(next.submissionAllowed, true);
+  assert.notEqual(next.baselineId, reservation.baselineId);
+});
+
+test('concurrent observers return one durable server ID for a delivery', async t => {
+  const f = fixture(t);
+  await prepare(f);
+  await submit(f);
+  const started = Promise.withResolvers();
+  const result = Promise.withResolvers();
+  const observer = new DesktopReceipts(f.root, {
+    ...f.options,
+    messages: () => {
+      started.resolve();
+      return result.promise;
+    },
+  });
+  const late = observer.observe(f.job, { phase: 'query' });
+  await started.promise;
+  f.setRows([f.row()]);
+  const first = await query(f);
+  result.resolve({ messages: [f.row({ localId: 2, serverId: '101' })] });
+  assert.equal(first.receipt.serverId, '100');
+  assert.deepEqual(await late, first);
+  assert.deepEqual(savedDesktopReceipt(f.root, f.job), first.receipt);
+});
+
+test('concurrent preparation reuses an existing reservation even after submission', async t => {
+  for (const alreadyPrepared of [false, true]) {
+    const f = fixture(t);
+    const old = alreadyPrepared ? await prepare(f) : null;
+    const started = Promise.withResolvers();
+    const result = Promise.withResolvers();
+    const observer = new DesktopReceipts(f.root, {
+      ...f.options,
+      messages: () => {
+        started.resolve(true);
+        return result.promise;
+      },
+    });
+    const late = observer.observe(f.job, { phase: 'prepare' });
+    let first;
+    try {
+      assert.equal(await Promise.race([started.promise, late.then(() => false)]), true);
+      first = await prepare(f);
+      assert.notEqual(first.baselineId, old?.baselineId);
+      await submit(f, f.job, { baselineId: first.baselineId });
+    } finally {
+      result.resolve({ messages: [], watermarks: {} });
+    }
+    assert.deepEqual(await late, { ...first, submissionAllowed: false });
+  }
+});
+test('a baseline read timeout cannot report an unattempted send after a concurrent reservation', async t => {
+  const f = fixture(t);
+  const old = await prepare(f);
+  const started = Promise.withResolvers();
+  const read = Promise.withResolvers();
+  const observer = new DesktopReceipts(f.root, {
+    ...f.options,
+    messages: () => {
+      started.resolve(true);
+      return read.promise;
+    },
+  });
+  const late = observer.observe(f.job, { phase: 'prepare' });
+  let current;
+  try {
+    assert.equal(await Promise.race([started.promise, late.then(() => false)]), true);
+    current = await prepare(f);
+    assert.notEqual(current.baselineId, old.baselineId);
+    await submit(f, f.job, { baselineId: current.baselineId });
+  } finally {
+    read.reject(new DOMException('Reader timed out', 'TimeoutError'));
+  }
+  assert.deepEqual(await late, { ...current, submissionAllowed: false });
+});
+
+test('only one ordinary caller can reserve a shared baseline for native input', async t => {
+  for (const [, fields] of receiptCases) {
+    const f = fixture(t);
+    const job = { ...f.job, ...fields };
+    const initial = await prepare(f, job);
+    const other = new DesktopReceipts(f.root, f.options);
+    const request = { phase: 'submitted', baselineId: initial.baselineId, submittedAt: f.now() };
+    const results = await Promise.allSettled([f.receipts.observe(job, request), other.observe(job, request)]);
+    assert.equal(results.filter(result => result.status === 'fulfilled' && result.value.recorded === true).length, 1);
+    assert.match(results.find(result => result.status === 'rejected')?.reason.message ?? '', /SUBMISSION_RESERVED/);
+
+    await f.receipts.observe(job, {
+      phase: 'not-attempted',
+      baselineId: initial.baselineId,
+      proof: { performed: false, attempted: false },
+    });
+    const next = await prepare(f, job);
+    assert.notEqual(next.baselineId, initial.baselineId);
+    assert.equal((await submit(f, job, { baselineId: next.baselineId })).recorded, true);
+  }
+});
+
 test('server acknowledgement of a preexisting local row cannot confirm a new send', async t => {
   const f = fixture(t);
   f.setRows([f.row({ localId: 17, serverId: '' })]);
@@ -194,7 +424,7 @@ test('permission changes after a database read never write a receipt claim', asy
   f.setRows([f.row()]);
   f.afterRead(() => f.setAllowed(false));
   await assert.rejects(query(f), /PERMISSION_CHANGED/);
-  assert.equal(fs.existsSync(path.join(f.root, 'state/desktop/receipt-claims')), false);
+  assert.equal(savedDesktopReceipt(f.root, f.job), undefined);
 });
 test('query windows stay fixed and reject incoming, ambiguous or different message text', async t => {
   const f = fixture(t);
@@ -292,7 +522,7 @@ test('file, native GIF and image receipts expose their actual database proof', a
   f.setRows([f.row({ localId: 3, serverId: '103', localType: 3 })]);
   assert.equal((await query(f, image)).reason, 'DESKTOP_IMAGE_CONTENT_UNVERIFIED');
   f.setRows([f.row({ localId: 3, serverId: '103', localType: 3, imageMd5: md5 })]);
-  assert.equal((await query(f, image)).receipt.sourceMd5Matched, true);
+  assert.equal((await query(f, image)).receipt.imageContentMatch, 'source-md5');
 });
 test('voice attempts use separate identities and their observed recording end window does not drift', async t => {
   const f = fixture(t),
@@ -342,6 +572,32 @@ test('voice upload confirmation may arrive after recording ends without extendin
   assert.equal(f.requests.at(-1).before, expectedBefore);
 });
 
+test('voice lookup restores a missing recording window only for the original reservation', async t => {
+  const f = fixture(t);
+  const job = { ...f.job, operation: 'voice', pcmBase64: Buffer.alloc(3200).toString('base64') };
+  await prepare(f, job);
+  const startedAt = f.now();
+  f.advance(4000);
+  const releasedAt = f.now();
+  const recording = { startedAt, releasedAt };
+  const observe = timing => f.receipts.observe(job, { phase: 'query', recording: timing });
+  assert.equal((await observe(recording)).reason, 'DESKTOP_RECEIPT_NOT_SUBMITTED');
+  assert.equal(f.requests.length, 0);
+  await submit(f, job, { submittedAt: startedAt });
+
+  f.advance(35000);
+  f.setVoice(f.row({ localType: 34 }));
+  assert.equal((await observe(recording)).confirmed, false);
+  assert.equal(f.requests[0].before, releasedAt / 1000 + 30);
+  assert.equal(
+    (await observe({ startedAt, releasedAt: releasedAt + 5000 })).reason,
+    'DESKTOP_RECEIPT_RECORDING_CHANGED',
+  );
+  assert.equal(f.requests.length, 1);
+  f.setVoice(f.row({ localType: 34, createTime: releasedAt / 1000 + 5 }));
+  assert.equal((await observe(recording)).receipt.source, 'desktop-acoustic-match');
+  assert.equal(f.requests[1].before, f.requests[0].before);
+});
 test('a preexisting row cannot become a new receipt by acquiring a new creation time', async t => {
   const f = fixture(t);
   f.setRows([f.row({ localId: 80, serverId: '', createTime: 12 })]);
@@ -353,23 +609,192 @@ test('a preexisting row cannot become a new receipt by acquiring a new creation 
   assert.equal((await query(f)).receipt.serverId, '2003');
 });
 
-test('re-encoded static images require applied native input and a unique new server row', async t => {
+test('a mismatched or missing image digest never claims a server row, even after restart', async t => {
   const f = fixture(t),
     image = { ...f.job, operation: 'image', path: 'fixture.png', md5: 'b'.repeat(32) };
-  const { baselineId } = await prepare(f, image);
+  const other = { ...image, deliveryId: 'another-image', md5: 'c'.repeat(32) };
+  await prepare(f, image);
+  await prepare(f, other);
   await submit(f, image);
-  const row = f.row({ localType: 3, imageMd5: 'c'.repeat(32) });
-  f.setRows([row]);
-  assert.equal((await query(f, image)).confirmed, false);
-  await f.receipts.observe(image, { phase: 'image-input-applied', baselineId });
-  f.setRows([row, { ...row, localId: 2, serverId: '0' }]);
-  assert.equal((await query(f, image)).reason, 'DESKTOP_RECEIPT_AMBIGUOUS');
-  f.setRows([{ ...row, createTime: row.createTime + 10 }]);
-  assert.equal((await query(f, image)).confirmed, false);
-  f.setRows([row]);
-  const proof = (await query(f, image)).receipt;
-  assert.deepEqual(
-    [proof.nativeImageRowConfirmed, proof.nativeSubmitVerified, proof.sourceMd5Matched, proof.imageContentVerified],
-    [true, true, false, false],
-  );
+  await submit(f, other);
+  const unrelated = f.row({ localType: 3, imageMd5: other.md5 });
+  for (const imageMd5 of [undefined, other.md5]) {
+    f.setRows([{ ...unrelated, imageMd5 }]);
+    assert.deepEqual(await query(f, image), { confirmed: false, reason: 'DESKTOP_IMAGE_CONTENT_UNVERIFIED' });
+    assert.equal(savedDesktopReceipt(f.root, image), undefined);
+  }
+
+  const restarted = new DesktopReceipts(f.root, f.options);
+  assert.equal((await restarted.observe(other, { phase: 'query' })).receipt.serverId, unrelated.serverId);
+  const exact = f.row({ localType: 3, localId: 2, serverId: '200', imageMd5: image.md5 });
+  f.setRows([unrelated, exact, { ...exact, localId: 3, serverId: '0' }]);
+  assert.equal((await restarted.observe(image, { phase: 'query' })).reason, 'DESKTOP_RECEIPT_AMBIGUOUS');
+  f.setRows([unrelated, exact]);
+  const result = await restarted.observe(image, { phase: 'query' });
+  assert.equal(result.receipt.serverId, '200');
+  assert.equal(result.receipt.imageContentMatch, 'source-md5');
 });
+
+test('an archived image uses the durable Reader record for both lookup and stopped queue display', async t => {
+  const f = fixture(t);
+  const job = {
+    ...f.job,
+    id: 'a'.repeat(64),
+    operation: 'image',
+    path: 'fixture.png',
+    md5: 'b'.repeat(32),
+    rosterGrant: 'grant',
+  };
+  const row = { job, fingerprint: 'fixture', sequence: 1, createdAt: f.now() };
+  const store = new DeliveryStore(path.join(f.root, 'state/desktop-sender', job.accountRef));
+  store.save(row);
+  store.retire(row, deliveryResult(job, 'unconfirmed', { inputReleased: true, inputStarted: true }));
+  const list = () => savedChatDeliveries(f.root, job.accountRef, 'wechat:private:' + job.target, 'grant');
+  assert.equal(list()[0].state, 'unconfirmed');
+  await prepare(f, job);
+  await submit(f, job);
+  f.setRows([f.row({ localType: 3 })]);
+  const archived = store.find(job.id);
+  const engine = Object.assign(Object.create(DesktopSenderEngine.prototype), {
+    root: f.root,
+    authorizeCurrent: () => true,
+    receipt: (source, operation) => f.receipts.observe(source, operation),
+  });
+  assert.equal((await engine.observe({ store }, archived, true)).state, 'unconfirmed');
+  assert.equal(list()[0].state, 'unconfirmed');
+  f.setRows([f.row({ localType: 3, localId: 2, serverId: '101', imageMd5: job.md5 })]);
+  const result = await engine.observe({ store }, archived, true);
+  assert.equal(result.confirmed, true);
+  assert.equal(result.receipt.serverId, '101');
+  assert.equal(list()[0].state, 'confirmed');
+  assert.equal(list()[0].receipt.serverId, '101');
+  assert.equal(list()[0].receipt.imageContentMatch, 'source-md5');
+});
+
+test('a reencoded image requires local content evidence and an unambiguous server acknowledgement', async t => {
+  const f = fixture(t);
+  const image = {
+    ...f.job,
+    operation: 'image',
+    path: 'fixture.png',
+    md5: 'b'.repeat(32),
+    sha256: 'c'.repeat(64),
+    imageFingerprint: { width: 100, height: 100, pixels: 'd'.repeat(64), sample: 'A'.repeat(4096) },
+  };
+  await prepare(f, image);
+  await submit(f, image);
+  const reencoded = f.row({ localType: 3, imageMd5: 'e'.repeat(32), localId: 2 });
+  const competing = { ...reencoded, localId: 3, serverId: '0' };
+  f.setRows([reencoded]);
+  assert.equal((await query(f, image)).reason, 'DESKTOP_IMAGE_CONTENT_UNVERIFIED');
+  f.setRows([{ ...reencoded, imageRasterMatched: true }, competing]);
+  assert.equal((await query(f, image)).reason, 'DESKTOP_RECEIPT_AMBIGUOUS');
+  f.setRows([
+    { ...reencoded, imageRasterMatched: true },
+    { ...competing, imageRasterMatched: false },
+  ]);
+  const restart = new DesktopReceipts(f.root, f.options);
+  const result = await restart.observe(image, { phase: 'query' });
+  assert.equal(result.receipt.serverId, reencoded.serverId);
+  assert.equal(result.receipt.imageContentMatch, 'raster');
+  assert.equal(result.receipt.sourceImageSha256, image.sha256);
+  assert.equal(result.receipt.imageContentVerified, false);
+});
+
+test('older archived native deliveries stay visible until their own receipt or review is recorded', async t => {
+  const f = fixture(t);
+  const account = f.job.accountRef;
+  const directory = path.join(f.root, 'state/desktop-sender', account);
+  fs.mkdirSync(directory, { recursive: true });
+  const store = new DeliveryStore(directory);
+  const archive = (sequence, operation, state = 'unconfirmed', jobFields = {}, outcomeFields = {}) => {
+    const id = sequence.toString(16).padStart(64, '0');
+    const job = { ...f.job, id, deliveryId: 'archive-' + sequence, operation, rosterGrant: 'grant', ...jobFields };
+    const row = { job, fingerprint: id, sequence, createdAt: f.now() + sequence };
+    store.retire(row, deliveryResult(job, state, { inputReleased: true, inputStarted: true, ...outcomeFields }));
+    return job;
+  };
+  const text = archive(1, 'text');
+  const image = archive(2, 'image', 'unconfirmed', { path: 'fixture.png', md5: 'b'.repeat(32) });
+  const sticker = archive(3, 'sticker', 'unconfirmed', { path: 'fixture.gif', md5: 'c'.repeat(32) });
+  const withLateReceipt = archive(4, 'text');
+  const differentText = archive(5, 'text', 'unconfirmed', { text: 'surviving input checkpoint' });
+  archive(6, 'image', 'unconfirmed', { path: 'fixture.png', rosterGrant: 'revoked' });
+  archive(7, 'text', 'unconfirmed', { target: '456' });
+  const reviewed = archive(8, 'text', 'unconfirmed', {}, { reviewed: true });
+  const file = archive(9, 'file', 'unconfirmed', { path: 'fixture.txt', fileName: 'fixture.txt' });
+  for (let sequence = 20; sequence < 151; sequence++) archive(sequence, 'text', 'confirmed');
+
+  for (const [job, message] of [
+    [withLateReceipt, 101],
+    [{ ...differentText, text: 'different receipt binding' }, 102],
+  ]) {
+    f.setRows([]);
+    await prepare(f, job);
+    await submit(f, job);
+    f.setRows([f.row({ fullText: job.text, localId: message, serverId: String(message) })]);
+    assert.equal((await query(f, job)).receipt.serverId, String(message));
+  }
+
+  const context = { account: { accountRef: account }, directory, store, chatControls: { heldChats: () => [] } };
+  const engine = Object.assign(Object.create(DesktopSenderEngine.prototype), {
+    root: f.root,
+    contexts: new Map([[account, context]]),
+  });
+  const scope = { accountRef: account, kind: 'private', target: f.job.target, rosterGrant: 'grant' };
+  const expected = new Set([text.id, image.id, sticker.id, file.id, differentText.id]);
+  for (const jobs of [
+    savedChatDeliveries(f.root, account, 'wechat:private:' + f.job.target, 'grant'),
+    engine.listDeliveries(scope),
+  ]) {
+    assert.deepEqual(new Set(jobs.filter(job => job.state === 'unconfirmed').map(job => job.id)), expected);
+    assert.equal(jobs.filter(job => job.state === 'confirmed').length, 128);
+    assert.equal(
+      jobs.some(job => job.id === withLateReceipt.id || job.id === reviewed.id),
+      false,
+    );
+    assert.ok(jobs.every(job => !job.canCancel && !job.canPause && !job.canResume));
+  }
+  assert.equal(store.find(withLateReceipt.id).outcome.state, 'unconfirmed');
+  assert.equal(savedDesktopReceipt(f.root, withLateReceipt).serverId, '101');
+});
+
+for (const [operation, evidence] of [
+  ['text', { localType: 1, fullText: 'late receipt' }],
+  ['sticker', { localType: 47, stickerMd5: 'b'.repeat(32) }],
+]) {
+  test('archived ' + operation + ' confirms a late receipt without reopening input', async t => {
+    const f = fixture(t);
+    const job = {
+      ...f.job,
+      id: 'b'.repeat(64),
+      operation,
+      text: 'late receipt',
+      md5: 'b'.repeat(32),
+      rosterGrant: 'grant',
+    };
+    const row = { job, fingerprint: 'fixture', sequence: 1, createdAt: f.now() };
+    const store = new DeliveryStore(path.join(f.root, 'state/desktop-sender', job.accountRef));
+    store.save(row);
+    store.retire(row, deliveryResult(job, 'unconfirmed', { inputReleased: true, inputStarted: true }));
+    await prepare(f, job);
+    await submit(f, job);
+    const engine = Object.assign(Object.create(DesktopSenderEngine.prototype), {
+      root: f.root,
+      authorizeCurrent: (_job, input) => input === false,
+      receipt: (source, options) => {
+        assert.equal(options.phase, 'query');
+        return f.receipts.observe(source, options);
+      },
+    });
+    const archived = store.find(job.id);
+    assert.equal((await engine.observe({ store }, archived, true)).state, 'unconfirmed');
+    f.setRows([f.row({ localId: 2, serverId: '101', ...evidence })]);
+    const confirmed = await engine.observe({ store }, archived, true);
+    assert.equal(confirmed.state, 'confirmed');
+    assert.equal(confirmed.receipt.serverId, '101');
+    const saved = savedChatDeliveries(f.root, job.accountRef, 'wechat:private:' + job.target, 'grant')[0];
+    assert.equal(saved.state, 'confirmed');
+    assert.equal(saved.canResume, false);
+  });
+}

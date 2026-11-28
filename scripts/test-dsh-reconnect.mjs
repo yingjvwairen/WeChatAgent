@@ -6,6 +6,9 @@ import os from 'node:os';
 import http from 'node:http';
 import { MessageBuffer, replyDeliveryParts } from '../components/qq-bridge/src/core/message-buffer.js';
 import { SocialEngine } from '../components/qq-bridge/src/core/social-engine.js';
+import { VoiceIngress } from '../components/qq-bridge/src/core/voice-ingress.js';
+import { ProactiveEngine } from '../components/qq-bridge/src/core/proactive-engine.js';
+import { PROACTIVE_DEFAULTS } from '../components/qq-bridge/src/core/proactive-policy.js';
 import { DshConnectionGuard } from '../components/qq-bridge/src/core/dsh-connection.js';
 import { DshPluginClient } from '../components/qq-bridge/src/dsh/plugin-client.js';
 import { AssistantTasks } from '../packages/dsh-social-bridge-plugin/assistant-tasks.mjs';
@@ -125,6 +128,7 @@ test('offline input is retained in history but a reconnect replies only to new i
   await until(() => f.sent.length === 1 && !f.engine.running.size);
   assert.equal(f.calls.length, 1);
   assert.match(f.calls[0][1], /fresh/);
+  assert.match(f.calls[0][1], /offline-59/);
   assert.doesNotMatch(f.calls[0][1], /offline-0/);
   assert.equal(f.calls[0][2].dshInstanceId, 'instance-b');
 });
@@ -313,25 +317,145 @@ test('offline drafts are cancelled while uncertain submitted text stays recorded
   assert.equal(f.buffer.recent(key).find(row => row.outgoing).delivery_status, 'unconfirmed');
   assert.equal(f.sent.length, 0);
 });
-test('fresh input after a recovered instance is not dropped by a second request in flight', async t => {
-  let finish;
+test('fresh input after a recovered instance does not wait for the old model response', async t => {
+  const stale = Promise.withResolvers();
   const f = fixture(t, {
-    decide: (_key, prompt) =>
-      prompt.includes('original') ? new Promise(resolve => (finish = resolve)) : 'RESPOND: fresh result',
+    decide: (_key, prompt) => (prompt.includes('fresh') ? 'RESPOND: fresh result' : stale.promise),
+  });
+  try {
+    await f.guard.check();
+    f.engine.receive(incoming('original', f.now + 1000));
+    await until(() => f.calls.length === 1);
+    f.setHealth({ ready: false });
+    await f.guard.check({ force: true });
+    f.advance(5000);
+    f.setHealth({ ready: true, instanceId: 'instance-b', startedAt: f.now });
+    await f.guard.check({ force: true });
+    f.engine.receive(incoming('fresh', f.now + 1000));
+
+    await until(() => f.sent.length === 1 && !f.engine.running.size);
+    assert.equal(f.sent[0][1], 'fresh result');
+    assert.match(f.calls.at(-1)[1], /original/);
+    assert.equal(f.buffer.pendingRequests.size, 0);
+    assert.equal(f.buffer.findIncoming(incoming('original', f.now)).reply_skip_reason, 'dsh_offline');
+    stale.resolve('RESPOND: stale');
+    await stale.promise;
+    assert.equal(f.sent.length, 1);
+  } finally {
+    f.engine.stop();
+    stale.resolve('RESPOND: stale');
+  }
+});
+test('a cancelled proactive decision releases the chat for a live reply after reconnect', async t => {
+  const stale = Promise.withResolvers();
+  let started = false;
+  let now = Date.parse('2026-11-26T02:00:00Z');
+  const f = fixture(t);
+  const proactive = new ProactiveEngine({
+    stateFile: path.join(f.root, 'proactive.json'),
+    buffer: f.buffer,
+    social: f.engine,
+    settingsFor: () => ({
+      whitelist: { groups: [], private: ['123'] },
+      proactive: {
+        ...PROACTIVE_DEFAULTS,
+        enabled: true,
+        intervalMinutes: 30,
+        idleMinutes: 5,
+        jitterMinutes: 0,
+        chats: { [key]: true },
+      },
+    }),
+    personaFor: () => ({ persona: 'Fixture', personaName: 'Fixture' }),
+    decide: async () => {
+      started = true;
+      return stale.promise;
+    },
+    send: () => assert.fail('a stale proactive reply must not be sent'),
+    selfIdFor: () => 'self',
+    isReady: () => f.guard.ready,
+    now: () => now,
+    random: () => 0,
+  });
+  try {
+    await f.guard.check();
+    await proactive.tick();
+    now += 30 * 60000;
+    const waiting = proactive.tick();
+    await until(() => started);
+    f.setHealth({ ready: false });
+    await f.guard.check({ force: true });
+    f.advance(5000);
+    f.setHealth({ ready: true, instanceId: 'instance-b', startedAt: f.now });
+    await f.guard.check({ force: true });
+    f.engine.receive(incoming('fresh', f.now + 1000));
+
+    await until(() => f.sent.length === 1);
+    await waiting;
+    assert.equal(f.sent[0][0].message_id, 'fresh');
+    assert.equal(proactive.state.chats[key].job, null);
+  } finally {
+    stale.resolve('RESPOND: stale');
+  }
+});
+
+test('a busy DSH session retries the same unadmitted batch once the agent is available', async t => {
+  let attempts = 0;
+  const f = fixture(t, {
+    decide: async () => {
+      if (++attempts === 1) throw Object.assign(Error('session_busy'), { code: 'DSH_SESSION_BUSY', admitted: false });
+      return 'RESPOND: retry finished';
+    },
   });
   await f.guard.check();
-  f.engine.receive(incoming('original', f.now + 1000));
-  await until(() => finish);
+  f.engine.receive(incoming('fresh input', f.now + 1000));
+  await until(() => f.sent.length === 1 && !f.engine.running.size);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[0][2].batchId, f.calls[1][2].batchId);
+  assert.equal(f.sent[0][1], 'retry finished');
+  assert.equal(f.buffer.pendingRequests.size, 0);
+});
+
+test('a disconnected transcription releases the voice worker for new messages', async t => {
+  const stale = Promise.withResolvers();
+  let oldSignal;
+  const recognized = [];
+  const ingress = new VoiceIngress({
+    recognize: async (target, { signal }) => {
+      recognized.push(target.message_id);
+      if (target.message_id === 'old voice') {
+        oldSignal = signal;
+        return stale.promise;
+      }
+      return { ok: true, text: 'new transcript' };
+    },
+  });
+  t.after(() => {
+    ingress.stop();
+    stale.resolve({ ok: true, text: 'old transcript' });
+  });
+  const f = fixture(t);
+  f.engine.prepareVoiceRows = (...args) => ingress.prepareRows(...args);
+  await f.guard.check();
+  const voice = { id: 'c'.repeat(64) };
+  f.engine.receive({ ...incoming('old voice', f.now + 1000), voice });
+  await until(() => oldSignal);
   f.setHealth({ ready: false });
   await f.guard.check({ force: true });
   f.advance(5000);
   f.setHealth({ ready: true, instanceId: 'instance-b', startedAt: f.now });
   await f.guard.check({ force: true });
-  f.engine.receive(incoming('fresh', f.now + 1000));
-  finish('RESPOND: stale');
+  f.engine.receive({ ...incoming('new voice', f.now + 1000), voice });
+
   await until(() => f.sent.length === 1 && !f.engine.running.size);
-  assert.equal(f.sent[0][1], 'fresh result');
+  assert.equal(oldSignal.aborted, true);
+  assert.deepEqual(recognized, ['old voice', 'new voice']);
+  assert.match(f.calls[0][1], /new transcript/);
+  assert.doesNotMatch(f.calls[0][1], /old transcript/);
+  assert.equal(f.buffer.findIncoming(incoming('old voice', f.now)).reply_skip_reason, 'dsh_offline');
+  assert.equal(ingress.active, 0);
 });
+
 test('ordinary model errors do not mark a healthy plugin offline or erase queued input', async t => {
   const f = fixture(t, {
     decide: async () => {
@@ -429,6 +553,36 @@ test('health readiness requires the authenticated bridge contract and exposes th
   assert.equal((await client.connectionHealth()).ready, false);
 });
 
+test('cancelling a model wait closes the local HTTP request', async t => {
+  let received = false,
+    closed = false;
+  const server = http.createServer((req, res) => {
+    assert.equal(req.url, '/followup');
+    req.resume();
+    if (received) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'agent_unavailable', detail: 'session_busy' }));
+    }
+    received = true;
+    res.once('close', () => (closed = true));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise(resolve => server.close(resolve));
+  });
+  const controller = new AbortController();
+  const client = new DshPluginClient({ url: 'http://127.0.0.1:' + server.address().port, token: 'fixture' });
+  const pending = assert.rejects(client.followup(key, 'fixture', {}, { signal: controller.signal }), {
+    code: 'DSH_CONNECTION_CHANGED',
+  });
+  await until(() => received);
+  controller.abort(Object.assign(Error('DSH_CONNECTION_CHANGED'), { code: 'DSH_CONNECTION_CHANGED' }));
+  await pending;
+  await until(() => closed);
+  await assert.rejects(client.followup(key, 'fixture'), { code: 'DSH_SESSION_BUSY', admitted: false });
+});
+
 test('an interrupted desktop reply survives restart as an observation of its original part only', async t => {
   let status = 'pending';
   const observed = [];
@@ -437,7 +591,7 @@ test('an interrupted desktop reply survives restart as an observation of its ori
     send: async () => ({ pending: true }),
     inspectReceipt: async (_, part) => {
       observed.push(part.deliveryId);
-      return status;
+      return { status };
     },
   });
   await f.guard.check();
@@ -466,13 +620,127 @@ test('an interrupted desktop reply survives restart as an observation of its ori
   assert.ok(observed.every(value => value === id));
 });
 
+test('DSH recovery can answer new input while a cancelled reply awaits its original receipt', async t => {
+  const receipt = Promise.withResolvers();
+  const observed = [];
+  const f = fixture(t, {
+    send: async target =>
+      target.message_id === 'before-disconnect'
+        ? { pending: true, admitted: true }
+        : { delivered: 'database-confirmed' },
+    inspectReceipt: async (_, part) => {
+      observed.push(part.deliveryId);
+      return receipt.promise;
+    },
+  });
+  try {
+    await f.guard.check();
+    f.engine.receive(incoming('before-disconnect', f.now + 1000));
+    await until(() => f.buffer.pendingReplies.get(key)?.parts[0].state === 'submitted' && !f.engine.running.has(key));
+    const id = f.sent[0][2].deliveryId;
+    f.setHealth({ ready: false });
+    assert.equal(await f.guard.check({ force: true }), false);
+    await until(() => observed.length === 1);
+    f.advance(10000);
+    f.setHealth({ ready: true, instanceId: 'instance-b', startedAt: f.now });
+    assert.equal(await f.guard.check({ force: true }), true);
+    f.engine.receive(incoming('after-reconnect', f.now + 1000));
+
+    await until(() => f.sent.length === 2 && !f.engine.running.has(key));
+    assert.deepEqual(
+      f.sent.map(([target]) => target.message_id),
+      ['before-disconnect', 'after-reconnect'],
+    );
+    assert.equal(f.calls.length, 2);
+    assert.equal(f.buffer.findIncoming(incoming('before-disconnect', f.now)).reply_skip_reason, 'dsh_offline');
+    assert.equal(f.buffer.replyReceipts.has(id), true);
+    assert.equal(f.buffer.findReplyPart(key, id), undefined);
+    receipt.resolve({ status: 'confirmed' });
+    await until(() => f.buffer.findReplyPart(key, id)?.delivery_status === 'confirmed');
+    assert.deepEqual(observed, [id]);
+    assert.equal(f.buffer.pendingReplies.size, 0);
+    assert.equal(f.buffer.replyReceipts.size, 0);
+  } finally {
+    f.engine.stop();
+    receipt.resolve({ status: 'pending' });
+  }
+});
+
+test('new media can be sent while the retired image receipts are outstanding', async t => {
+  const receipt = Promise.withResolvers();
+  const oldIds = ['b', 'c', 'd'].map(value => value.repeat(64));
+  const newId = 'e'.repeat(64);
+  const observed = [];
+  const sent = [];
+  const f = fixture(t, {
+    inspectReceipt: async (_, part) => {
+      observed.push(part.deliveryId);
+      if (observed.length === 1) return receipt.promise;
+      return { status: 'confirmed', mediaType: 'wechat-image' };
+    },
+  });
+  const media = f.engine.media;
+  media.policy = async () => ({ enabled: true });
+  f.engine.sendSticker = async (_target, _asset, options) => {
+    sent.push(options.deliveryId);
+    return { delivered: 'database-confirmed', data: { media_type: 'wechat-image' } };
+  };
+  const enqueue = deliveryId => {
+    const result = { decision: 'STICKER', stickerId: sticker };
+    media.enqueue(key, { message: incoming(deliveryId, f.now) }, replyDeliveryParts(result, deliveryId)[0]);
+  };
+  try {
+    await f.guard.check();
+    for (const id of oldIds) {
+      enqueue(id);
+      f.buffer.mediaReplies.get(id).part.state = 'submitted';
+    }
+    f.setHealth({ ready: false });
+    assert.equal(await f.guard.check({ force: true }), false);
+    await until(() => observed.length === 1);
+    f.advance(10000);
+    f.setHealth({ ready: true, instanceId: 'instance-b', startedAt: f.now });
+    assert.equal(await f.guard.check({ force: true }), true);
+
+    enqueue(newId);
+    await until(() => f.buffer.findReplyPart(key, newId)?.delivery_status === 'confirmed');
+    assert.deepEqual(sent, [newId]);
+    assert.deepEqual([...new MessageBuffer(f.file).mediaReplies.keys()].toSorted(), oldIds);
+    receipt.resolve({ status: 'pending' });
+    await until(() => f.buffer.mediaReplies.size === 0);
+    assert.deepEqual(observed, [...oldIds, oldIds[0]]);
+    for (const id of oldIds) assert.equal(f.buffer.findReplyPart(key, id)?.delivery_status, 'confirmed');
+    assert.deepEqual(sent, [newId]);
+  } finally {
+    f.engine.stop();
+    receipt.resolve({ status: 'pending' });
+  }
+});
+
+test('a failed withdrawal is retried even if DSH recovers before the next probe', async t => {
+  const f = fixture(t);
+  await f.guard.check();
+  const epoch = f.guard.epoch;
+  let calls = 0;
+  f.guard.onBoundary = () => {
+    if (++calls === 1) throw Error('fixture write contention');
+  };
+  f.setHealth({ ready: false });
+  assert.equal(await f.guard.check({ force: true }), false);
+  assert.equal(f.guard.epoch, epoch);
+  f.setHealth({ ready: true });
+  assert.equal(await f.guard.check({ force: true }), true);
+  assert.equal(f.guard.epoch, epoch + 1);
+  assert.equal(calls, 2);
+});
+
 test('DSH restart preserves an in-flight image receipt and discards its queued successor', async t => {
   let observed = 0;
   const f = fixture(t, {
     inspectReceipt: async (_target, part) => {
       assert.equal(part.stickerId, sticker);
       observed++;
-      return 'confirmed';
+      return { status: 'confirmed', mediaType: 'wechat-sticker' };
     },
   });
   await f.guard.check();

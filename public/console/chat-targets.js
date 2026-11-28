@@ -1,5 +1,6 @@
 const key = row => `wechat:${row.kind}:${row.id}`;
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const canSelect = row => row.kind === 'private' || row.canSend !== false;
 
 export function mergeTargetSave(previous, draft, saved) {
   const merge = (before, pending, current) => {
@@ -15,8 +16,10 @@ export function mergeTargetSave(previous, draft, saved) {
   };
   const result = merge(previous, draft, saved);
   result.wechat.whitelist = structuredClone(saved.wechat.whitelist);
-  if (saved.wechat.rosterGrants) result.wechat.rosterGrants = structuredClone(saved.wechat.rosterGrants);
-  else delete result.wechat.rosterGrants;
+  for (const field of ['rosterGrants', 'rosterStarts']) {
+    if (saved.wechat[field]) result.wechat[field] = structuredClone(saved.wechat[field]);
+    else delete result.wechat[field];
+  }
   return result;
 }
 
@@ -56,7 +59,11 @@ export function createChatTargetsUI({
     $('#target-kind').value = ['private', 'groups'].includes(kind) ? kind : 'all';
     const label = row => row.name ?? state.names.get(key(row)) ?? row.id;
     const detail = row =>
-      [row.kind === 'group' ? '群聊' : '好友', label(row) === row.id ? '' : row.id]
+      [
+        row.kind === 'group' ? '群聊' : '好友',
+        label(row) === row.id ? '' : row.id,
+        row.canSend === false ? (row.kind === 'private' ? '可读取。请设置唯一备注以发送' : '微信内无法唯一定位') : '',
+      ]
         .filter(Boolean)
         .map(esc)
         .join(' · ');
@@ -76,7 +83,7 @@ export function createChatTargetsUI({
         [...catalog.values()]
           .map(
             row =>
-              `<label class="contact-result"><input type="checkbox" data-target-choice="${esc(key(row))}" ${picked.has(key(row)) ? 'checked' : ''}><span>${esc(label(row))}<small>${detail(row)}</small></span></label>`,
+              `<label class="contact-result"><input type="checkbox" data-target-choice="${esc(key(row))}" ${picked.has(key(row)) ? 'checked' : canSelect(row) ? '' : 'disabled'}><span>${esc(label(row))}<small>${detail(row)}</small></span></label>`,
           )
           .join('') || '<p class="empty-state">没有找到匹配的聊天。</p>';
       paintSelected();
@@ -100,7 +107,11 @@ export function createChatTargetsUI({
         );
         if (!connected() || current !== sequence) return;
         catalog.clear();
-        for (const row of found.flat()) catalog.set(key(row), row);
+        for (const row of found.flat()) {
+          const id = key(row);
+          catalog.set(id, row);
+          if (picked.has(id)) picked.set(id, row);
+        }
         paint();
       } catch (failure) {
         if (connected() && current === sequence) {
@@ -120,8 +131,12 @@ export function createChatTargetsUI({
       const id = event.target.dataset.targetChoice,
         row = catalog.get(id);
       if (!row || saving) return;
-      if (event.target.checked) picked.set(id, row);
-      else picked.delete(id);
+      if (event.target.checked && canSelect(row)) picked.set(id, row);
+      else {
+        picked.delete(id);
+        event.target.checked = false;
+        event.target.disabled = !canSelect(row);
+      }
       paintSelected();
     });
     selection.addEventListener('change', event => {

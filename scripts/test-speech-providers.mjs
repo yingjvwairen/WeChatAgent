@@ -727,6 +727,23 @@ test('ElevenLabs, Azure and Google keep their synthesis and recognition requests
 
 // ---- custom APIs ----
 
+test('custom speech synthesis posts to the exact URL when selected', async () => {
+  const endpoint = 'https://gw.example/tts/render/?version=2';
+  const settings = configured({
+    tts: ['custom', 'speech', { endpoint, endpointMode: 'exact', model: 'm', voice: 'v' }],
+    owners: { tts: { entry: 'custom', origins: ['https://gw.example'] } },
+    keys: { tts: 'fixture-key' },
+  });
+  const server = recorder(() => new Response(wav16(200)));
+  assert.equal((await synthesizeText(settings, '你好', { fetchImpl: server.fetchImpl })).durationMs, 200);
+  assert.deepEqual(
+    server.calls.map(({ url, method, headers }) => [url, method, headers.Authorization]),
+    [[endpoint, 'POST', 'Bearer fixture-key']],
+  );
+  await assert.rejects(listFor(settings, 'tts', { fetchImpl: server.fetchImpl }), { message: 'VOICE_TTS_MODELS' });
+  assert.equal(server.calls.length, 1);
+});
+
 test('custom APIs: full URLs, gateway prefixes, header or no auth, optional model list and error responses', async () => {
   const full = configured({
     tts: [

@@ -16,11 +16,12 @@ const {
   stopLegacyServices,
 } = require('./storage-location.cjs');
 
-app.setName('WeChatAgent');
-app.setAppUserModelId('local.wechatagent.desktop');
+const { appId, productName } = require('./package.json');
+app.setName(productName);
+app.setAppUserModelId(appId);
 const installedDistribution =
   app.isPackaged && fs.existsSync(path.join(process.resourcesPath, 'project', 'deployment.json'));
-const legacyHome = path.join(app.getPath('appData'), 'WeChatAgent');
+const legacyHome = path.join(app.getPath('appData'), productName);
 let storage = null,
   storageFailure = null;
 try {
@@ -183,7 +184,7 @@ else {
               plan.source +
               '\n到：' +
               plan.dataHome +
-              '\n\n会停止旧实例管理的后台服务，再复制并校验配置、人设、表情包和会话状态，保留旧副本。请先退出旧版窗口和匹配微信。\n\n选择“保留旧 DSH”会跳过 DSH 数据迁移，保留其原位置、会话、附件和配置并继续启动；启动后需在 DSH 中手动重新添加新版插件目录。选择完整迁移时，请先从托盘退出 DSH。',
+              '\n\n会停止旧实例管理的后台服务，再复制并校验配置、人设、表情包和会话状态，保留旧副本。请先退出旧版窗口和匹配微信。\n\n选择“保留旧 DSH”会保留其原位置、会话、附件和配置。选择完整迁移前，请从托盘退出 DSH。\n\n如果原插件是从旧工作区的本机目录添加的，迁移后请在 DSH 插件页重新添加“连接设置”里显示的新插件目录，并完整重开 DSH。',
             buttons: ['停止旧服务并迁移', '保留旧 DSH', '暂不启动'],
             defaultId: 1,
             cancelId: 2,

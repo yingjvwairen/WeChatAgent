@@ -6,7 +6,78 @@ import path from 'node:path';
 import os from 'node:os';
 import deployment from '../apps/console-desktop/deployment.cjs';
 import { createUpdateChecker, compareVersions } from './update-check.mjs';
-import { deploymentVerification } from './release-verification.mjs';
+import {
+  deploymentVerification,
+  DESKTOP_APP_SOURCE_FILES,
+  desktopInstallerPackage,
+  stageDesktopYaml,
+  verifyInstallerDesktopApp,
+  verifyInstallerOcrModel,
+} from './release-verification.mjs';
+import { LOCAL_OCR_MODEL } from './desktop-sender/prepare-local-ocr-model.mjs';
+
+test('release verification requires the pinned OCR model used at desktop startup', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-ocr-payload-'));
+  t.after(() => fs.rmSync(root, { recursive: true }));
+  await assert.rejects(verifyInstallerOcrModel(root), /INSTALLER_OCR_MODEL_INVALID/);
+  const models = path.join(root, 'runtime/ocr-models');
+  fs.mkdirSync(models, { recursive: true });
+  fs.writeFileSync(path.join(models, LOCAL_OCR_MODEL.file), 'truncated model');
+  await assert.rejects(verifyInstallerOcrModel(root), /INSTALLER_OCR_MODEL_INVALID/);
+});
+
+test('installer desktop code and entry point must match the audited source snapshot', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-desktop-app-check-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 }));
+  const source = path.join(root, 'source');
+  const desktop = path.join(source, 'apps/console-desktop');
+  const app = path.join(root, 'app');
+  fs.mkdirSync(desktop, { recursive: true });
+  fs.mkdirSync(app);
+  const workspace = path.resolve(import.meta.dirname, '..');
+  const { dependencies } = JSON.parse(
+    fs.readFileSync(path.join(workspace, 'apps/console-desktop/package.json'), 'utf8'),
+  );
+  const identity = { name: 'fixture-app', appId: 'fixture.desktop', productName: 'Fixture Desktop', dependencies };
+  const release = { version: '0.4.6', packageVersion: '0.4.6' };
+  fs.writeFileSync(path.join(desktop, 'package.json'), JSON.stringify(identity));
+  for (const file of DESKTOP_APP_SOURCE_FILES) {
+    fs.writeFileSync(path.join(desktop, file), 'fixture ' + file);
+    fs.copyFileSync(path.join(desktop, file), path.join(app, file));
+  }
+  const manifest = desktopInstallerPackage(identity, release);
+  fs.writeFileSync(path.join(app, 'package.json'), JSON.stringify(manifest, null, 2));
+  const verify = () => verifyInstallerDesktopApp(app, source, release, workspace);
+  assert.throws(verify, /INSTALLER_DESKTOP_YAML_CHANGED/);
+  stageDesktopYaml(app, workspace, dependencies.yaml);
+  verify();
+  assert.equal(manifest.main, 'main.cjs');
+  assert.equal(manifest.releaseVersion, release.version);
+
+  const parserPackage = path.join(app, 'node_modules/yaml/package.json');
+  const parserManifest = JSON.parse(fs.readFileSync(parserPackage, 'utf8'));
+  delete parserManifest.scripts;
+  delete parserManifest.keywords;
+  fs.writeFileSync(parserPackage, JSON.stringify(parserManifest));
+  verify();
+  fs.writeFileSync(parserPackage, JSON.stringify({ ...parserManifest, main: './other.js' }));
+  assert.throws(verify, /INSTALLER_DESKTOP_YAML_CHANGED: package\.json/);
+  fs.writeFileSync(parserPackage, JSON.stringify(parserManifest));
+
+  const parser = path.join(app, 'node_modules/yaml/dist/index.js');
+  const originalParser = fs.readFileSync(parser);
+  fs.appendFileSync(parser, 'changed at staging');
+  assert.throws(verify, /INSTALLER_DESKTOP_YAML_CHANGED/);
+  fs.writeFileSync(parser, originalParser);
+
+  fs.appendFileSync(path.join(app, 'preload.cjs'), 'changed at staging');
+  assert.throws(verify, /INSTALLER_DESKTOP_APP_CHANGED: preload/);
+  fs.copyFileSync(path.join(desktop, 'preload.cjs'), path.join(app, 'preload.cjs'));
+
+  fs.writeFileSync(path.join(app, 'package.json'), JSON.stringify({ ...manifest, main: 'fixture.cjs' }, null, 2));
+  assert.throws(verify, /INSTALLER_DESKTOP_PACKAGE_CHANGED/);
+});
+
 const prefix = 'https://github.com/sourcepro5/WeChatAgent/releases/download/';
 const release = (version, extra = []) => ({
   tag_name: 'v' + version,

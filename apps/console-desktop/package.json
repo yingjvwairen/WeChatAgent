@@ -1,10 +1,15 @@
 {
   "name": "wechatagent-desktop",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "private": true,
   "description": "WeChatAgent Windows desktop console",
-  "productName": "WeChatAgent",
+  "productName": "WeChatAgent Desktop",
+  "appId": "local.wechatagent.desktop-sender",
+  "executableName": "WeChatAgentDesktop",
   "main": "main.cjs",
   "license": "SEE LICENSES.md",
-  "releaseVersion": "0.4.5"
+  "releaseVersion": "0.4.6",
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
 }

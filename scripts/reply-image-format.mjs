@@ -1,3 +1,5 @@
+import { imageContentMatched } from '../packages/delivery-contract.mjs';
+
 export const REPLY_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const REPLY_IMAGE_MAX_EDGE = 4096;
 export const REPLY_IMAGE_MAX_PIXELS = 4000000;
@@ -215,14 +217,6 @@ export function inspectReplyImage(bytes) {
   }
   throw fault('FORMAT_UNSUPPORTED');
 }
-// A DIB paste can be re-encoded. A verified native submission and a single
-// newly claimed outgoing image row prove delivery without claiming identical pixels.
-export function staticImageReceiptMatches(receipt) {
-  return (
-    receipt?.localType === 3 &&
-    (receipt.sourceMd5Matched === true ||
-      (receipt.sourceMd5Matched === false &&
-        receipt.nativeSubmitVerified === true &&
-        receipt.nativeImageRowConfirmed === true))
-  );
+export function validStaticImageReceipt(receipt) {
+  return receipt?.localType === 3 && imageContentMatched(receipt);
 }

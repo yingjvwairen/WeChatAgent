@@ -1,5 +1,8 @@
 import fs from 'node:fs';
 import { conversationWorkMode } from '../../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
+import { replyDeliveryStatus, replySentAt } from '../../../../packages/delivery-contract.mjs';
+import { boundedTask } from '../../../../packages/dsh-social-bridge-plugin/deadline.mjs';
+import { conversationGrant } from '../../../../packages/wechat-identity.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { buildConversationKey, parseConversationKey } from './conversation-key.js';
@@ -20,6 +23,7 @@ import {
 } from './proactive-policy.js';
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+const draftLifetimeMs = 10 * 60000;
 const quote = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const localTime = now => new Date(now + 8 * 3600000).toISOString().slice(0, 16).replace('T', ' ');
 function historyTime(at, now) {
@@ -120,6 +124,8 @@ export class ProactiveEngine {
       log,
     });
     this.busy = false;
+    this.receiptChecks = new Set();
+    this.receiptWork = Promise.resolve();
     this.state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { version: 1, chats: {} };
     if (
       this.state.version !== 1 ||
@@ -151,8 +157,10 @@ export class ProactiveEngine {
         !/^[a-f0-9]{64}$/.test(job.id ?? '') ||
         !Number.isFinite(job.createdAt) ||
         !Number.isFinite(job.expiresAt) ||
-        job.expiresAt - job.createdAt > 600000 ||
+        job.expiresAt - job.createdAt > draftLifetimeMs ||
         !/^[a-f0-9]{64}$/.test(job.snapshot ?? '') ||
+        (job.observeOnly !== undefined && (job.observeOnly !== true || !job.dispatching)) ||
+        (job.retiredAt !== undefined && (!Number.isSafeInteger(job.retiredAt) || job.retiredAt < 1)) ||
         (!job.evaluating &&
           (typeof job.text !== 'string' ||
             job.text.length > 1200 ||
@@ -174,12 +182,50 @@ export class ProactiveEngine {
     return (
       policy.enabled &&
       withinProactiveWindow(now, policy) &&
-      !this.buffer.unread(key, 1).length &&
+      this.social.deliveryControls?.scope(key) !== null &&
+      !this.social.unreadFor(key, 1).length &&
       !this.buffer.pendingReplies.has(key) &&
+      ![...this.buffer.mediaReplies.values()].some(item => item.key === key && item.observeOnly !== true) &&
       now - last >= policy.idleMinutes * 60000 &&
       !declinedProactive(rows) &&
       rows.at(-1)?.delivery_status !== 'unconfirmed'
     );
+  }
+  #sameContext(key, item, policy, now) {
+    return (
+      proactivePolicyKey(policy) === item.signature &&
+      this.eligible(key, policy, now) &&
+      conversationSnapshot(this.buffer.recent(key, this.buffer.maxPerChat)) === item.job.snapshot
+    );
+  }
+  #retire(key, item) {
+    const { job } = item;
+    if (job.observeOnly) return;
+    this.social.deliveryControls?.withdrawInputs(key, job.message.readerGrant ?? 'legacy', [job.id]);
+    job.observeOnly = true;
+    job.retiredAt = this.now();
+    try {
+      this.save();
+    } catch (error) {
+      delete job.observeOnly;
+      delete job.retiredAt;
+      throw error;
+    }
+  }
+  #checkReceipt(key, item) {
+    const job = item.job;
+    if (!job || this.receiptChecks.has(job.id)) return;
+    this.receiptChecks.add(job.id);
+    // Keep recovered work within one receipt slot without holding the scheduler.
+    const check = this.receiptWork.then(async () => {
+      try {
+        if (item.job === job) await this.deliver(key, item, true);
+      } finally {
+        this.receiptChecks.delete(job.id);
+      }
+    });
+    this.receiptWork = check.catch(() => {});
+    return check;
   }
   notice(key, id) {
     this.buffer.setContextNotice(key, {
@@ -208,21 +254,43 @@ export class ProactiveEngine {
   async tick() {
     if (this.busy || !this.isReady()) return;
     this.busy = true;
+    const receipts = [];
     try {
       const settings = await this.settingsFor(),
         wechat = settings.wechat ?? settings;
-      const keys = ['private', 'group'].flatMap(kind =>
-        (wechat.whitelist?.[kind === 'private' ? 'private' : 'groups'] ?? []).map(id =>
-          buildConversationKey('wechat', kind, String(id)),
+      const keys = new Set(
+        ['private', 'group'].flatMap(kind =>
+          (wechat.whitelist?.[kind === 'private' ? 'private' : 'groups'] ?? []).map(id =>
+            buildConversationKey('wechat', kind, String(id)),
+          ),
         ),
       );
+      for (const [key, item] of Object.entries(this.state.chats)) if (item.job?.dispatching) keys.add(key);
       for (const key of keys) {
-        if (conversationWorkMode(wechat, key) === 'assistant') continue;
         const policy = proactivePolicy(wechat, key);
         let item = this.state.chats[key];
         const now = this.now(),
           signature = proactivePolicyKey(policy);
         if (this.finishRecorded(key, item)) continue;
+        const rosterGrant = conversationGrant(wechat, key);
+        const maySchedule = rosterGrant !== null && conversationWorkMode(wechat, key) !== 'assistant';
+        const job = item?.job;
+        const expired = job && now >= job.expiresAt;
+        if (
+          job?.dispatching &&
+          (job.observeOnly ||
+            !maySchedule ||
+            !policy.enabled ||
+            expired ||
+            job.message.readerGrant !== rosterGrant ||
+            this.social.deliveryControls?.inputWithdrawn(key, job.message.readerGrant ?? 'legacy', job.id))
+        ) {
+          this.#retire(key, item);
+          receipts.push([key, item]);
+          continue;
+        }
+        if (job && this.receiptChecks.has(job.id)) continue;
+        if (!maySchedule) continue;
         if (!policy.enabled) {
           if (item && item.signature !== signature) {
             if (item.job && !item.job.dispatching) {
@@ -258,7 +326,7 @@ export class ProactiveEngine {
           this.save();
           continue;
         }
-        if (item.job && this.now() > item.job.expiresAt) {
+        if (expired) {
           this.notice(key, item.job.id);
           item.job = null;
           item.nextAt = nextProactiveAt(now, policy, this.random);
@@ -266,15 +334,29 @@ export class ProactiveEngine {
           continue;
         }
         if (!item.job && (now < item.nextAt || !this.eligible(key, policy, now))) continue;
-        await this.social.withConversationLock(key, async () => this.run(key, policy, item));
+        const ran = await this.social.withConversationLock(key, () => this.run(key, policy, item, rosterGrant));
+        if (item.job?.dispatching && (!ran || item.job.observeOnly)) {
+          if (!ran && !this.#sameContext(key, item, policy, this.now())) this.#retire(key, item);
+          receipts.push([key, item]);
+        }
       }
     } catch (error) {
       this.log('[Proactive] unavailable ' + String(error.message));
     } finally {
       this.busy = false;
     }
+    const observed = await Promise.allSettled(receipts.map(([key, item]) => this.#checkReceipt(key, item)));
+    for (const result of observed)
+      if (result.status === 'rejected')
+        this.log('[Proactive] receipt recovery unavailable ' + String(result.reason?.code ?? 'unknown'));
   }
-  async run(key, policy, item) {
+  async run(key, policy, item, rosterGrant) {
+    const connection = this.social.connection;
+    const signal = connection?.signal;
+    const decide = (chat, prompt, metadata) =>
+      signal
+        ? boundedTask(current => this.decide(chat, prompt, metadata, { signal: current }), { signal })
+        : this.decide(chat, prompt, metadata);
     const target = parseConversationKey(key),
       rows = this.buffer.recent(key, this.buffer.maxPerChat),
       persona = await this.personaFor(key);
@@ -283,6 +365,7 @@ export class ProactiveEngine {
       kind: target.kind,
       conversation_id: target.conversationId,
       conversation_name: rows.at(-1)?.conversation_name ?? target.conversationId,
+      readerGrant: rosterGrant,
       self_id: String(this.selfIdFor() || rows.at(-1)?.self_id || ''),
       sender_id: 'local-scheduler',
       sender_name: '本机主动发言',
@@ -291,17 +374,18 @@ export class ProactiveEngine {
     let job = item.job;
     if (!job) {
       const mode = policy.mode === 'mixed' ? ['greeting', 'news', 'meme'][item.cycles % 3] : policy.mode;
+      const createdAt = this.now();
       job = item.job = {
         id: hash(key + '\0' + item.nextAt + '\0' + item.cycles),
         mode,
-        createdAt: this.now(),
-        expiresAt: this.now() + 600000,
+        createdAt,
+        expiresAt: createdAt + draftLifetimeMs,
         snapshot: conversationSnapshot(rows),
         personaDigest: hash(JSON.stringify([persona.personaName, persona.persona])),
         evaluating: true,
       };
       item.cycles++;
-      item.nextAt = nextProactiveAt(this.now(), policy, this.random);
+      item.nextAt = nextProactiveAt(createdAt, policy, this.random);
       this.save();
       let search = null;
       if (mode !== 'greeting' && policy.useSearch) {
@@ -319,6 +403,7 @@ export class ProactiveEngine {
         conversationName: message.conversation_name,
         images: [],
         batchId: job.id,
+        ...connection?.metadata(),
         searchOptOut: mode === 'greeting' || !policy.useSearch || search?.status === 'unavailable',
       };
       if (search?.status === 'ready') {
@@ -351,14 +436,15 @@ export class ProactiveEngine {
       let result;
       try {
         ({ result } = await resolveSocialDecision({
-          rawOutput: await this.decide(key, prompt, metadata),
+          rawOutput: await decide(key, prompt, metadata),
           key,
           metadata,
-          decide: (...args) => this.decide(...args),
+          decide,
           log: this.log,
         }));
+        signal?.throwIfAborted();
       } catch (error) {
-        this.notice(key, job.id);
+        if (!signal?.aborted) this.notice(key, job.id);
         item.job = null;
         this.save();
         this.log(`[Proactive] ${key} decision_failed`);
@@ -390,32 +476,58 @@ export class ProactiveEngine {
       return;
     }
     const fresh = await this.settingsFor(),
-      current = proactivePolicy(fresh.wechat ?? fresh, key),
+      wechat = fresh.wechat ?? fresh,
+      current = proactivePolicy(wechat, key),
       livePersona = await this.personaFor(key);
     if (
-      !this.eligible(key, current, this.now()) ||
-      proactivePolicyKey(current) !== item.signature ||
-      hash(JSON.stringify([livePersona.personaName, livePersona.persona])) !== job.personaDigest ||
-      conversationSnapshot(this.buffer.recent(key, this.buffer.maxPerChat)) !== job.snapshot
+      signal?.aborted ||
+      conversationGrant(wechat, key) !== job.message.readerGrant ||
+      conversationWorkMode(wechat, key) === 'assistant' ||
+      this.now() >= job.expiresAt ||
+      !this.#sameContext(key, item, current, this.now()) ||
+      hash(JSON.stringify([livePersona.personaName, livePersona.persona])) !== job.personaDigest
     ) {
+      if (job.dispatching) {
+        this.#retire(key, item);
+        return;
+      }
       this.notice(key, job.id);
       item.job = null;
       this.save();
       this.log(`[Proactive] ${key} cancelled_context_changed`);
       return;
     }
-    job.dispatching = true;
-    this.save();
+    if (!job.dispatching) {
+      job.dispatching = true;
+      this.save();
+    }
+    return this.deliver(key, item);
+  }
+
+  async deliver(key, item, observeOnly = false) {
+    const { job } = item;
     let delivery;
     try {
-      delivery = await this.send(job.message, job.text, {
-        deliveryId: job.id,
-        source: 'proactive',
-        contextId: job.snapshot,
-        expiresAt: job.expiresAt,
-      });
+      const send = () =>
+        this.send(job.message, job.text, {
+          deliveryId: job.id,
+          source: 'proactive',
+          contextId: job.snapshot,
+          expiresAt: job.expiresAt,
+          receiptOnly: observeOnly || job.awaitingReceipt === true,
+          observeOnly,
+        });
+      delivery = observeOnly
+        ? await boundedTask(send, {
+            timeoutMs: this.social.deliveryRetry?.mediaCallTimeoutMs ?? 10000,
+            code: 'PROACTIVE_RECEIPT_TIMEOUT',
+          })
+        : await send();
     } catch (error) {
-      if (['PROACTIVE_NOT_ALLOWED', 'PROACTIVE_CONTEXT_CHANGED', 'CONVERSATION_NOT_ALLOWED'].includes(error.code)) {
+      if (
+        ['PROACTIVE_NOT_ALLOWED', 'PROACTIVE_CONTEXT_CHANGED', 'CONVERSATION_NOT_ALLOWED'].includes(error.code) ||
+        (error.code === 'NATIVE_SEND_REJECTED' && error.data?.attempted === false)
+      ) {
         this.notice(key, job.id);
         item.job = null;
       }
@@ -423,12 +535,20 @@ export class ProactiveEngine {
       this.log(`[Proactive] ${key} send_pending code=${error.code ?? 'unknown'}`);
       return;
     }
-    if (delivery?.pending === true) return;
-    const at = this.now(),
-      status = delivery?.delivered === 'unconfirmed' ? 'unconfirmed' : 'confirmed';
-    this.buffer.completeReply(
+    const outcome = replyDeliveryStatus(delivery);
+    if (outcome === 'pending') {
+      if (!job.awaitingReceipt) {
+        job.awaitingReceipt = true;
+        this.save();
+      }
+      return;
+    }
+    const status = outcome === 'confirmed' ? 'confirmed' : 'unconfirmed';
+    const fallback = job.retiredAt ?? this.now();
+    const at = status === 'confirmed' ? replySentAt(delivery, fallback) : fallback;
+    this.buffer.recordReplyPart(
       key,
-      { deliveryId: job.id, throughId: 'proactive-' + job.id, noticeId: job.noticeId },
+      { deliveryId: job.id, noticeId: job.noticeId },
       {
         ...job.message,
         sender_id: job.message.self_id,
@@ -436,6 +556,10 @@ export class ProactiveEngine {
         timestamp: at / 1000,
         delivery_status: status,
         proactive: true,
+      },
+      {
+        inSendOrder: job.observeOnly === true || (status === 'confirmed' && delivery.sentAt === at),
+        receiptOrder: delivery?.readerOrder,
       },
     );
     this.social.noteOutgoing(key, at);

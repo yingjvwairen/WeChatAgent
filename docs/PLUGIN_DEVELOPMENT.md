@@ -130,7 +130,7 @@ export function setup(api) {
 | API | 权限 / 返回 |
 | --- | --- |
 | ctx.apiVersion | 2 |
-| ctx.chat | 当前聊天 `{key, platform:'wechat', kind:'private'\|'group', id, name}`。没有跨聊天目标参数。 |
+| ctx.chat | 当前聊天 `{key, platform:'wechat', kind:'private'\|'group', id, name}`。id 为当前账号中的微信原始标识，例如 wxid_example 或 123@chatroom。 |
 | ctx.actor | `{id}`，当前批次可识别的真实微信发送者；无法确认时为空字符串。它不是管理员授权凭据。 |
 | ctx.sessionId | 当前 DSH 会话 id，仅用于关联。 |
 | ctx.account / ctx.now | `{id}` 为不含原 wxid 的账号作用域；now 为本次调用开始的毫秒时间。 |
@@ -143,7 +143,7 @@ export function setup(api) {
 | await ctx.history.recent({limit:20}) | `history_read`，当前聊天最近 1–100 条已收录文字记录。 |
 | await ctx.fetch(url,{maxChars:12000,timeoutMs:6000}) | `web_fetch`，公开 HTTP(S) GET，返回标准 Response。 |
 | await ctx.reply(text) | `reply`，申请本轮回复，返回 `{queued:true}`，不是即时送达回执。 |
-| await ctx.audio.read(id,{format:'wav'}) | `audio_read` + `voice-input-v1`；仅限宿主为本次语音动作绑定的 id，返回有界音频 `{id,b64,mime,filename,sampleRate,durationSeconds}`。format 可为 wav 或 silk；钩子不可调用。 |
+| await ctx.audio.read(id,{format:'wav',segment:0}) | `audio_read` + `voice-input-v1`；仅限本次动作绑定的 id。返回 `{id,b64,mime,filename,sampleRate,durationSeconds}`，每次最多 60 秒。视频音轨可附 `segmentIndex/segmentCount/totalDurationSeconds`，以同一 id 按 0～4 顺序读取最多 300 秒音轨；每段重新检查权限。format 可为 wav 或 silk，宿主按需将 WAV 段编码为 SILK。普通语音只允许 segment 0。钩子不可调用。 |
 
 存储键只允许 1–64 个英文字母、数字、`_`、`-`；值必须可 JSON 序列化。同一账号下每插件总存储上限 256 KiB。账号、插件、聊天、发送者不能通过参数改成其他目标。
 
@@ -197,7 +197,7 @@ export function setup(api) {
 }
 ```
 
-每插件最多 16 个动作，id、description、parameters 与工具同样校验，最多执行 35 秒。动作不会自动注册成模型工具，也不构成微信万能命令。通过专用宿主接入或带控制台令牌的 `POST /api/plugins/:id/actions/:action` 调用，正文为 `{key:"wechat:private:123",args:{}}`；仅允许本机已授权聊天。若需要模型调用，请另行注册工具。
+每插件最多 16 个动作，id、description、parameters 与工具同样校验，最多执行 35 秒。动作不会自动注册成模型工具，也不构成微信万能命令。通过专用宿主接入或带控制台令牌的 `POST /api/plugins/:id/actions/:action` 调用，正文为 `{key:"wechat:private:wxid_example",args:{}}`；仅允许本机已授权聊天。若需要模型调用，请另行注册工具。
 
 动作和每日计划不支持 ctx.reply；返回值由调用它的界面或专用聊天接入决定如何使用，不能借定时计划绕过既有发送流程。
 
@@ -235,9 +235,9 @@ export function setup(api) {
 
 同一聊天只能有一个插件处理同一能力。语音有两个候选时返回 `VOICE_PLUGIN_CONFLICT`，并在这些插件卡片上提示；日记询问有两个候选时不交给插件，按普通聊天回复，并在 DSH 日志中记录。没有候选时语音返回 `VOICE_PLUGIN_DISABLED`，日记询问按普通聊天回复。最近一次真实语音结果按处理它的插件保存在 `state/plugin-service-checks/voice-input/<插件id>.json`。
 
-`voice-output-v1` 由语音适配器调用。每次 `ctx.audio.write` 最多 256 KiB，整段最多 2 MiB，依次提交同一 WAV 的字节，格式为 16 kHz 单声道 16 位 PCM。适配器在合成完成后重新核对聊天、账号和插件授权，再进入发送流程。设置页可以独立调用声明的合成测试动作。[文字转语音发送接口](VOICE_OUTPUT.md#通过插件合成并发送)
+`voice-output-v1` 由语音适配器调用。每次 `ctx.audio.write` 最多 256 KiB，整段最多 32 MiB，依次提交同一 WAV 的字节，格式为 16 kHz 单声道 16 位 PCM。适配器在合成完成后重新核对聊天、账号和插件授权，再进入发送流程。设置页可以独立调用声明的合成测试动作。[微信语音气泡](VOICE_OUTPUT.md#微信语音气泡)
 
-`voice-dialogue-v1` 也由语音适配器调用。启用该能力的插件以 `voiceMode: "realtime"` 参与语音对语音路由，以 `voiceMode: "separate"` 和已配置的 `recognitionModel` 参与原有转写路由。出站音频沿用 `voice-output-v1` 的 WAV 格式和限制。[Realtime 语音对语音](VOICE_OUTPUT.md#realtime-语音对语音)
+`voice-dialogue-v1` 也由语音适配器调用。启用该能力的插件以 `voiceMode: "realtime"` 参与语音对语音路由，以 `voiceMode: "separate"` 和已配置的 `recognitionModel` 参与原有转写路由。出站音频沿用 `voice-output-v1` 的 WAV 格式和限制。[语音对话的回复方式](VOICE_OUTPUT.md#逐轮选择文字或语音)
 
 ## 打包、更新和卸载
 
@@ -266,7 +266,7 @@ Compress-Archive -Path '.\chat-notes\*' -DestinationPath '.\chat-notes-1.0.0.zip
 | 内容 | 相对路径 |
 | --- | --- |
 | 已安装代码 | plugins/插件id/ |
-| 本机设置与授权 | config/plugins.json |
+| 本机设置与授权 | config/plugins.json，插件参数保存在本机，聊天授权按微信账号保存 |
 | 隔离后的持久数据 | state/plugins/账号作用域哈希/插件id/data.json |
 | 旧版和卸载源码 | state/plugin-archives/ |
 | 安装预览临时文件 | state/plugin-install-staging/ |
@@ -401,3 +401,7 @@ chat-notes/
 不使用 SDK 时，可直接与 `parent` 收发消息：页面请求 `{wa:1,type:'request',id,method,params}`，宿主回复 `{wa:1,type:'response',id,ok,result|error}`；宿主请求（如 `collect`）格式相同，由页面回复；宿主事件为 `{wa:1,type:'event',event,payload}`。方法名为 `host.info`、`settings.get`、`settings.save`（params `{values}`）、`actions.call`（params `{action,args,key}`）、`ui.resize`、`ui.toast`、`ui.close`。
 
 页面仍是本机可信代码的一部分：沙箱阻止它读取控制台和其他插件，但动作在 Node 子进程中运行，权限规则与前文一致。完整示例见 [examples/plugins/chat-notes](../examples/plugins/chat-notes/) 的 `ui/` 目录。
+
+## 分段音轨
+
+需要分段识别的插件应声明 `audio-segments-v1` 并申请 `audio_read`，使用 `for await (const audio of ctx.audio.segments(id, {format:'wav'}))`。每段都通过原有消息和聊天授权检查。设置 `maxDurationSeconds` 可缩小允许时长，`single:true` 用于只接受单段的实时对话。只有所有分段成功后才向聊天返回完整转写。

@@ -4,6 +4,39 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
+import { qualityBase, sourceQualityFiles } from './source-quality-files.mjs';
+
+test('quality scope needs a real baseline and checks the whole change after a shallow fetch', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-quality-scope-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 }));
+  const git = (...args) => execFileSync('git', args, { cwd: root, windowsHide: true });
+  git('init', '-q');
+  const commit = message => {
+    git('add', '.');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', message);
+  };
+  fs.writeFileSync(path.join(root, 'bridge.mjs'), 'export {}\n');
+  commit('release');
+  if (process.env.WECHATAGENT_QUALITY_BASE) t.skip('A caller-supplied base overrides the default');
+  else {
+    assert.throws(() => qualityBase(root), /QUALITY_BASE_UNAVAILABLE/);
+    git('tag', 'v0.4.5');
+    const release = git('rev-parse', 'HEAD').toString().trim();
+    fs.writeFileSync(path.join(root, 'bridge.mjs'), 'export const example = 1;\n');
+    commit('change');
+    fs.writeFileSync(path.join(root, 'reader.py'), 'ready = True\n');
+    commit('reader');
+    assert.equal(qualityBase(root), 'v0.4.5');
+    assert.deepEqual(sourceQualityFiles(root), ['bridge.mjs', 'reader.py']);
+    assert.deepEqual(sourceQualityFiles(root, 'HEAD'), []);
+    const shallow = path.join(root, 'shallow');
+    git('clone', '-q', '--no-tags', '--depth=1', pathToFileURL(root).href, shallow);
+    assert.throws(() => sourceQualityFiles(shallow), /QUALITY_BASE_UNAVAILABLE/);
+    git('-C', shallow, 'fetch', '-q', '--depth=1', 'origin', release);
+    assert.deepEqual(sourceQualityFiles(shallow, release), ['bridge.mjs', 'reader.py']);
+  }
+});
 
 test('source build and secondary export use the same commit despite staged, edited and untracked files', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-release-test-'));

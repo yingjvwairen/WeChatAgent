@@ -1,5 +1,7 @@
 import path from 'node:path';
-import { staticImageReceiptMatches } from '../reply-image-format.mjs';
+import { receiptReservationRefusal } from '../../packages/delivery-contract.mjs';
+import { savedDesktopSubmission } from '../desktop-receipts.mjs';
+import { validStaticImageReceipt } from '../reply-image-format.mjs';
 import { UiTextOutbox } from './ui-text-outbox.mjs';
 import { UiImageOutbox } from './ui-image-outbox.mjs';
 import { MAX_TEXT_CHARS } from './text-contract.mjs';
@@ -18,22 +20,36 @@ export function createDeliveryQueues(engine, context) {
   const releaseFocus = () =>
     (focusRelease ??= Promise.resolve()
       .then(() => driver.releaseTextFocus?.())
+      .then(
+        result => {
+          context.focusReturnFailed = false;
+          return result;
+        },
+        error => {
+          context.focusReturnFailed = true;
+          throw error;
+        },
+      )
       .finally(() => {
         focusRelease = undefined;
       }));
   const receiptFor = (job, options = {}) => engine.receipt(engine.callbackJob(context, job), options);
+  const recordedSubmission = job => {
+    const source = engine.callbackJob(context, job);
+    return engine.authorizeCurrent(source, false) === true ? savedDesktopSubmission(engine.root, source) : null;
+  };
   const authorizedInput = async (job, row, options) => {
     const grant = await engine.authorize(row.job, options);
     if (grant?.reason && row.job.proactive) {
       row.inputRefusal = grant.reason;
       context.store.save(row);
     }
-    return grant?.allowed === true && grant.grantId === row.grant.grantId && permitted(job) ? grant : null;
+    return { ...grant, allowed: grant?.allowed === true && grant.grantId === row.grant.grantId && permitted(job) };
   };
   const prepare = async (job, options = {}) => {
     const row = meta(job.id);
     const grant = await authorizedInput(job, row, { preparing: true, signal: options.signal });
-    if (!grant) return { ready: false, reason: 'DESKTOP_PERMISSION_CHANGED' };
+    if (!grant.allowed) return { ready: false, reason: grant.reason ?? 'DESKTOP_PERMISSION_CHANGED' };
     return driver.prepare(grant.quote ? { ...job, quote: grant.quote } : job, {
       ...options,
       interactionPlan: { executionMode: 'focus-handoff', sendMode: 'focus-handoff' },
@@ -45,17 +61,18 @@ export function createDeliveryQueues(engine, context) {
     (method, submit = false) =>
     async (job, guard) => {
       const row = meta(job.id);
-      if (!permitted(job) || (row.job.proactive && !(await authorizedInput(job, row))))
+      if (!permitted(job) || (row.job.proactive && !(await authorizedInput(job, row)).allowed))
         return { performed: false, attempted: false, reason: 'DESKTOP_PERMISSION_CHANGED' };
-      const local = {
-        ...(submit ? { canSubmit: () => permitted(job) } : { canInput: () => permitted(job) }),
-      };
+      // The queue saves the submit outcome before returning shared focus.
+      const local = submit
+        ? { canSubmit: () => permitted(job), deferFocusRelease: true }
+        : { canInput: () => permitted(job) };
       return driver[method](job, guard, local);
     };
   const receiptAdapter = {
+    recordedSubmission,
     prepare: (job, options) => receiptFor(job, { ...options, phase: 'prepare' }),
     submitted: (job, at, options = {}) => receiptFor(job, { ...options, phase: 'submitted', submittedAt: at }),
-    imageInputApplied: (job, baselineId) => receiptFor(job, { phase: 'image-input-applied', baselineId }),
     notAttempted: (job, baselineId) =>
       receiptFor(job, {
         phase: 'not-attempted',
@@ -72,7 +89,7 @@ export function createDeliveryQueues(engine, context) {
       if (
         job.mediaKind === 'image' &&
         job.imageFormat !== 'gif' &&
-        (!staticImageReceiptMatches(r) || !/^[a-f0-9]{32}$/.test(source.md5) || r.sourceImageMd5 !== source.md5)
+        (!validStaticImageReceipt(r) || r.sourceImageSha256 !== source.sha256)
       )
         return { confirmed: false, reason: 'DESKTOP_IMAGE_CONTENT_UNVERIFIED' };
       return {
@@ -85,6 +102,7 @@ export function createDeliveryQueues(engine, context) {
           target: job.target,
           sourceImageSha256: job.sourceImageSha256,
         },
+        ...(result.reason ? { reason: result.reason } : {}),
       };
     },
   };
@@ -111,14 +129,19 @@ export function createDeliveryQueues(engine, context) {
       submit: async (job, guard) => {
         if (!permitted(job)) return { performed: false, attempted: false, reason: 'DESKTOP_PERMISSION_CHANGED' };
         const prepared = await receiptFor(job, { phase: 'prepare' });
+        if (prepared?.prepared === false && prepared.performed === false && prepared.attempted === false)
+          return prepared;
         if (prepared?.prepared !== true || prepared.submissionAllowed !== true)
           throw fault('DESKTOP_RECEIPT_PREPARATION_REQUIRED');
         if (!permitted(job)) return { performed: false, attempted: false, reason: 'DESKTOP_PERMISSION_CHANGED' };
-        await receiptFor(job, {
-          phase: 'submitted',
-          submittedAt: engine.now(),
-          baselineId: prepared.baselineId,
-        });
+        const refusal = receiptReservationRefusal(
+          await receiptFor(job, {
+            phase: 'submitted',
+            submittedAt: engine.now(),
+            baselineId: prepared.baselineId,
+          }),
+        );
+        if (refusal) return refusal;
         const result = await boundary('submit', true)(job, guard);
         if (result?.performed === false && result.attempted === false)
           await receiptFor(job, {
@@ -129,6 +152,7 @@ export function createDeliveryQueues(engine, context) {
         return result;
       },
       receipt: (job, options) => receiptFor(job, { ...options, phase: 'query' }),
+      recordedSubmission,
       releaseTextFocus: releaseFocus,
     },
   });

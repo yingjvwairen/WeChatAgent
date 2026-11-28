@@ -191,7 +191,7 @@ export function setup(api) {
     async execute(ctx, { id }) {
       try {
         const text = await transcribeSegments(ctx, id, wav =>
-          transcribeVoice(ctx.settings, wav, { signal: ctx.signal }),
+          transcribeVoice(ctx.settings, wav, { signal: ctx.signal, allowEmpty: true }),
         );
         return { ok: true, text };
       } catch (error) {

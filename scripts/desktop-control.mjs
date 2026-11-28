@@ -1,4 +1,5 @@
-import { parseChatKey, conversationGrant } from '../packages/wechat-identity.mjs';
+import { parseChatKey, deliveryScopeAllowed } from '../packages/wechat-identity.mjs';
+import { voiceFallbackId } from '../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -78,14 +79,9 @@ export async function executeDesktopControl(adapter, body) {
   if (action === 'apply-configuration') return engine.applyConfiguration();
   if (action === 'configuration-status') return engine.configurationStatus();
   const chat = parseChatKey(body.key);
-  if (
-    !chat ||
-    body.account !== adapter.accountRef ||
-    !adapter.allowed(chat.kind, chat.id) ||
-    body.grant !== conversationGrant(adapter.project.wechat, body.key)
-  )
+  const scope = { accountRef: body.account, kind: chat?.kind, target: chat?.id, rosterGrant: body.grant };
+  if (!chat || !deliveryScopeAllowed(adapter.project.wechat, adapter.accountRef, scope))
     throw fault('DESKTOP_CONTROL_SCOPE_CHANGED', 403);
-  const scope = { accountRef: adapter.accountRef, kind: chat.kind, target: chat.id, rosterGrant: body.grant };
   if (action === 'list') {
     return {
       jobs: engine.listDeliveries(scope).map(job => ({ ...job, channel: 'native' })),
@@ -155,13 +151,45 @@ export function createDesktopControlHandler({ token, projectRoot, execute }) {
 }
 
 export function mergedDeliveries(files, replies, native) {
-  const replacements = new Map((native.jobs ?? []).filter(job => job.parentId).map(job => [job.parentId, job]));
+  const nativeJobs = native.jobs ?? [];
+  const replacements = new Map(nativeJobs.filter(job => job.parentId).map(job => [job.parentId, job]));
+  const textParents = new Set(nativeJobs.filter(job => job.operation === 'text').map(job => job.parentId));
   return {
     ...files,
     ...replies,
-    jobs: files.jobs.map(job => (replacements.has(job.id) ? { ...job, ...replacements.get(job.id) } : job)),
-    replies: replies.replies.filter(job => !replacements.has(job.id)),
-    native: (native.jobs ?? []).filter(job => !job.parentId || !files.jobs.some(file => file.id === job.parentId)),
+    jobs: files.jobs.map(job => {
+      const delivery = replacements.get(job.id);
+      if (delivery?.operation !== 'file') return job;
+      const view = { ...job, ...delivery, receipt: delivery.receipt, recovery: delivery.recovery };
+      const saved = job.receipt;
+      if (job.state !== 'confirmed' || saved?.serverConfirmed !== true) return view;
+      const receipt = delivery.receipt;
+      const matchesSavedReceipt =
+        delivery.state === 'confirmed' &&
+        delivery.confirmed === true &&
+        receipt?.source === 'wechat-server-id' &&
+        receipt.serverId === saved.serverId &&
+        typeof receipt.fileContentMd5Matched === 'boolean' &&
+        (saved.fileContentMd5Matched !== true || receipt.fileContentMd5Matched);
+      if (matchesSavedReceipt) return view;
+      return {
+        ...view,
+        state: 'confirmed',
+        confirmed: true,
+        pending: false,
+        submitted: true,
+        submission: 'confirmed',
+        receipt: saved,
+        reason: null,
+        canPause: false,
+        canResume: false,
+        canCancel: false,
+      };
+    }),
+    replies: replies.replies.filter(
+      job => !replacements.has(job.id) && (job.kind !== 'voice' || !textParents.has(voiceFallbackId(job.id))),
+    ),
+    native: nativeJobs.filter(job => job.operation !== 'file' || !files.jobs.some(file => file.id === job.parentId)),
     desktopAvailable: native.available === true,
   };
 }

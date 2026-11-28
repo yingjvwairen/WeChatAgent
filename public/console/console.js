@@ -174,7 +174,7 @@ const actions = {
   'dsh-open': ['打开 DSH', '打开模型程序，在 DSH 中登录并启用本项目插件。'],
   'reader-check': ['检查读取配置', '只读检查当前数据库与凭据是否有效。'],
   'reader-connect': ['连接并验证微信', '正在获取并验证所选账号的读取凭据。请在微信中完成登录。'],
-  'desktop-check': ['检查发送连接', '校验发送组件、微信版本和账号。'],
+  'desktop-check': ['检查当前发送方式', '只读校验发送组件、微信账号和当前窗口布局。'],
   'desktop-setup': ['检查模拟输入依赖', '检查安装包内置运行环境。源码运行时会准备本地独立环境。'],
   'sessions-configure': ['同步会话名称', '按聊天名称和当前人格更新 DSH 会话名称。'],
   'sessions-compact': ['压缩上下文', '在同一 DSH 会话内生成摘要，这会调用模型。'],
@@ -423,6 +423,87 @@ function confirmAction(title, description, label, callback) {
     },
     { once: true },
   );
+}
+
+function openReceivedFileConfirmation(key) {
+  modal(
+    '确认收到的附件',
+    `<form id="confirm-received-file">
+      <p class="modal-description">填写助手给出的附件 ID。在电脑微信的原消息中打开文件所在位置，再选择对应的缓存文件。</p>
+      <div class="field"><label for="received-file-id">附件 ID</label><input id="received-file-id" required maxlength="64" pattern="[a-f0-9]{64}" spellcheck="false"></div>
+      <div class="field"><label for="received-file-path">微信缓存文件</label><div class="button-row"><input id="received-file-path" required maxlength="4096"><button class="button" id="received-file-browse" type="button">选择文件</button></div></div>
+      <p class="inline-error" role="alert" id="received-file-error"></p>
+      <div class="modal-actions"><button class="button" type="button" data-close>取消</button><button type="submit" class="button primary">确认附件</button></div>
+    </form>`,
+  );
+  const form = $('#confirm-received-file'),
+    id = $('#received-file-id'),
+    file = $('#received-file-path'),
+    browse = $('#received-file-browse'),
+    submit = form.querySelector('[type=submit]'),
+    error = $('#received-file-error');
+  browse.addEventListener('click', async () => {
+    browse.disabled = submit.disabled = true;
+    error.textContent = '';
+    try {
+      const chosen = await api('/api/browse', { kind: 'attachment' });
+      if (chosen.path) file.value = chosen.path;
+    } catch (problem) {
+      error.textContent = problem.message;
+    } finally {
+      browse.disabled = submit.disabled = false;
+    }
+  });
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    browse.disabled = submit.disabled = true;
+    error.textContent = '';
+    try {
+      const result = await api('/api/received-file/confirm', { key, id: id.value, path: file.value.trim() });
+      if (form.isConnected) closeModal();
+      toast(`已确认 ${result.name}。可请助手重试读取。`);
+    } catch (problem) {
+      error.textContent = problem.message;
+    } finally {
+      browse.disabled = submit.disabled = false;
+    }
+  });
+}
+
+function openVoiceCableSettings() {
+  modal(
+    'VB-CABLE 线路',
+    `<p id="voice-cable-status" class="modal-description" role="status">正在检查本机线路…</p>
+    <div class="modal-actions"><button class="button" data-close>取消</button>
+    <button class="button" id="voice-cable-auto">自动选择</button>
+    <button class="button primary" id="voice-cable-pin" disabled>固定当前线路</button></div>`,
+  );
+  const status = $('#voice-cable-status'),
+    pin = $('#voice-cable-pin');
+  const saveChoice = pair => {
+    if (pair) state.draft.input.voiceCable = pair;
+    else delete state.draft.input.voiceCable;
+    closeModal();
+    updateDraftUI();
+    renderPage();
+  };
+  $('#voice-cable-auto').addEventListener('click', () => saveChoice(null));
+  void api('/api/desktop/voice-cable')
+    .then(({ pair, defaultsReady }) => {
+      if (!status.isConnected) return;
+      const binding = state.draft.input.voiceCable;
+      status.textContent = !pair
+        ? '没有找到唯一的 VB-CABLE 播放与录音配对。'
+        : (binding && (binding.renderId !== pair.renderId || binding.captureId !== pair.captureId)
+            ? '已固定的线路已变化，可以重新固定当前配对。'
+            : '已找到 CABLE Input 和 CABLE Output。') + (defaultsReady ? '' : ' 请在 Windows 中核对三个默认录音角色。');
+      pin.disabled = !pair;
+      if (pair) pin.addEventListener('click', () => saveChoice(pair));
+    })
+    .catch(error => {
+      status.textContent = error.message;
+    });
 }
 // 保存后需要重启服务才生效的设置，在标签旁标注（判断规则与服务器共用 layout-model.mjs）
 const restartTag = path =>
@@ -977,7 +1058,7 @@ function connectionsPage() {
         ],
         help: '需与微信“设置 → 快捷键 → 发送消息”一致。',
       },
-    )}${field('单次桌面操作超时 / 秒', 'input.operationTimeoutMs', { type: 'number', transform: 'seconds', min: 5, max: 30 })}${field('你在用电脑时延后发送 / 秒', 'input.idleMs', { type: 'number', transform: 'seconds', min: 0, max: 30, help: '这段时间内有键鼠操作就稍后再发；0 表示不等待。' })}${inputModeControls()}${toggle('暂停模拟输入自动发送', 'input.paused', '保存后立即暂停新的桌面发送操作。')}${toggle('原生语音发送', 'input.voiceSend', '需要 VB-CABLE。支持已授权语音合成的好友和群聊，沿用自适应布局；录制在后台进行，具体焦点占用取决于 OCR 或 UIA 链路。')}</div><p class="subtle">UIA 与 OCR 均使用快速发送流程，结合控件或界面状态与键鼠活动监控推进；最终以数据库回执确认送达。联系人按唯一微信号、备注或昵称定位，群聊按唯一群名定位。发送结果需要核对时，请查看对应聊天的发送队列。支持文字、普通文件以及匹配版本的图片和 GIF。UIA、OCR 与逐字输入的选择保存后用于后续操作。</p><div class="button-row"><button class="button" data-action="desktop-setup">检查模拟输入依赖</button><button class="button" data-action="desktop-check">检查当前发送方式</button></div></section>
+    )}${field('单次桌面操作超时 / 秒', 'input.operationTimeoutMs', { type: 'number', transform: 'seconds', min: 5, max: 30 })}${field('你在用电脑时延后发送 / 秒', 'input.idleMs', { type: 'number', transform: 'seconds', min: 0, max: 30, help: '这段时间内有键鼠操作就稍后再发；0 表示不等待。' })}${inputModeControls()}${toggle('暂停模拟输入自动发送', 'input.paused', '保存后立即暂停新的桌面发送操作。')}${toggle('原生语音发送', 'input.voiceSend', '需要 VB-CABLE。支持已授权语音合成的好友和群聊，沿用自适应布局；录制在后台进行，具体焦点占用取决于 OCR 或 UIA 链路。')}</div><p class="subtle">UIA 与 OCR 均使用快速发送流程，结合控件或界面状态与键鼠活动监控推进；最终以数据库回执确认送达。联系人按唯一微信号、备注或昵称定位，群聊按唯一群名定位。发送结果需要核对时，请查看对应聊天的发送队列。支持文字、普通文件以及匹配版本的图片和 GIF。UIA、OCR 与逐字输入的选择保存后用于后续操作。</p><div class="button-row"><button class="button" data-action="desktop-setup">检查模拟输入依赖</button><button class="button" data-action="desktop-check">检查当前发送方式</button><button class="button" id="configure-voice-cable">VB-CABLE 线路${state.draft.input?.voiceCable ? '（已固定）' : ''}</button></div></section>
     ${inputOperationsUI.placeholder()}
     ${readerConfigurationCard()}
     <section class="card">${header('高级连接选项', '通常无需修改。端口需要互不重复。', '', 'sliders')}<details><summary>展开端口与发送超时设置</summary><div class="form-grid">${field('读取服务端口', 'ports.weflow', { type: 'number', min: 1024, max: 65535 })}${field('消息桥接端口', 'ports.onebot', { type: 'number', min: 1024, max: 65535 })}${field('适配器状态端口', 'ports.adapter', { type: 'number', min: 1024, max: 65535 })}${field('DSH 插件端口', 'ports.dshPlugin', { type: 'number', min: 1024, max: 65535 })}${field('回执等待超时 / 秒', 'input.receiptTimeoutMs', { type: 'number', transform: 'seconds', min: 1, max: 18, step: 0.1 })}</div></details></section></div>`;
@@ -1582,6 +1663,7 @@ document.addEventListener('click', event => {
   if (button.matches('[data-process-recovery]') || button.id === 'job-recovery')
     return openProcessRecovery({ api, modal, refreshStatus, toast });
   if (button.hasAttribute('data-close')) return closeModal();
+  if (button.id === 'configure-voice-cable') return openVoiceCableSettings();
   if (button.dataset.action) return runAction(button.dataset.action, button.dataset.key);
   if (button.dataset.browse) return browse(button);
   if (button.dataset.mode) {
@@ -1610,6 +1692,7 @@ document.addEventListener('click', event => {
     state.deliveryHistory = { key: button.dataset.key, page: Number(button.dataset.deliveryPage) };
     return renderPage();
   }
+  if (button.dataset.fileConfirm) return openReceivedFileConfirmation(button.dataset.fileConfirm);
   if (button.dataset.fileDelivery) {
     const { fileDelivery: operation, channel, grant, job: id, revision, account, key } = button.dataset;
     const control = async () => {

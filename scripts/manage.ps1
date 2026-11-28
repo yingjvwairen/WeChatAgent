@@ -4,11 +4,20 @@ $root = Split-Path -Parent $PSScriptRoot
 $stateDir = Join-Path $root 'state'
 $recordFile = Join-Path $stateDir 'runtime.json'
 $script:record = @{}
-if (Test-Path -LiteralPath $recordFile) {
-    $saved = Get-Content -LiteralPath $recordFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    foreach ($property in $saved.PSObject.Properties) { $script:record[$property.Name] = $property.Value }
+$script:startedServices = @()
+function Save-Record {
+    $temporary = $recordFile + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllText($temporary, ($script:record | ConvertTo-Json -Depth 6))
+        if ([IO.File]::Exists($recordFile)) {
+            [IO.File]::Replace($temporary, $recordFile, [NullString]::Value)
+        } else {
+            [IO.File]::Move($temporary, $recordFile)
+        }
+    } finally {
+        [IO.File]::Delete($temporary)
+    }
 }
-function Save-Record { $script:record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $recordFile -Encoding UTF8 }
 function Test-Port([int]$Port) {
     $client = [System.Net.Sockets.TcpClient]::new()
     try { $task = $client.ConnectAsync('127.0.0.1',$Port); return ($task.Wait(700) -and $client.Connected) }
@@ -38,14 +47,7 @@ function Owned-Process($Item,[switch]$AllowStale) {
     }
     return $process
 }
-if ($Action -eq 'check-desktop-stopped') {
-    foreach ($name in @('adapter','bridge')) {
-        if (Owned-Process $script:record[$name] -AllowStale) { Write-Output 'DESKTOP_RUNNING'; return }
-    }
-    Write-Output 'DESKTOP_STOPPED'
-    return
-}
-function Stop-Services {
+function Stop-Services([string[]]$Names = @('adapter','bridge','reader','weflow')) {
     $stopErrors = [System.Collections.Generic.List[string]]::new()
     $externalWeFlow = $false
     $settingsFile = Join-Path $root 'config\wechatagent.json'
@@ -54,6 +56,7 @@ function Stop-Services {
         $externalWeFlow = $settings.runtime.weflowMode -eq 'existing'
     }
     foreach ($name in @('adapter','bridge','reader','weflow')) {
+        if ($name -notin $Names) { continue }
         if ($name -eq 'weflow' -and $externalWeFlow) { continue }
         if ($script:record.ContainsKey($name)) {
           try {
@@ -61,8 +64,9 @@ function Stop-Services {
             if (Owned-Process $item -AllowStale) {
                 $stoppedGracefully = $false
                 if ($name -eq 'adapter') {
-                    if (-not $settings -or -not $settings.ports.adapter) { throw 'DESKTOP_SHUTDOWN_CONFIG_REQUIRED' }
-                    $endpoint = 'http://127.0.0.1:' + [int]$settings.ports.adapter
+                    $port = 0
+                    if (-not [int]::TryParse([string]$item.port,[ref]$port) -or $port -lt 1024 -or $port -gt 65535) { throw 'DESKTOP_SHUTDOWN_PORT_REQUIRED' }
+                    $endpoint = 'http://127.0.0.1:' + $port
                     $health = Invoke-RestMethod ($endpoint + '/status') -TimeoutSec 3
                     if ($health.pid -ne $item.pid -or $health.project -ne 'WeChatAgent' -or $health.backend -ne 'wechat-ui' -or
                         [IO.Path]::GetFullPath([string]$health.projectRoot).TrimEnd('\','/') -ne [IO.Path]::GetFullPath($root).TrimEnd('\','/')) { throw 'DESKTOP_SHUTDOWN_OWNER_MISMATCH' }
@@ -131,17 +135,22 @@ function Test-ServiceReady([string]$Name,[int]$Port,[int]$ExpectedProcessId) {
         if(-not [int]::TryParse([string]$health.pid,[ref]$healthPid) -or $health.project -ne 'WeChatAgent' -or $health.component -ne 'adapter' -or $health.statusVersion -ne 1 -or $health.backend -ne 'wechat-ui' -or ($script:expectedSender -and $health.backend -ne $script:expectedSender) -or $healthPid -ne $ExpectedProcessId -or $health.projectRoot -isnot [string]){throw ('ADAPTER_IDENTITY_MISMATCH port='+$Port+' expectedPid='+$ExpectedProcessId)}
         $sameRoot=$false;try{$sameRoot=[IO.Path]::GetFullPath($health.projectRoot).TrimEnd('\','/') -eq [IO.Path]::GetFullPath($root).TrimEnd('\','/')}catch{}
         if(-not $sameRoot){throw ('ADAPTER_IDENTITY_MISMATCH port='+$Port+' expectedPid='+$ExpectedProcessId)}
-        return $health.ready -eq $true
+        return $health.ready -eq $true -and $health.ob_connected -eq $true -and $health.reader_connected -eq $true
     }
     return $true
 }
 function Start-ServiceProcess([string]$Name,[string]$Exe,[string]$Arguments,[string]$Directory,[string]$Marker,[int]$Port,[bool]$Visible) {
+    $item = $script:record[$Name]
+    $existing = Owned-Process $item -AllowStale
+    if ($existing -and $item.port -ne $Port) {
+        throw ('SERVICE_RESTART_REQUIRED service='+$Name+' port='+$Port+' runningPort='+$item.port)
+    }
     $bindings=@(Get-PortBindings $Port)
     if($bindings.Count){
-        $item=$script:record[$Name];$existing=$null
-        try{$existing=Owned-Process $item}catch{}
         $owners=@($bindings | Select-Object -ExpandProperty OwningProcess -Unique)
         if(-not $existing -or @($owners | Where-Object {[int]$_ -ne [int]$item.pid}).Count){throw ('SERVICE_PORT_IN_USE service='+$Name+' port='+$Port+' owners='+($owners -join ','))}
+    }
+    if($existing){
         $process=Get-Process -Id ([int]$item.pid) -ErrorAction Stop
     }else{
         # A failed connection does not prove the port can be bound. This
@@ -149,7 +158,9 @@ function Start-ServiceProcess([string]$Name,[string]$Exe,[string]$Arguments,[str
         Assert-PortBindable $Name $Port
         $style = if ($Visible) { 'Normal' } else { 'Hidden' }
         $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Directory -WindowStyle $style -PassThru -RedirectStandardOutput (Join-Path $stateDir ('logs\'+$Name+'.stdout.log')) -RedirectStandardError (Join-Path $stateDir ('logs\'+$Name+'.stderr.log'))
-        $script:record[$Name] = @{pid=$process.Id;exe=$Exe;marker=$Marker;createdUtcTicks=$process.StartTime.ToUniversalTime().Ticks.ToString()}; Save-Record
+        $script:record[$Name] = @{pid=$process.Id;exe=$Exe;marker=$Marker;port=$Port;createdUtcTicks=$process.StartTime.ToUniversalTime().Ticks.ToString()}
+        $script:startedServices += $Name
+        Save-Record
     }
     $watch=[Diagnostics.Stopwatch]::StartNew()
     do {
@@ -179,60 +190,89 @@ function Show-Status($Config) {
     }
     Write-Output ('Logs: '+(Join-Path $stateDir 'logs'))
 }
-if ($Action -eq 'stop') { Stop-Services; exit 0 }
-$node = (Get-Command node -ErrorAction Stop).Source
-& $node (Join-Path $PSScriptRoot 'project-config.mjs')
-if ($LASTEXITCODE -ne 0) { throw 'Invalid project configuration.' }
-$config = Get-Content (Join-Path $root 'config\wechatagent.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$script:expectedSender = $config.runtime.sender
-if ($Action -eq 'prepare') { exit 0 }
-if ($Action -eq 'status') { Show-Status $config; exit 0 }
-if ($Action -eq 'restart') { Stop-Services }
-$python = (Get-Command $config.runtime.python -ErrorAction Stop).Source
-$ntReader = $true
-$names = @('ELECTRON_RUN_AS_NODE','WEFLOW_CONFIG_CWD','WEFLOW_USER_DATA_PATH','AUTO_UPDATE_ENABLED','SOCIAL_DSH_TOKEN','PYTHONUTF8','PYTHONUNBUFFERED','WECHATAGENT_LOG_DIR','WECHATAGENT_STATE_DIR')
-$previous = @{}; foreach ($name in $names) { $previous[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
+# The kernel releases this handle even if the supervisor exits unexpectedly.
+New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 try {
-    $env:ELECTRON_RUN_AS_NODE = $null
-    $env:WEFLOW_CONFIG_CWD = $null; $env:WEFLOW_USER_DATA_PATH = $null
-    $env:AUTO_UPDATE_ENABLED = '0'
-    $env:PYTHONUTF8='1'; $env:PYTHONUNBUFFERED='1'
-    $readerEntry = Join-Path $PSScriptRoot 'reader-api.py'
-    Start-ServiceProcess 'reader' $python ('"'+$readerEntry+'"') $root $readerEntry ([int]$config.ports.weflow) $false
-    $sync = Start-Process -FilePath $node -ArgumentList ('"'+(Join-Path $PSScriptRoot 'sync-weflow.cjs')+'"') -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput (Join-Path $stateDir 'logs\sync.stdout.log') -RedirectStandardError (Join-Path $stateDir 'logs\sync.stderr.log')
-    if ($sync.ExitCode -ne 0) {
-        $detail = (Get-Content (Join-Path $stateDir 'logs\sync.stderr.log') -Raw).Trim()
-        throw ('WeFlow account/API verification failed: ' + $detail + '. Open WeFlow settings; details: state/logs/sync.stderr.log')
+    $operationLock = [IO.File]::Open((Join-Path $stateDir 'runtime.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+} catch [IO.IOException] {
+    if (($_.Exception.GetBaseException().HResult -band 0xffff) -in @(32, 33)) { throw 'RUNTIME_OPERATION_BUSY' }
+    throw
+}
+try {
+    if (Test-Path -LiteralPath $recordFile) {
+        $saved = Get-Content -LiteralPath $recordFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($property in $saved.PSObject.Properties) { $script:record[$property.Name] = $property.Value }
     }
-    & $node (Join-Path $PSScriptRoot 'wechat-onebot.mjs') --check
-    if ($LASTEXITCODE -ne 0) { throw 'DESKTOP_SENDER_NOT_READY: Prepare desktop components and use the already running selected WeChat account.' }
-    $env:SOCIAL_DSH_TOKEN = (Get-Content (Join-Path $stateDir 'social-dsh-token.txt') -Raw).Trim()
-    $dshUrl = 'http://127.0.0.1:'+$config.ports.dshPlugin+'/health'
-    if (-not (Test-Port ([int]$config.ports.dshPlugin))) {
-        if (-not $config.runtime.dshDesktop -or -not (Test-Path -LiteralPath $config.runtime.dshDesktop)) { throw 'DSH_NOT_CONFIGURED: Install DSH from the setup link, then select its executable and save settings.' }
-        & (Join-Path $PSScriptRoot 'launch-dsh.ps1')
-        for($i=0;$i -lt 60 -and -not (Test-Port ([int]$config.ports.dshPlugin));$i++){Start-Sleep -Milliseconds 250}
-        if (-not (Test-Port ([int]$config.ports.dshPlugin))) { throw 'DSH_PLUGIN_NOT_READY: Enable the local plugin in DSH and fully reopen DSH from the tray.' }
+    if ($Action -eq 'check-desktop-stopped') {
+        foreach ($name in @('adapter','bridge')) {
+            if (Owned-Process $script:record[$name] -AllowStale) { Write-Output 'DESKTOP_RUNNING'; return }
+        }
+        Write-Output 'DESKTOP_STOPPED'
+        return
     }
-    $health = Invoke-RestMethod $dshUrl -Headers @{Authorization='Bearer '+$env:SOCIAL_DSH_TOKEN} -TimeoutSec 3
-    $accountIdentityFile = Join-Path $stateDir 'weflow\active-account.json'
-    if (Test-Path -LiteralPath $accountIdentityFile) {
-        $accountIdentity = Get-Content -LiteralPath $accountIdentityFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($health.accountScope -ne $accountIdentity.id) { throw 'ACCOUNT_SWITCH_REQUIRES_DSH_RESTART: Fully exit DSH from the tray and reopen it after switching account.' }
+
+    if ($Action -in @('stop','restart')) {
+        Stop-Services
+        if ($Action -eq 'stop') { exit 0 }
     }
-    if ($health.ok -ne $true -or $health.project -ne 'WeChatAgent' -or [IO.Path]::GetFullPath($health.projectRoot) -ne [IO.Path]::GetFullPath($root)) { throw 'Install the DSH plugin from this project packages directory, then fully reopen DSH.' }
-    if ($health.contextMode -ne 'native-session-v1') { throw 'Fully exit DSH from the tray and reopen it to load the native-session plugin.' }
-    if ($health.behaviorPolicy -ne 'local-config-only-v1') { throw 'Fully reopen DSH to load the local-only behavior policy before starting WeChatAgent.' }
-    if ($ntReader -and $health.imageInput -ne 'native-attachment-v1') { throw 'Fully exit DSH from the tray and reopen it to load the image attachment plugin.' }
-    $bridgeEntry = Join-Path $root 'components\qq-bridge\src\social-bridge.js'
-    Start-ServiceProcess 'bridge' $node ('"'+$bridgeEntry+'" "'+(Join-Path $stateDir 'bridge-config.json')+'"') (Join-Path $root 'components\qq-bridge') $bridgeEntry ([int]$config.ports.onebot) $false
-    $env:PYTHONUTF8='1'; $env:PYTHONUNBUFFERED='1'
-    $env:WECHATAGENT_LOG_DIR=$null; $env:WECHATAGENT_STATE_DIR=$null
-    $adapterEntry = Join-Path $PSScriptRoot 'wechat-onebot.mjs'
-    Start-ServiceProcess 'adapter' $node ('"'+$adapterEntry+'"') $root $adapterEntry ([int]$config.ports.adapter) $false
-    for($i=0;$i -lt 20;$i++) {
-        $status=Invoke-RestMethod ('http://127.0.0.1:'+$config.ports.adapter+'/status') -TimeoutSec 3
-        if($status.ob_connected -and $status.reader_connected){break}; Start-Sleep -Milliseconds 250
-    }
-    Show-Status $config
-} finally { foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$previous[$name],'Process')} }
+    $node = (Get-Command node -ErrorAction Stop).Source
+    & $node (Join-Path $PSScriptRoot 'project-config.mjs')
+    if ($LASTEXITCODE -ne 0) { throw 'Invalid project configuration.' }
+    $config = Get-Content (Join-Path $root 'config\wechatagent.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $script:expectedSender = $config.runtime.sender
+    if ($Action -eq 'prepare') { exit 0 }
+    if ($Action -eq 'status') { Show-Status $config; exit 0 }
+    $python = (Get-Command $config.runtime.python -ErrorAction Stop).Source
+    $ntReader = $true
+    $names = @('ELECTRON_RUN_AS_NODE','WEFLOW_CONFIG_CWD','WEFLOW_USER_DATA_PATH','AUTO_UPDATE_ENABLED','SOCIAL_DSH_TOKEN','PYTHONUTF8','PYTHONUNBUFFERED','WECHATAGENT_LOG_DIR','WECHATAGENT_STATE_DIR')
+    $previous = @{}; foreach ($name in $names) { $previous[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
+    try {
+        $env:ELECTRON_RUN_AS_NODE = $null
+        $env:WEFLOW_CONFIG_CWD = $null; $env:WEFLOW_USER_DATA_PATH = $null
+        $env:AUTO_UPDATE_ENABLED = '0'
+        $env:PYTHONUTF8='1'; $env:PYTHONUNBUFFERED='1'
+        $readerEntry = Join-Path $PSScriptRoot 'reader-api.py'
+        Start-ServiceProcess 'reader' $python ('"'+$readerEntry+'"') $root $readerEntry ([int]$config.ports.weflow) $false
+        $sync = Start-Process -FilePath $node -ArgumentList ('"'+(Join-Path $PSScriptRoot 'sync-weflow.cjs')+'"') -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput (Join-Path $stateDir 'logs\sync.stdout.log') -RedirectStandardError (Join-Path $stateDir 'logs\sync.stderr.log')
+        if ($sync.ExitCode -ne 0) {
+            $detail = (Get-Content (Join-Path $stateDir 'logs\sync.stderr.log') -Raw).Trim()
+            throw ('WeFlow account/API verification failed: ' + $detail + '. Open WeFlow settings; details: state/logs/sync.stderr.log')
+        }
+        & $node (Join-Path $PSScriptRoot 'wechat-onebot.mjs') --check-startup
+        if ($LASTEXITCODE -ne 0) { throw 'DESKTOP_SENDER_NOT_READY: Prepare desktop components and use the already running selected WeChat account.' }
+        $env:SOCIAL_DSH_TOKEN = (Get-Content (Join-Path $stateDir 'social-dsh-token.txt') -Raw).Trim()
+        $dshUrl = 'http://127.0.0.1:'+$config.ports.dshPlugin+'/health'
+        if (-not (Test-Port ([int]$config.ports.dshPlugin))) {
+            if (-not $config.runtime.dshDesktop -or -not (Test-Path -LiteralPath $config.runtime.dshDesktop)) { throw 'DSH_NOT_CONFIGURED: Install DSH from the setup link, then select its executable and save settings.' }
+            & (Join-Path $PSScriptRoot 'launch-dsh.ps1')
+            for($i=0;$i -lt 60 -and -not (Test-Port ([int]$config.ports.dshPlugin));$i++){Start-Sleep -Milliseconds 250}
+            if (-not (Test-Port ([int]$config.ports.dshPlugin))) { throw 'DSH_PLUGIN_NOT_READY: Enable the local plugin in DSH and fully reopen DSH from the tray.' }
+        }
+        $health = Invoke-RestMethod $dshUrl -Headers @{Authorization='Bearer '+$env:SOCIAL_DSH_TOKEN} -TimeoutSec 3
+        $accountIdentityFile = Join-Path $stateDir 'weflow\active-account.json'
+        if (Test-Path -LiteralPath $accountIdentityFile) {
+            $accountIdentity = Get-Content -LiteralPath $accountIdentityFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($health.accountScope -ne $accountIdentity.id) { throw 'ACCOUNT_SWITCH_REQUIRES_DSH_RESTART: Fully exit DSH from the tray and reopen it after switching account.' }
+        }
+        if ($health.ok -ne $true -or $health.project -ne 'WeChatAgent' -or [IO.Path]::GetFullPath($health.projectRoot) -ne [IO.Path]::GetFullPath($root)) { throw 'Install the DSH plugin from this project packages directory, then fully reopen DSH.' }
+        if ($health.contextMode -ne 'native-session-v1') { throw 'Fully exit DSH from the tray and reopen it to load the native-session plugin.' }
+        if ($health.behaviorPolicy -ne 'local-config-only-v1') { throw 'Fully reopen DSH to load the local-only behavior policy before starting WeChatAgent.' }
+        if ($ntReader -and $health.imageInput -ne 'native-attachment-v1') { throw 'Fully exit DSH from the tray and reopen it to load the image attachment plugin.' }
+        $bridgeEntry = Join-Path $root 'components\qq-bridge\src\social-bridge.js'
+        Start-ServiceProcess 'bridge' $node ('"'+$bridgeEntry+'" "'+(Join-Path $stateDir 'bridge-config.json')+'"') (Join-Path $root 'components\qq-bridge') $bridgeEntry ([int]$config.ports.onebot) $false
+        $env:PYTHONUTF8='1'; $env:PYTHONUNBUFFERED='1'
+        $env:WECHATAGENT_LOG_DIR=$null; $env:WECHATAGENT_STATE_DIR=$null
+        $adapterEntry = Join-Path $PSScriptRoot 'wechat-onebot.mjs'
+        Start-ServiceProcess 'adapter' $node ('"'+$adapterEntry+'"') $root $adapterEntry ([int]$config.ports.adapter) $false
+        Show-Status $config
+    } catch {
+        $startupError = $_
+        if ($script:startedServices.Count) {
+            try { Stop-Services -Names $script:startedServices }
+            catch { Write-Output ('Startup rollback incomplete: ' + $_.Exception.Message) }
+        }
+        throw $startupError
+    } finally { foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$previous[$name],'Process')} }
+} finally {
+    $operationLock.Dispose()
+}

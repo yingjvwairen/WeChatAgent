@@ -42,6 +42,9 @@ const [result, duplicate] = await Promise.all(['1', '2'].map(ch =>
 assert.equal(result.ok, true, result.code);
 assert.equal(duplicate.text, result.text);
 assert(real ? result.text.length > 0 : result.text === 'en|hello');
+const repeated = await actions.get('transcribe').execute(ctx, {id:'1'.repeat(64)});
+assert.equal(repeated.text, result.text);
+assert.equal(repeated.cached, undefined); // Only the resident worker can cache this result.
 const service = {key, entry:'custom', profile:{auth:'bearer'}, flat:{endpoint,model:'chinese',timeoutMs:25000}};
 const transcript = await transcriptionsTranscribe(service,wav);
 assert(real ? transcript.length > 0 : transcript === 'zh|你好');
@@ -120,7 +123,7 @@ class LocalWhisperTests(unittest.TestCase):
                 json.dumps({'zh': {'modelDirectory': 'model', 'language': 'zh', 'initialPrompt': 'example'}}),
                 encoding='utf8',
             )
-            self.assertEqual(provider.read_profiles(None, file), {'zh': (folder, 'zh', 'example')})
+            self.assertEqual(provider.read_profiles(None, file), {'zh': (folder.resolve(), 'zh', 'example')})
             key_file = base / 'private' / 'api.key'
             key = provider.read_key(key_file)
             self.assertEqual(key, provider.read_key(key_file))

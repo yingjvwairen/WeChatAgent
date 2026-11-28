@@ -169,7 +169,7 @@ export function createAssistantControl({
     if (['notifications', 'notification-ack'].includes(action)) {
       if (body.localControl !== true || !accountReady()) throw taskFault('ASSISTANT_SENDER_DENIED', 403);
       if (action === 'notification-ack') notifications?.ack(body.id);
-      return { ok: true, notifications: notifications?.list() ?? [] };
+      return { ok: true, notifications: notifications?.list({ advance: action === 'notifications' }) ?? [] };
     }
     const w = allowed(body),
       key = body.conversationKey,

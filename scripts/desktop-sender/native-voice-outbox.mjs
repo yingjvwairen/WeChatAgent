@@ -135,7 +135,7 @@ function verifyState(value, id) {
       !Number.isInteger(part.bytes) ||
       part.bytes < 44 ||
       part.bytes > 32 * 1024 * 1024 ||
-      (part.state === 'confirmed' && !receiptMatches(part.receipt, { ...value, ...part }))
+      (part.state === 'confirmed' && !voiceReceiptMatches(part.receipt, { ...value, ...part }))
     )
       throw fault('NATIVE_VOICE_STATE_INVALID');
     if (
@@ -186,7 +186,7 @@ function verifyState(value, id) {
     throw fault('NATIVE_VOICE_STATE_INVALID');
   return value;
 }
-function receiptMatches(receipt, job) {
+export function voiceReceiptMatches(receipt, job) {
   if (receipt?.type === 'desktop-reader-voice-v1')
     return (
       receipt.deliveryId === job.id &&
@@ -582,7 +582,7 @@ export class NativeVoiceOutbox {
         part.state = 'unknown';
         part.reason = 'NATIVE_VOICE_CANCELLATION_UNVERIFIED';
       }
-    } else if (safe && result?.confirmed === true && receiptMatches(result.receipt, { ...job, ...part })) {
+    } else if (safe && result?.confirmed === true && voiceReceiptMatches(result.receipt, { ...job, ...part })) {
       part.state = 'confirmed';
       part.receipt = clone(result.receipt);
       delete part.reason;

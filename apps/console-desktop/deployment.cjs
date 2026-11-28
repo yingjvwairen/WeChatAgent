@@ -100,9 +100,14 @@ async function bootstrapDeployment(resourcesPath, dataHome, progress = () => {},
     manifestFile = path.join(template, 'deployment.json');
   if (!fs.existsSync(manifestFile)) return null;
   const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  const { wechatVersion } = JSON.parse(fs.readFileSync(path.join(template, 'release-profile.json'), 'utf8'));
   if (
     manifest.desktopRuntime !== true ||
-    manifest.wechatVersion !== '4.2.0.53' ||
+    typeof wechatVersion !== 'string' ||
+    !/^\d+(\.\d+){3}$/u.test(wechatVersion) ||
+    manifest.wechatVersion !== wechatVersion ||
+    !Array.isArray(manifest.files) ||
+    !manifest.files.includes('release-profile.json') ||
     !Array.isArray(manifest.bundledWechatVersions) ||
     manifest.bundledWechatVersions.length
   )
@@ -213,7 +218,7 @@ async function bootstrapDeployment(resourcesPath, dataHome, progress = () => {},
     config.input.python === previous.foregroundInputPython
   )
     config.input.python = python;
-  config.input.expectedVersion = '4.2.0.53';
+  config.input.expectedVersion = wechatVersion;
   fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
   if (manifest.buildId && previous.buildId && previous.buildId !== manifest.buildId) {
     const pendingFile = path.join(workspace, 'state/console-state.json');
@@ -235,7 +240,7 @@ async function bootstrapDeployment(resourcesPath, dataHome, progress = () => {},
         builtAt: manifest.builtAt,
         runtimeRevision: manifest.runtimeRevision,
         desktopRuntime: true,
-        wechatVersion: '4.2.0.53',
+        wechatVersion,
         bundledWechatVersions: [],
         installed: true,
         dataHome,

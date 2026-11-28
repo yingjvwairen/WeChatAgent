@@ -39,7 +39,8 @@ test('native image admission verifies authenticated source, integrity and conver
     id = 'a'.repeat(64),
     key = 'wechat:private:123',
     saved = [];
-  let target = key;
+  let target = key,
+    forwardItem;
   const server = http.createServer((req, res) => {
     assert.equal(req.headers.authorization, 'Bearer fixture-reader-token');
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -50,6 +51,7 @@ test('native image admission verifies authenticated source, integrity and conver
         b64: bytes.toString('base64'),
         mime: 'image/jpeg',
         sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        forwardItem,
       }),
     );
   });
@@ -83,6 +85,16 @@ test('native image admission verifies authenticated source, integrity and conver
     imageBlocks(ctx, dir, key, [{ id }], 'fixture-provider', 'fixture-model'),
     /CONVERSATION_MISMATCH/,
   );
+  target = key;
+  forwardItem = 1;
+  const unavailable = [];
+  const mismatched = await imageBlocks(ctx, dir, key, [{ id, forwardItem: 2 }], 'fixture', 'fixture', {
+    onUnavailable: result => unavailable.push(result),
+  });
+  assert.equal(saved.length, 1);
+  assert.equal(mismatched.length, 1);
+  assert.match(mismatched[0].text, /I1.*合并转发第 2 条/);
+  assert.equal(unavailable[0].code, 'IMAGE_FORWARD_ITEM_MISMATCH');
   services.llm.resolveModelInfo = async () => ({ inputModalities: ['text'] });
   await assert.rejects(imageBlocks(ctx, dir, key, [{ id }], 'fixture-provider', 'fixture-model'), /UNSUPPORTED/);
 });
@@ -106,12 +118,12 @@ test('thumbnail-only input is explicitly labelled without discarding other image
   globalThis.fetch = async url => ({
     ok: true,
     json: async () => ({
-      imageId: url.split('/').at(-1),
+      imageId: new URL(url).pathname.split('/').at(-1),
       conversationKey: 'wechat:private:123',
       mime: 'image/jpeg',
       b64: bytes.toString('base64'),
       sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
-      sourceQuality: url.endsWith(ids[0]) ? 'thumbnail' : 'full',
+      sourceQuality: new URL(url).pathname.endsWith(ids[0]) ? 'thumbnail' : 'full',
       _imageSource: { ids: ['fixture-private-source'] },
     }),
   });
@@ -141,6 +153,81 @@ test('thumbnail-only input is explicitly labelled without discarding other image
   assert.match(blocks[0].text, /I1.*缩略图/);
   assert.equal(saved.length, 2);
   assert(!JSON.stringify({ blocks, saved }).includes('fixture-private-source'));
+});
+
+test('model image budget keeps each source and allocates available frame slots across videos', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-video-budget-'));
+  const ids = ['a', 'b', 'c'].map(value => value.repeat(64));
+  const key = 'wechat:private:123';
+  const original = globalThis.fetch;
+  const saved = [];
+  fs.mkdirSync(path.join(dir, 'state'));
+  fs.writeFileSync(
+    path.join(dir, 'state/wechat-io-config.json'),
+    JSON.stringify({ reader_base_url: 'http://127.0.0.1:1', reader_token: 'fixture' }),
+  );
+  t.after(() => {
+    globalThis.fetch = original;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  function pixels(name) {
+    const data = Buffer.from(name);
+    return {
+      mime: 'image/jpeg',
+      b64: data.toString('base64'),
+      sha256: crypto.createHash('sha256').update(data).digest('hex'),
+    };
+  }
+  globalThis.fetch = async url => {
+    const location = new URL(url);
+    const id = location.pathname.split('/').at(-1);
+    assert.equal(location.searchParams.get('maxFrames'), '2');
+    const preview =
+      id === ids[2]
+        ? pixels('still')
+        : {
+            frames: ['early', 'late'].map((frame, index) => ({
+              ...pixels(id[0] + ':' + frame),
+              atMs: 1000 + index * 1000,
+              sourceQuality: 'video-frame',
+            })),
+            playback: { durationSeconds: 3, audioPresent: false },
+            ...(id === ids[1] ? { forwardItem: 2 } : {}),
+          };
+    return { ok: true, json: async () => ({ conversationKey: key, imageId: id, ...preview }) };
+  };
+  const ctx = {
+    get: name =>
+      name === 'llm'
+        ? { resolveModelInfo: async () => ({ inputModalities: ['image'] }) }
+        : {
+            saveImage: async ({ data }) => {
+              saved.push(data.toString());
+              return { attachmentId: data.toString() };
+            },
+          },
+  };
+  const blocks = await imageBlocks(
+    ctx,
+    dir,
+    key,
+    ids.map((id, index) => (index === 1 ? { id, forwardItem: 2 } : { id, quoted: true })),
+    'fixture',
+    'fixture',
+  );
+  const output = ['a:early', 'a:late', 'b:late', 'still'];
+  assert.deepEqual(saved.toSorted(), output);
+  assert.deepEqual(
+    blocks.filter(block => block.type === 'image').map(block => block.attachment.attachmentId),
+    output,
+  );
+  assert(blocks.some(block => /第 2 条.*时长 3.00 秒。没有音轨/.test(block.text)));
+  for (const [index, block] of blocks.entries()) {
+    if (block.type !== 'image') continue;
+    const attachment = block.attachment.attachmentId;
+    const source = attachment === 'b:late' ? /I2.*合并转发第 2 条/ : /被引用历史消息/;
+    assert.match(blocks[index - 1].text, source, attachment);
+  }
 });
 test('completed image turns retain durable attachment references but stop rebilling image bytes', () => {
   const events = [
@@ -221,10 +308,11 @@ test('one missing or timed-out sticker keeps other images and preserves their pr
   let hang = false;
   const server = http.createServer((req, res) => {
     if (hang) return;
-    res.writeHead(req.url.endsWith(ids[0]) ? 503 : 200, { 'content-type': 'application/json' });
+    const missing = new URL(req.url, 'http://127.0.0.1').pathname.endsWith(ids[0]);
+    res.writeHead(missing ? 503 : 200, { 'content-type': 'application/json' });
     res.end(
       JSON.stringify(
-        req.url.endsWith(ids[0])
+        missing
           ? { error: 'IMAGE_STICKER_LOCAL_COPY_UNAVAILABLE' }
           : {
               imageId: ids[1],
@@ -294,7 +382,7 @@ test('two image workers preserve order and fast later images survive a slow firs
     fs.rmSync(dir, { recursive: true, force: true });
   });
   globalThis.fetch = async url => {
-    const id = url.split('/').at(-1);
+    const id = new URL(url).pathname.split('/').at(-1);
     active++;
     max = Math.max(max, active);
     await new Promise(r => setTimeout(r, id === ids[0] ? 100 : 5));
@@ -330,6 +418,25 @@ test('two image workers preserve order and fast later images survive a slow firs
   assert.deepEqual(
     blocks.map(b => b.attachment.id),
     ids,
+  );
+  const fetchWithinBudget = globalThis.fetch;
+  globalThis.fetch = url => (new URL(url).pathname.endsWith(ids[0]) ? new Promise(() => {}) : fetchWithinBudget(url));
+  const partial = await imageBlocks(
+    ctx,
+    dir,
+    'wechat:private:123',
+    ids.map(id => ({ id })),
+    'fixture',
+    'fixture',
+    {
+      timeoutMs: 150,
+      onUnavailable() {},
+    },
+  );
+  assert.equal(partial[0].type, 'text');
+  assert.deepEqual(
+    partial.slice(1).map(block => block.attachment.id),
+    ids.slice(1),
   );
 });
 

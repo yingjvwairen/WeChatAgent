@@ -5,6 +5,7 @@ import { LocalSpeechProcesses } from './local-speech-processes.mjs';
 import { defaultProfilesPath, localSpeechPort } from './local-speech-owned.mjs';
 export { defaultProfilesPath } from './local-speech-owned.mjs';
 import { MODEL_FIELDS, VOICE_PARAMETERS } from '../packages/speech-contract/model-schema.mjs';
+import { atomicJson } from '../packages/extension-runtime/catalog.mjs';
 export { VOICE_PARAMETERS } from '../packages/speech-contract/model-schema.mjs';
 
 const kinds = ['asr', 'tts'];
@@ -111,16 +112,29 @@ export function validateProfiles(root, kind, config, rows) {
 }
 
 export function discoverModels(root, kind, config) {
-  if (!kinds.includes(kind) || !config.modelDirectory) throw Error('LOCAL_MODEL_DIRECTORY_REQUIRED');
-  const base = fs.realpathSync(path.resolve(root, config.modelDirectory));
+  if (!kinds.includes(kind)) throw Error('LOCAL_MODEL_DIRECTORY_REQUIRED');
+  const configured = config.modelDirectory ? path.resolve(root, config.modelDirectory) : null;
+  const base =
+    configured && (kind === 'tts' || fs.statSync(configured, { throwIfNoEntry: false })?.isDirectory())
+      ? fs.realpathSync(configured)
+      : null;
+  const installedDirectory = path.join(root, 'state/local-whisper/models');
+  const installed =
+    kind === 'asr' && fs.lstatSync(installedDirectory, { throwIfNoEntry: false })?.isDirectory()
+      ? fs.realpathSync(installedDirectory)
+      : null;
+  if (!base && !installed) throw Error('LOCAL_MODEL_DIRECTORY_REQUIRED');
   const found = { gptWeights: [], sovitsWeights: [], refAudio: [], modelDirectory: [] };
+  const visited = new Set();
   let entries = 0,
     truncated = false;
   const walk = (folder, depth) => {
+    if (visited.has(folder)) return;
     if (entries >= 3000 || depth > 5) {
       truncated = true;
       return;
     }
+    visited.add(folder);
     const rows = fs.readdirSync(folder, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     if (
       kind === 'asr' &&
@@ -149,8 +163,9 @@ export function discoverModels(root, kind, config) {
       if (key && found[key].length < 300) found[key].push(file);
     }
   };
-  walk(base, 0);
-  return { kind, root: base, candidates: found, truncated };
+  if (installed) walk(installed, 0);
+  if (base) walk(base, 0);
+  return { kind, root: base ?? installed, candidates: found, truncated };
 }
 
 // Console routes provide their usual authentication and config serialization.
@@ -206,16 +221,18 @@ export function createLocalModelControls({
             error = 'LOCAL_MODEL_SETTINGS_INVALID';
           }
           const selectedProfile = selected(kind, stored.profiles);
-          let phase = manager.status[kind] || 'stopped';
+          let phase = config.enabled === true ? manager.status[kind] || 'stopped' : 'stopped';
           let loadedProfile = null;
+          let loadedRevision = null;
           if (phase === 'ready') {
             try {
               const model = await manager.modelStatus(kind);
               loadedProfile = typeof model.loadedProfile === 'string' ? model.loadedProfile : null;
-              phase =
-                ['starting', 'loading', 'failed'].includes(model.phase) || (model.phase === 'ready' && loadedProfile)
-                  ? model.phase
-                  : 'unavailable';
+              loadedRevision =
+                model.phase === 'ready' && loadedProfile && typeof model.revision === 'string' ? model.revision : null;
+              if (['starting', 'loading', 'failed'].includes(model.phase)) phase = model.phase;
+              else if (model.phase !== 'ready' || !loadedRevision || error) phase = 'unavailable';
+              else phase = loadedRevision === stored.revision ? 'ready' : 'saved';
             } catch {
               phase = 'unavailable';
             }
@@ -229,6 +246,7 @@ export function createLocalModelControls({
               ...stored,
               selectedProfile,
               loadedProfile,
+              loadedRevision,
               phase,
               error,
               endpoint: `http://127.0.0.1:${localSpeechPort(kind, config)}/v1`,
@@ -275,11 +293,30 @@ export function createLocalModelControls({
         stored = readProfiles(file);
       if (stored.revision !== revision) throw Error('LOCAL_MODEL_REVISION_CHANGED');
       if (!stored.profiles[profile] || config.enabled !== true) throw Error('LOCAL_MODEL_NOT_ENABLED');
+      const configuration = JSON.stringify(config);
+      const assertUnchanged = () => {
+        if (JSON.stringify(configFor(kind)) !== configuration || readProfiles(file).revision !== revision)
+          throw Error('LOCAL_MODEL_REVISION_CHANGED');
+      };
       manager.start(readConfig().runtime.localSpeech);
-      const loaded = await manager.model(kind, 'load', { profile, revision });
-      if (!loaded.loaded || loaded.selectedProfile !== profile || loaded.revision !== revision)
-        throw Error('LOCAL_MODEL_LOAD_UNCONFIRMED');
-      return { ...(await view()), loaded: { kind, profile, phase: 'ready' } };
+      await manager.operation;
+      assertUnchanged();
+      const standby = manager.status[kind] === 'standby';
+      if (standby) {
+        atomicJson(path.join(root, 'state/local-speech', kind + '.selection.json'), { version: 1, profile });
+      } else {
+        const loaded = await manager.model(kind, 'load', { profile, revision }, assertUnchanged);
+        if (
+          !loaded.loaded ||
+          loaded.selectedProfile !== profile ||
+          loaded.loadedProfile !== profile ||
+          loaded.revision !== revision
+        )
+          throw Error('LOCAL_MODEL_LOAD_UNCONFIRMED');
+      }
+      const current = await view();
+      assertUnchanged();
+      return { ...current, loaded: { kind, profile, phase: standby ? 'standby' : 'ready' } };
     },
     close() {
       return manager.close();

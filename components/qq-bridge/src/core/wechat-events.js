@@ -63,11 +63,15 @@ export function quoteReplyText(reply) {
   );
 }
 
+const forwardedItemLimit = 801;
+const forwardedRecordLimit = 6400;
+const textLength = text => [...text].length;
+const itemLength = item => textLength(item.sender) + textLength(item.time) + textLength(item.text) + 12;
+
 export function normalizeForwardedRecord(value) {
   // Reader counts Unicode code points. Apply the same bounds at the JS boundary.
-  const length = text => [...text].length;
   const bounded = (text, limit) =>
-    typeof text === 'string' && text.isWellFormed() && text.length <= limit * 2 && length(text) <= limit;
+    typeof text === 'string' && text.isWellFormed() && text.length <= limit * 2 && textLength(text) <= limit;
   if (
     !value ||
     value.version !== 1 ||
@@ -77,13 +81,13 @@ export function normalizeForwardedRecord(value) {
   )
     return null;
   const items = [];
-  let size = length(value.title);
+  let size = textLength(value.title);
   for (const item of value.items) {
     if (
       !item ||
       !bounded(item.sender, 80) ||
       !bounded(item.time, 64) ||
-      !bounded(item.text, 801) ||
+      !bounded(item.text, forwardedItemLimit) ||
       typeof item.kind !== 'string' ||
       item.kind.length > 8 ||
       !Number.isSafeInteger(item.depth) ||
@@ -91,8 +95,8 @@ export function normalizeForwardedRecord(value) {
       item.depth > 3
     )
       return null;
-    size += length(item.sender) + length(item.time) + length(item.text) + 12;
-    if (size > 6400) return null;
+    size += itemLength(item);
+    if (size > forwardedRecordLimit) return null;
     items.push({ sender: item.sender, time: item.time, text: item.text, kind: item.kind, depth: item.depth });
   }
   return {
@@ -104,10 +108,42 @@ export function normalizeForwardedRecord(value) {
   };
 }
 
-export function forwardedRecordText(record) {
-  const lines = record.items.map(
-    item => `${'  '.repeat(item.depth)}${item.time ? item.time + ' ' : ''}${item.sender}: ${item.text}`,
+const unreadMediaLabel = {
+  2: '[图片，未提供图片内容]',
+  3: '[语音，未转写]',
+  4: '[视频，未提供视频内容]',
+  37: '[表情，未提供表情内容]',
+};
+
+export function annotateForwardedItem(record, index, note) {
+  const item = record.items[index];
+  const label = unreadMediaLabel[item.kind];
+  const caption =
+    label && (item.text === label || item.text.startsWith(label + ' '))
+      ? item.text.slice(label.length).trimStart()
+      : item.text;
+  const sizeWithoutText =
+    record.items.reduce((size, row) => size + itemLength(row), textLength(record.title)) - textLength(item.text);
+  const available = Math.max(
+    0,
+    Math.min(forwardedItemLimit, forwardedRecordLimit - sizeWithoutText) -
+      textLength(caption) -
+      Number(Boolean(caption)),
   );
+  const points = [...note];
+  const truncated = points.length > available;
+  const addition = !truncated ? note : available ? points.slice(0, available - 1).join('') + '…' : '';
+  const items = record.items.slice();
+  items[index] = { ...item, text: [caption, addition].filter(Boolean).join('\n') };
+  return { ...record, items, truncated: record.truncated || truncated };
+}
+
+export function forwardedRecordText(record, imageRefs) {
+  const lines = record.items.map((item, index) => {
+    const refs = imageRefs?.get(index + 1);
+    const pictures = refs?.length ? '[附图 ' + refs.join('、') + '] ' : '';
+    return `${'  '.repeat(item.depth)}${item.time ? item.time + ' ' : ''}${item.sender}: ${pictures}${item.text}`;
+  });
   return (
     '[合并转发的历史聊天记录]\n标题：' +
     record.title +

@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from desktop_quote_source import QuoteSourceUnavailable
+from reader_message_rows import MAX_RECEIPT_RESPONSE_BYTES
 from wechat_identity import group_username, valid_chat_id
 from wechat_image_limits import MAX_REQUEST_BYTES as IMAGE_MATERIAL_REQUEST_BYTES
 from wechat_sticker_manager import ManagerError
@@ -37,18 +39,20 @@ def reader_request_handler(reader, token):
         protocol_version = 'HTTP/1.1'
 
         def log_message(self, *_):
-            pass  # URL query parameters can contain the authentication token.
+            pass  # Avoid logging account and conversation parameters.
 
-        def respond(self, body, status=200):
+        def respond(self, body, status=200, *, max_bytes=None):
             raw = json.dumps(body, ensure_ascii=False).encode('utf-8')
+            if max_bytes is not None and len(raw) > max_bytes:
+                raise RuntimeError('READER_RECEIPT_LIMIT')
             self.send_response(status)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
 
-        def authorized(self, query_token=''):
-            supplied = self.headers.get('Authorization', '').removeprefix('Bearer ') or query_token
+        def authorized(self):
+            supplied = self.headers.get('Authorization', '').removeprefix('Bearer ')
             if token and hmac.compare_digest(supplied.encode(), token.encode()):
                 return True
             self.respond({'success': False, 'error': 'Unauthorized'}, 401)
@@ -57,40 +61,27 @@ def reader_request_handler(reader, token):
         def do_GET(self):
             url = urlsplit(self.path)
             query = parse_qs(url.query)
-            if not self.authorized(query.get('access_token', [''])[0]):
+            if not self.authorized():
                 return
             try:
                 max_limit = 1000 if url.path == '/api/v1/sessions' else 500
                 limit = min(max_limit, max(1, int(query.get('limit', ['100'])[0])))
-                if url.path == '/api/v1/push/messages':
-                    with reader.push_events() as events:
-                        self.close_connection = True
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
-                        self.send_header('Cache-Control', 'no-cache')
-                        self.send_header('Connection', 'close')
-                        self.send_header('Transfer-Encoding', 'chunked')
-                        self.end_headers()
-                        for payload in events:
-                            line = (
-                                ': heartbeat\n\n'
-                                if payload is None
-                                else 'data: ' + json.dumps(payload, ensure_ascii=False) + '\n\n'
-                            )
-                            raw = line.encode('utf-8')
-                            self.wfile.write(('%x\r\n' % len(raw)).encode() + raw + b'\r\n')
-                            self.wfile.flush()
-                    self.wfile.write(b'0\r\n\r\n')
-                elif url.path == '/api/v1/intake/next':
+                if url.path == '/api/v1/intake/next':
                     session = query.get('consumer', [''])[0]
                     if not re.fullmatch('[0-9a-f]{32}', session):
                         self.respond({'success': False, 'error': 'Missing bridge session'}, 400)
                         return
                     busy = query.get('busy', [])
-                    if len(busy) > 8 or any(not re.fullmatch('[a-f0-9]{64}', token) for token in busy):
+                    excluded = query.get('excludeRoute', [])
+                    if (
+                        len(busy) > 9
+                        or any(not re.fullmatch('[a-f0-9]{64}', token) for token in busy)
+                        or len(excluded) > 2
+                        or any(route not in ('dsh', 'realtime') for route in excluded)
+                    ):
                         self.respond({'success': False, 'error': 'Invalid intake exclusions'}, 400)
                         return
-                    self.respond({'success': True, 'event': reader.next_intake(session, busy)})
+                    self.respond({'success': True, 'event': reader.next_intake(session, busy, excluded)})
                 elif url.path == '/api/v1/sessions':
                     reader.verify_message_shards()
                     self.respond({'success': True, 'sessions': reader.sessions(limit)})
@@ -109,9 +100,12 @@ def reader_request_handler(reader, token):
                     talker = query.get('talker', [''])[0]
                     after, before = (int(query[name][0]) for name in ('after', 'before'))
                     marks = {} if query.get('baseline') == ['1'] else None
-                    rows = reader.outgoing_receipt_rows(talker, after, before, watermarks=marks)
+                    proof = self.headers.get('X-WeChatAgent-Receipt')
+                    scope = {'receipt_proof': proof} if proof is not None else {}
+                    rows = reader.outgoing_receipt_rows(talker, after, before, watermarks=marks, **scope)
                     self.respond(
-                        {'success': True, 'messages': rows, **({'watermarks': marks} if marks is not None else {})}
+                        {'success': True, 'messages': rows, **({'watermarks': marks} if marks is not None else {})},
+                        max_bytes=MAX_RECEIPT_RESPONSE_BYTES,
                     )
                 elif url.path == '/api/v1/messages':
                     talker = query.get('talker', [''])[0]
@@ -163,7 +157,11 @@ def reader_request_handler(reader, token):
                         )
                     )
                 elif re.fullmatch(r'/api/v1/images/[a-f0-9]{64}', url.path):
-                    self.respond(reader.resolve_image(url.path.rsplit('/', 1)[1]))
+                    max_frames = query.get('maxFrames', ['4'])
+                    if len(max_frames) != 1 or max_frames[0] not in ('1', '2', '3', '4'):
+                        self.respond({'success': False, 'error': 'Invalid image frame budget'}, 400)
+                        return
+                    self.respond(reader.resolve_image(url.path.rsplit('/', 1)[1], max_frames=int(max_frames[0])))
                 elif re.fullmatch(r'/api/v1/stickers/pool-review/[a-f0-9]{64}', url.path):
                     self.respond(reader.sticker_pool_review_packet(url.path.rsplit('/', 1)[1]))
                 elif url.path == '/api/v1/stickers/pool-status':
@@ -192,6 +190,8 @@ def reader_request_handler(reader, token):
                     )
                 else:
                     self.respond({'success': False, 'error': 'Not found'}, 404)
+            except QuoteSourceUnavailable as error:
+                self.respond({'success': False, 'error': str(error)}, 409)
             except ManagerError as error:
                 self.respond({'error': error.code}, error.status)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -199,22 +199,44 @@ def reader_request_handler(reader, token):
             except PermissionError:
                 self.respond({'success': False, 'error': 'Conversation is not selected'}, 403)
             except Exception as error:
-                image_failure = (
+                public_failure = (
                     re.fullmatch(r'/api/v1/images/[a-f0-9]{64}', url.path)
                     and re.fullmatch(r'IMAGE_[A-Z_]{3,80}', str(error))
                     or re.fullmatch(r'/api/v1/voices/[a-f0-9]{64}', url.path)
                     and re.fullmatch(r'VOICE_[A-Z_]{3,80}', str(error))
+                    or url.path == '/api/v1/outgoing-messages'
+                    and str(error) == 'READER_RECEIPT_LIMIT'
                 ) and isinstance(error, RuntimeError)
                 self.respond(
                     {
                         'success': False,
-                        'error': str(error) if image_failure else 'Reader query failed: ' + type(error).__name__,
+                        'error': str(error) if public_failure else 'Reader query failed: ' + type(error).__name__,
                     },
                     503,
                 )
 
         def do_POST(self):
             if not self.authorized():
+                return
+            confirmation = re.fullmatch(r'/api/v1/files/([a-f0-9]{64})/confirm', self.path)
+            if confirmation:
+                try:
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < size <= 32768:
+                        raise ValueError()
+                    self.connection.settimeout(6)
+                    body = json.loads(self.rfile.read(size))
+                    if not isinstance(body, dict) or set(body) != {'path', 'key', 'account', 'grant'}:
+                        raise ValueError()
+                    if body['account'] != reader.account_ref:
+                        raise PermissionError()
+                    self.respond(reader.files.confirm(confirmation[1], body['path'], body['key'], body['grant']))
+                except PermissionError:
+                    self.respond({'error': 'FILE_CONFIRMATION_DENIED'}, 403)
+                except (ValueError, TypeError, FileNotFoundError):
+                    self.respond({'error': 'FILE_CONFIRMATION_INVALID'}, 400)
+                except (OSError, RuntimeError):
+                    self.respond({'error': 'FILE_CONFIRMATION_UNAVAILABLE'}, 503)
                 return
             if self.path == '/api/v1/outgoing-recorded-voice-receipt':
                 try:
@@ -259,8 +281,10 @@ def reader_request_handler(reader, token):
                     # Source duration rounds up to a whole millisecond; features use complete 10 ms frames.
                     if shape_size not in (2 * (duration // 10), 2 * ((duration - 1) // 10)):
                         raise ValueError()
+                    proof = self.headers.get('X-WeChatAgent-Receipt')
+                    scope = {'receipt_proof': proof} if proof is not None else {}
                     match = reader.match_outgoing_voice(
-                        body['talker'], body['account'], after, before, set(baseline), None, body
+                        body['talker'], body['account'], after, before, set(baseline), None, body, **scope
                     )
                     self.respond({'success': True, 'match': match})
                 except (KeyError, ValueError, TypeError):

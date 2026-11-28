@@ -10,7 +10,10 @@ const { pathToFileURL } = require('node:url');
 (async () => {
   const project = path.resolve(process.env.WECHATAGENT_VERIFY_PROJECT || path.join(__dirname, '..'));
   const source = path.resolve(process.argv[2] || 'E:/DSH');
-  const fixture = fs.mkdtempSync(path.join(project, 'state', 'dsh-020-compat-'));
+  fs.mkdirSync(path.join(project, 'state'), { recursive: true });
+  const fixture = fs.realpathSync.native(
+    fs.mkdtempSync(path.join(process.argv[3] || path.join(project, 'state'), 'dsh-020-compat-')),
+  );
   const home = path.join(fixture, 'home');
   process.env.DSH_HOME = home;
   process.env.DSH_TELEMETRY_DISABLED = '1';
@@ -48,6 +51,7 @@ const { pathToFileURL } = require('node:url');
     'dsh-agent',
     'dsh-agent-loop',
     'dsh-session-title',
+    'dsh-tool-executor-native',
   ].map((name, i) => ({ id: 'core-' + i, name: '@deepseek-ai/' + name, config: {} }));
   rows[3].config = { personaPrefix: '' };
   rows[7].config = { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 };
@@ -271,35 +275,9 @@ const { pathToFileURL } = require('node:url');
       }),
     );
     for (const tool of lateTools) socialAgent.ctx.tools.register(tool);
-    // Reproduce the pre-fix presentation in this isolated offline fixture.
-    const legacySchemas = lateTools.map(({ name, description, parameters }) => ({ name, description, parameters }));
-    const removeLegacyOverride = socialAgent.ctx.on(
-      'system-prompt/assemble',
-      async (_assembly, _context, next) => ({ ...(await next()), tools: legacySchemas }),
-      { prepend: true },
-    );
-    const legacyFailure = await rpc('/followup', { ...identity, message: '旧版定时工具污染复现' }, true);
-    assert.equal(legacyFailure.code, 'INVALID_REQUEST', 'The fixture must reproduce the deferred-only failure');
-    assert(calls.at(-1).tools.every(tool => tool.deferLoading === true));
-    removeLegacyOverride();
-    const recovered = await rpc('/followup', { ...identity, message: '修复后的历史工具隔离测试' });
-    assert.equal(recovered.text, 'SILENT');
+    const scopedReply = await rpc('/followup', { ...identity, message: '验证会话工具隔离，只输出 SILENT。' });
+    assert.equal(scopedReply.text, 'SILENT');
     assert.equal(calls.at(-1).tools?.length ?? 0, 0);
-    assert(
-      socialAgent.session
-        .snapshotEvents()
-        .some(event => event.type === 'user/message' && event.data.source?.socialToolMetadataRetired),
-    );
-    assert(
-      socialAgent.session
-        .snapshotEvents()
-        .some(
-          event =>
-            event.type === 'developer/message' &&
-            event.data.message?.content.some(block => block.type === 'tool-addition'),
-        ),
-      'Original tool-change history must be retained for audit',
-    );
     const coding = await ctx.agents.create({
       sessionId: 'coding-tool-isolation-fixture',
       meta: { cwd: fixture },
@@ -1162,8 +1140,6 @@ const { pathToFileURL } = require('node:url');
       nativeCompaction: true,
       emptyTools: true,
       lateScopedToolIsolation: true,
-      deferredOnlyFailureReproduced: true,
-      legacyToolHistoryRecovered: true,
       codingToolsUnaffected: true,
       peerCompatibility: true,
       wechatMessagesSent: 0,

@@ -9,50 +9,54 @@ import { singleDirectoryTemplate } from './installer-directory-page.mjs';
 import { assertPluginHost } from './plugin-host-check.mjs';
 import { BUNDLED_PLUGINS } from '../packages/plugin-api/bundled.mjs';
 import { releaseIdentity } from './release-version.mjs';
-import { READER_KEY, verifyReaderKey } from './prepare-reader-key.mjs';
+import { READER_KEY } from './prepare-reader-key.mjs';
+import { installerRuntimeRevision, prepareInstallerRuntime, runtimeVersions } from './prepare-installer-runtime.mjs';
+import { DESKTOP_APP_SOURCE_FILES, desktopInstallerPackage, stageDesktopYaml } from './release-verification.mjs';
 
 export async function packageInstaller(workspace, { directory: root, files: sourceFiles, commit }, stageOnly) {
-  const wechatVersion = '4.2.0.53';
-  const { version, packageVersion, buildVersion } = releaseIdentity(
-    JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')),
-  );
+  const { wechatVersion } = JSON.parse(fs.readFileSync(path.join(root, 'release-profile.json'), 'utf8'));
+  const desktopPackage = JSON.parse(fs.readFileSync(path.join(root, 'apps/console-desktop/package.json'), 'utf8'));
+  const { appId, productName, executableName } = desktopPackage;
+  const appPackage = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const { version, packageVersion, buildVersion } = releaseIdentity(appPackage);
   const stage = path.join(workspace, 'state', 'installer-stage');
   const appDir = path.join(stage, 'app');
   const project = path.join(stage, 'project');
   const vendor = path.join(stage, 'vendor');
-  const bundledPython = path.join(stage, 'runtime/python/python.exe');
-  const inputProbe = spawnSync(
-    bundledPython,
-    ['-B', '-c', 'import psutil,win32api,win32clipboard,win32gui,win32process'],
-    { windowsHide: true, encoding: 'utf8', timeout: 30000 },
-  );
-  if (inputProbe.status !== 0)
-    throw new Error(
-      'Bundled foreground input dependencies are unavailable. Run prepare-installer-runtime.mjs first. ' +
-        (inputProbe.stderr || ''),
-    );
-  if (!verifyReaderKey(fs.readFileSync(path.join(stage, 'runtime/reader-key/wx_key.dll'))))
-    throw Error('READER_KEY_CHECKSUM_MISMATCH');
+  const runtime = path.join(stage, 'runtime');
   const require = createRequire(path.join(workspace, 'package.json'));
-  const pluginPackage = JSON.parse(
-    fs.readFileSync(path.join(root, 'packages/dsh-social-bridge-plugin/package.json'), 'utf8'),
+  const electronVersion = appPackage.devDependencies.electron;
+  if (require('electron/package.json').version !== electronVersion)
+    throw Error('Installed Electron must match the version in the source snapshot. Run npm ci.');
+  const pluginRoot = path.join(root, 'packages/dsh-social-bridge-plugin');
+  const npm = process.env.npm_execpath;
+  const install = spawnSync(
+    npm ? process.execPath : 'npm',
+    [...(npm ? [npm] : []), 'ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'],
+    {
+      cwd: pluginRoot,
+      shell: !npm && process.platform === 'win32',
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 180000,
+    },
   );
+  if (install.status !== 0) throw Error('INSTALLER_PLUGIN_DEPENDENCIES_FAILED: ' + (install.stderr || install.error));
+  const pluginPackage = JSON.parse(fs.readFileSync(path.join(pluginRoot, 'package.json'), 'utf8'));
   const sdkPackage = JSON.parse(
-    fs.readFileSync(
-      path.join(workspace, 'packages/dsh-social-bridge-plugin/node_modules/@deepseek-ai/dsh-llm/package.json'),
-      'utf8',
-    ),
+    fs.readFileSync(path.join(pluginRoot, 'node_modules/@deepseek-ai/dsh-llm/package.json'), 'utf8'),
   );
   if (pluginPackage.dependencies['@deepseek-ai/dsh-llm'] !== DSH_SDK_VERSION || sdkPackage.version !== DSH_SDK_VERSION)
     throw new Error('Installed plugin SDK must match the declared DSH compatibility version.');
   console.log('DSH desktop is external; only the bridge plugin and SDK ' + DSH_SDK_VERSION + ' are included.');
   const nativeStage = path.join(stage, 'desktop-native');
-  for (const dir of [appDir, project, vendor, nativeStage]) {
+  for (const dir of [appDir, project, vendor, nativeStage, runtime]) {
     const resolved = path.resolve(dir);
     if (!resolved.startsWith(path.resolve(stage) + path.sep)) throw new Error('Invalid release staging directory');
     fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
-  for (const dir of [appDir, project, vendor, path.join(stage, 'runtime')]) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [appDir, project, vendor, runtime]) fs.mkdirSync(dir, { recursive: true });
+  await prepareInstallerRuntime(workspace, runtime);
   const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
   const files = [];
   function copyFile(source, target) {
@@ -73,44 +77,19 @@ export async function packageInstaller(workspace, { directory: root, files: sour
     files.push(relative);
   }
   function addTree(relative, allow) {
-    copyTree(path.join(workspace, relative), path.join(project, relative), allow);
+    copyTree(path.join(root, relative), path.join(project, relative), allow);
     for (const name of fs.readdirSync(path.join(project, relative), { recursive: true }))
       if (fs.statSync(path.join(project, relative, name)).isFile())
         files.push((relative + '/' + name).replaceAll('\\', '/'));
   }
 
-  for (const name of [
-    'package.json',
-    'main.cjs',
-    'preload.cjs',
-    'shutdown.cjs',
-    'storage-location.cjs',
-    'desktop-policy.cjs',
-    'deployment.cjs',
-    'appearance.cjs',
-    'loading-preload.cjs',
-    'loading.html',
-    'loading.css',
-    'loading.js',
-  ])
+  for (const name of DESKTOP_APP_SOURCE_FILES)
     copyFile(path.join(root, 'apps/console-desktop', name), path.join(appDir, name));
   fs.writeFileSync(
     path.join(appDir, 'package.json'),
-    JSON.stringify(
-      {
-        name: 'wechatagent',
-        productName: 'WeChatAgent',
-        version: packageVersion,
-        releaseVersion: version,
-        description: 'WeChatAgent desktop console',
-        main: 'main.cjs',
-        author: 'WeChatAgent contributors',
-        license: 'SEE THIRD-PARTY-NOTICES.txt',
-      },
-      null,
-      2,
-    ),
+    JSON.stringify(desktopInstallerPackage(desktopPackage, { version, packageVersion }), null, 2),
   );
+  stageDesktopYaml(appDir, workspace, desktopPackage.dependencies.yaml);
   await buildIcons(root, appDir, require('sharp'));
   for (const relative of sourceFiles) add(relative);
   const presetNames = fs
@@ -160,9 +139,6 @@ export async function packageInstaller(workspace, { directory: root, files: sour
       .sort()
       .map(name => [name, sha(fs.readFileSync(path.join(nativeStage, name)))]),
   );
-  copyFile(process.execPath, path.join(stage, 'runtime/node.exe'));
-  if (!fs.existsSync(path.join(stage, 'runtime/python/python.exe')))
-    throw new Error('Run prepare-installer-runtime.mjs first.');
   const fileList = [...new Set(files)].sort();
   const sourceHashes = Object.fromEntries(fileList.map(file => [file, sha(fs.readFileSync(path.join(project, file)))]));
   const desktopHashes = Object.fromEntries(
@@ -172,15 +148,7 @@ export async function packageInstaller(workspace, { directory: root, files: sour
       .sort()
       .map(file => [file, sha(fs.readFileSync(path.join(appDir, file)))]),
   );
-  const runtimeRevision = sha(
-    Buffer.from(
-      JSON.stringify({
-        node: sha(fs.readFileSync(process.execPath)),
-        python: fs.readFileSync(path.join(stage, 'runtime/python/DEPENDENCIES.json'), 'utf8'),
-        ocr: fs.readFileSync(path.join(stage, 'runtime/ocr/DEPENDENCIES.json'), 'utf8'),
-      }),
-    ),
-  ).slice(0, 12);
+  const runtimeRevision = installerRuntimeRevision;
   const buildId = sha(
     Buffer.from(
       JSON.stringify({
@@ -213,13 +181,12 @@ export async function packageInstaller(workspace, { directory: root, files: sour
         files: fileList,
         builtinPlugins,
         presets: presetNames.map(name => name.slice(0, -3)),
-        node: process.version,
-        python: '3.13.16',
+        ...runtimeVersions,
         dshBundled: false,
         dshSdkVersion: DSH_SDK_VERSION,
         dshInstallUrl: DSH_INSTALL_URL,
         privateAccountDataIncluded: false,
-        clientDistribution: 'Uses the user-installed WeChat 4.2.0.53; no WeChat client or sender Hook is bundled.',
+        clientDistribution: `Uses the user-installed WeChat ${wechatVersion}.`,
       },
       null,
       2,
@@ -241,7 +208,7 @@ export async function packageInstaller(workspace, { directory: root, files: sour
   const notices =
     'WeChatAgent ' +
     version +
-    '\n\nWeChat and DSH are installed separately by the user. No WeChat client or memory-injection sending component is bundled.\n\nBundled components: Electron, Node.js, Python 3.13.16, SQLCipher Python binding, cryptography, zstandard, pycryptodome, Pillow, imageio-ffmpeg, cffi, pycparser, psutil, pywin32, RapidOCR, ONNX Runtime, NumPy, MIT weflow-cli NT reader sources, MIT Social Bridge sources and the local DSH bridge plugin/SDK. The DSH desktop program is installed separately by the user.\n\nPython and wheel licenses are retained in runtime/python, runtime/ocr and their site-packages/*.dist-info directories. Electron/Chromium and vendor notices are retained with their programs. Refer to project/LICENSES.md for source attribution and license boundaries. No account, credential, chat or whitelist data is included. Maintainer-authorized persona files are included as presets.\n';
+    '\n\nWeChat and DSH are installed separately by the user. No WeChat client or memory-injection sending component is bundled.\n\nBundled components: Electron, Node.js, Python 3.13.16, SQLCipher Python binding, cryptography, zstandard, pycryptodome, Pillow, imageio-ffmpeg, cffi, pycparser, psutil, pywin32, RapidOCR, ONNX Runtime, NumPy, YAML, MIT weflow-cli NT reader sources, MIT Social Bridge sources and the local DSH bridge plugin/SDK. The DSH desktop program is installed separately by the user.\n\nPython and wheel licenses are retained in runtime/python, runtime/ocr and their site-packages/*.dist-info directories. The YAML license is in node_modules/yaml/LICENSE. Electron/Chromium and vendor notices are retained with their programs. Refer to project/LICENSES.md for source attribution and license boundaries. No account, credential, chat or whitelist data is included. Maintainer-authorized persona files are included as presets.\n';
   fs.writeFileSync(path.join(appDir, 'THIRD-PARTY-NOTICES.txt'), notices);
   copyFile(path.join(root, 'LICENSE'), path.join(appDir, 'LICENSE.txt'));
   if (stageOnly) {
@@ -253,15 +220,6 @@ export async function packageInstaller(workspace, { directory: root, files: sour
   const customNsis = path.join(stage, 'nsis-templates');
   fs.mkdirSync(customNsis, { recursive: true });
   copyTree(templateDir, customNsis);
-  let multiUser = fs.readFileSync(path.join(templateDir, 'multiUser.nsh'), 'utf8');
-  const originalFolderLookup = /      System::Store S[\s\S]*?      System::Store L\r?\n/;
-  if (!originalFolderLookup.test(multiUser))
-    throw new Error('NSIS per-user path template differs; inspect before building.');
-  multiUser = multiUser.replace(
-    originalFolderLookup,
-    '      # Current-user LocalAppData avoids the old System::Store memory fault.\n',
-  );
-  fs.writeFileSync(path.join(customNsis, 'multiUser.nsh'), multiUser);
   const assistedFile = path.join(customNsis, 'assistedInstaller.nsh');
   const assisted = fs.readFileSync(assistedFile, 'utf8');
   fs.writeFileSync(assistedFile, singleDirectoryTemplate(assisted));
@@ -292,23 +250,26 @@ export async function packageInstaller(workspace, { directory: root, files: sour
   process.env.ELECTRON_BUILDER_CACHE = path.join(workspace, 'state', 'installer-cache', 'electron-builder');
   process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
   process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL ??= '1';
+  const electronDist = path.dirname(require('electron'));
+  if (fs.readFileSync(path.join(electronDist, 'version'), 'utf8').trim().replace(/^v/, '') !== electronVersion)
+    throw Error('Electron binary version differs from the source snapshot. Run npm exec install-electron.');
   await build({
     targets: Platform.WINDOWS.createTarget('nsis', Arch.x64),
     config: {
-      appId: 'local.wechatagent.desktop',
-      productName: 'WeChatAgent',
+      appId,
+      productName,
       artifactName: 'WeChatAgent-Setup-' + version + '-${arch}.${ext}',
       buildVersion,
       directories: { app: appDir, output: path.join(workspace, 'release', 'installer'), buildResources: appDir },
-      electronDist: path.join(workspace, 'node_modules/electron/dist'),
-      electronVersion: '41.1.1',
+      electronDist,
+      electronVersion,
       asar: false,
       npmRebuild: false,
       buildDependenciesFromSource: false,
       files: ['**/*'],
       afterPack: async context =>
         embedExecutableIcon(
-          path.join(context.appOutDir, 'WeChatAgent.exe'),
+          path.join(context.appOutDir, executableName + '.exe'),
           path.join(appDir, 'icon.ico'),
           require('resedit'),
         ),
@@ -318,6 +279,7 @@ export async function packageInstaller(workspace, { directory: root, files: sour
         { from: path.join(stage, 'desktop-native'), to: 'desktop-native' },
       ],
       win: {
+        executableName,
         target: ['nsis'],
         icon: path.join(appDir, 'icon.ico'),
         signAndEditExecutable: false,

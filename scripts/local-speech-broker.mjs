@@ -13,6 +13,8 @@ import {
 } from './local-speech-owned.mjs';
 import { processIdentity } from './speech-process-identity.mjs';
 import { SpeechLeases } from './local-speech-leases.mjs';
+import { rosterFeatureSettings } from '../packages/plugin-api/catalog.mjs';
+import { activeOf, servicesOf } from '../optional-extensions/speech-synthesis/ui/providers.mjs';
 
 export function brokerPaths(root) {
   const canonical = fs.realpathSync(root);
@@ -48,7 +50,8 @@ export function normalizeServices(root, services, status) {
   for (const kind of ['asr', 'tts']) {
     if (services?.[kind]?.enabled !== true) continue;
     try {
-      result[kind] = normalizeService(root, kind, services[kind]);
+      // Match the workspace used by brokerPaths when deriving default profile paths.
+      result[kind] = normalizeService(fs.realpathSync(root), kind, services[kind]);
     } catch {
       status[kind] = 'failed';
     }
@@ -56,22 +59,65 @@ export function normalizeServices(root, services, status) {
   return result;
 }
 
-export async function modelControl(root, kind, operation, body, config = {}) {
+export const speechServiceRevision = service =>
+  service ? crypto.createHash('sha256').update(JSON.stringify(service)).digest('hex') : null;
+
+export async function modelControl(root, kind, operation, body, config = {}, signals = []) {
   if (!['asr', 'tts'].includes(kind) || !['status', 'load'].includes(operation))
     throw Error('LOCAL_SPEECH_REQUEST_INVALID');
   const key = fs.readFileSync(path.join(root, 'state/local-speech', kind + '.control.key'), 'utf8').trim();
   if (!/^[A-Za-z0-9_-]{32,128}$/.test(key)) throw Error('LOCAL_SPEECH_CONTROL_UNAVAILABLE');
+  const signal = AbortSignal.any([...signals, AbortSignal.timeout(operation === 'load' ? 180000 : 3000)]);
   const response = await fetch(`http://127.0.0.1:${localSpeechPort(kind, config)}/wca/${operation}`, {
     method: operation === 'load' ? 'POST' : 'GET',
     redirect: 'error',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     ...(operation === 'load' ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(operation === 'load' ? 180000 : 3000),
+    signal,
   });
   if (!response.ok) throw Error(response.status === 409 ? 'LOCAL_MODEL_REVISION_CHANGED' : 'LOCAL_MODEL_LOAD_FAILED');
   const result = await response.json();
+  signal.throwIfAborted();
   if (result.version !== 1) throw Error('LOCAL_SPEECH_PROTOCOL_INVALID');
   return result;
+}
+
+function cloudAddress(value) {
+  try {
+    const url = new URL(value);
+    return ['https:', 'wss:'].includes(url.protocol) && !/^(?:localhost(?:\.|$)|127\.|\[)/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+const SPEECH_ROUTE_FEATURES = {
+  asr: ['voice-input-v1', 'voice-dialogue-v1'],
+  tts: ['voice-output-v1', 'voice-dialogue-v1'],
+};
+
+function cloudSpeechRoute({ id, feature, settings }) {
+  if (id === 'speech-recognition') return feature === 'voice-input-v1' && cloudAddress(settings.endpoint);
+  if (id !== 'speech-synthesis') return false;
+  const services = servicesOf(settings);
+  if (feature === 'voice-input-v1' && services.recognition === 'off') return false;
+  const slot = feature !== 'voice-input-v1' ? 'tts' : services.recognition === 'realtime' ? 'realtimeAsr' : 'fileAsr';
+  const active = activeOf(services, slot);
+  if (!active.definition || active.definition.kind === 'gpt-sovits') return false;
+  return active.entry !== 'custom' || cloudAddress(active.profile.endpoint);
+}
+
+function cloudOnlyServices(root) {
+  try {
+    const features = [...new Set(Object.values(SPEECH_ROUTE_FEATURES).flat())];
+    const routes = rosterFeatureSettings(root, features);
+    return Object.keys(SPEECH_ROUTE_FEATURES).filter(kind => {
+      const relevant = routes.filter(route => SPEECH_ROUTE_FEATURES[kind].includes(route.feature));
+      return relevant.length > 0 && relevant.every(cloudSpeechRoute);
+    });
+  } catch {
+    return []; // An unreadable setting cannot establish a cloud-only switch.
+  }
 }
 
 export async function runBroker(root, { identify = processIdentity, owner = new OwnedSpeechProcesses(root) } = {}) {
@@ -81,7 +127,8 @@ export async function runBroker(root, { identify = processIdentity, owner = new 
   if (!identity) throw Error('LOCAL_SPEECH_OWNER_INVALID');
   const leases = new SpeechLeases({ identify });
   const sockets = new Map(),
-    configured = {};
+    configured = new Map();
+  const hasClients = () => [...leases.clients.keys()].some(id => sockets.get(id)?.destroyed === false);
   let stopping = false,
     idleSince = Date.now(),
     serial = Promise.resolve();
@@ -91,36 +138,60 @@ export async function runBroker(root, { identify = processIdentity, owner = new 
     return result;
   };
   const reconcile = async (retryFailed = false) => {
-    if (stopping) return;
-    // All consumers of this broker share one workspace and its atomic, operator-saved settings.
-    const invalid = {};
-    const desired = leases.clients.size
-      ? normalizeServices(
-          root,
-          JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8').replace(/^\uFEFF/, '')).runtime
-            ?.localSpeech ?? {},
-          invalid,
-        )
-      : {};
-    for (const kind of ['asr', 'tts']) {
-      if (configured[kind] && JSON.stringify(configured[kind]) !== JSON.stringify(desired[kind])) {
-        await owner.close(kind);
-        delete configured[kind];
+    while (!stopping) {
+      // All consumers of this broker share one workspace and its atomic, operator-saved settings.
+      const invalid = {};
+      const desired = hasClients()
+        ? normalizeServices(
+            root,
+            JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8').replace(/^\uFEFF/, ''))
+              .runtime?.localSpeech ?? {},
+            invalid,
+          )
+        : {};
+      const cloudOnly = desired.asr || desired.tts ? cloudOnlyServices(root) : [];
+      // Cancel every affected request before waiting for any service to stop.
+      const updates = ['asr', 'tts'].map(kind => {
+        const standby = !!desired[kind] && cloudOnly.includes(kind);
+        const service = standby ? undefined : desired[kind];
+        const previous = configured.get(kind);
+        const replacing = previous && JSON.stringify(previous.config) !== JSON.stringify(service);
+        if (replacing) previous.controller.abort(Error('LOCAL_MODEL_REVISION_CHANGED'));
+        return { kind, standby, service, replacing };
+      });
+      const replacements = updates.filter(update => update.replacing);
+      if (replacements.length) {
+        for (const { kind } of replacements) {
+          await owner.close(kind);
+          if (stopping) return;
+          configured.delete(kind);
+        }
+        // A save or disconnect can change the desired services while a process stops.
+        continue;
       }
-      if (invalid[kind]) owner.status[kind] = 'failed';
-      if (!invalid[kind] && !desired[kind] && owner.status[kind]) owner.status[kind] = 'stopped';
-      if (desired[kind] && !configured[kind]) {
-        configured[kind] = desired[kind];
-        owner.start({ [kind]: desired[kind] });
-      } else if (desired[kind] && retryFailed && owner.status[kind] === 'failed') {
-        owner.start({ [kind]: desired[kind] });
+      for (const { kind, standby, service } of updates) {
+        if (invalid[kind]) owner.status[kind] = 'failed';
+        if (standby) owner.status[kind] = 'standby';
+        else if (!invalid[kind] && !service && owner.status[kind]) owner.status[kind] = 'stopped';
+        const active = configured.get(kind);
+        if (
+          service &&
+          hasClients() &&
+          (!active || active.controller.signal.aborted || (retryFailed && owner.status[kind] === 'failed'))
+        ) {
+          active?.controller.abort(Error('LOCAL_MODEL_REVISION_CHANGED'));
+          configured.set(kind, { config: service, controller: new AbortController() });
+          owner.start({ [kind]: service });
+        }
       }
+      if (hasClients()) idleSince = null;
+      else idleSince ??= Date.now();
+      return;
     }
-    if (leases.clients.size) idleSince = null;
-    else idleSince ??= Date.now();
   };
   const server = net.createServer(socket => {
     const id = crypto.randomUUID();
+    const connection = new AbortController();
     let authorized = false,
       buffered = 0;
     sockets.set(id, socket);
@@ -159,6 +230,10 @@ export async function runBroker(root, { identify = processIdentity, owner = new 
         if (!authorized) {
           if (request.op !== 'hello' || request.token !== token) throw Error('LOCAL_SPEECH_UNAUTHORIZED');
           await leases.acquire(id, request.identity);
+          if (socket.destroyed || stopping) {
+            leases.release(id);
+            return;
+          }
           authorized = true;
           idleSince = null;
           return { version: 1 };
@@ -170,12 +245,22 @@ export async function runBroker(root, { identify = processIdentity, owner = new 
         }
         if (request.op === 'status') return owner.status;
         if (request.op === 'model') {
-          if (!configured[request.kind]?.enabled) throw Error('LOCAL_SPEECH_NOT_ENABLED');
-          if (owner.status[request.kind] !== 'ready') throw Error('LOCAL_SPEECH_NOT_READY');
+          const { kind, operation, body, serviceRevision } = request;
+          await reconcile();
+          if (socket.destroyed || stopping) return;
+          const service = configured.get(kind);
+          if (!service) throw Error('LOCAL_SPEECH_NOT_ENABLED');
+          // Loads bind both the service configuration and the profile revision in the request body.
+          if (operation === 'load' && serviceRevision !== speechServiceRevision(service.config))
+            throw Error('LOCAL_MODEL_REVISION_CHANGED');
+          if (owner.status[kind] !== 'ready') throw Error('LOCAL_SPEECH_NOT_READY');
           // The Python inference lock serializes model loading. Keep the lease
           // queue free so disconnects can stop even an unfinished model load.
           return {
-            modelRequest: modelControl(root, request.kind, request.operation, request.body, configured[request.kind]),
+            modelRequest: modelControl(root, kind, operation, body, service.config, [
+              connection.signal,
+              service.controller.signal,
+            ]),
           };
         }
         throw Error('LOCAL_SPEECH_REQUEST_INVALID');
@@ -194,6 +279,7 @@ export async function runBroker(root, { identify = processIdentity, owner = new 
     });
     socket.on('error', () => {});
     socket.on('close', () => {
+      connection.abort(Error('LOCAL_SPEECH_DISCONNECTED'));
       lines.close();
       sockets.delete(id);
       leases.release(id);
@@ -209,12 +295,20 @@ export async function runBroker(root, { identify = processIdentity, owner = new 
     server.once('error', reject);
     server.listen(locations.socket, resolve);
   });
-  fs.mkdirSync(path.dirname(locations.descriptor), { recursive: true });
-  fs.writeFileSync(locations.descriptor, JSON.stringify({ version: 1, ...identity, token }), { mode: 0o600 });
+  try {
+    fs.mkdirSync(path.dirname(locations.descriptor), { recursive: true });
+    fs.writeFileSync(locations.descriptor, JSON.stringify({ version: 1, ...identity, token }), { mode: 0o600 });
+  } catch (error) {
+    stopping = true;
+    for (const socket of sockets.values()) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+    throw error;
+  }
   const close = async () => {
     if (stopping) return;
     stopping = true;
     clearInterval(timer);
+    for (const { controller } of configured.values()) controller.abort(Error('LOCAL_SPEECH_DISCONNECTED'));
     for (const socket of sockets.values()) socket.destroy();
     server.close();
     await owner.close();

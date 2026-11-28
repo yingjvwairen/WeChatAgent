@@ -49,6 +49,7 @@ const attachment = /** @type {const} */ ([
   'beginOperation',
   'busy',
   'closed',
+  'config',
   'discardDraft',
   'freshAccount',
   'holdDraft',
@@ -57,7 +58,10 @@ const attachment = /** @type {const} */ ([
   'rememberImageDraft',
   'rememberPausedImage',
   'rememberResumedImage',
+  'recognize',
+  'refuseImageSubmission',
   'resetInputSession',
+  'root',
   'textResume',
 ]);
 export const attachmentAccess = owner => view(owner, attachment);

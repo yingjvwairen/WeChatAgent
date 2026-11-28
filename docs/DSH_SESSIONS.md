@@ -2,7 +2,7 @@
 
 ## 实现方式
 
-每个 `平台:聊天类型:数字ID` 对应一个当前使用的 DSH session。正常续聊与压缩继续使用同一 ID；用户在 DSH 归档当前会话后，该聊天的下一次配置／消息会创建新一代 session。旧记录继续归档，新会话从一次人格初始化开始。
+每个 `平台:聊天类型:完整标识` 对应一个当前使用的 DSH session。正常续聊与压缩继续使用同一 ID；用户在 DSH 归档当前会话后，该聊天的下一次配置／消息会创建新一代 session。旧记录继续归档，新会话从一次人格初始化开始。
 
 ```text
 首次进入／人格变化 → 移出旧人格初始化 → 补入一次当前人格 → 追加新消息
@@ -72,10 +72,10 @@ npm run sessions:status
 
 ## 使用原生压缩
 
-可以在 DSH 界面压缩对应 session；也可以调用管理命令，示例中的 ID 需要换成自己的白名单数字 ID：
+可以在 DSH 界面压缩对应 session；也可以调用管理命令，将示例中的会话键替换为控制台“聊天”中已授权的微信标识：
 
 ```powershell
-npm run sessions:compact -- wechat:private:123456
+npm run sessions:compact -- wechat:private:wxid_example
 ```
 
 不传会话键时，会压缩所有可解析的白名单会话。压缩通过 `ctx.compaction.compactNow` 完成，需要原生 Agent 空闲；正在回复时会返回忙碌，稍后重试。

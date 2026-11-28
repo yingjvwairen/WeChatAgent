@@ -1,10 +1,17 @@
 import { assistantNotificationText } from './decision-format.js';
 import { isSilentAssistantNotification } from '../../../../packages/dsh-social-bridge-plugin/assistant-notifications.mjs';
-import { assistantSenderAllowed } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
+import { assistantDeliveryAllowed } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import { matchesConversationGrant } from '../../../../packages/wechat-identity.mjs';
-import { conversationWorkMode } from '../../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
+import { replyDeliveryStatus } from '../../../../packages/delivery-contract.mjs';
 
-export function createAssistantNoticeDelivery({ adapter, plugin, settingsFor, isReady = () => true, log = () => {} }) {
+export function createAssistantNoticeDelivery({
+  adapter,
+  plugin,
+  settingsFor,
+  deliveryControls,
+  isReady = () => true,
+  log = () => {},
+}) {
   let running = false,
     stopped = false;
   const ready = () => !stopped && isReady() && adapter.stats.connected && !!adapter.selfId;
@@ -19,8 +26,7 @@ export function createAssistantNoticeDelivery({ adapter, plugin, settingsFor, is
         try {
           const w = settingsFor();
           if (
-            conversationWorkMode(w, notice.key) !== 'assistant' ||
-            !assistantSenderAllowed(w, notice.key, notice.sender) ||
+            !assistantDeliveryAllowed(w, notice.key, notice.sender) ||
             !matchesConversationGrant(w, notice.key, notice.rosterGrant)
           )
             continue;
@@ -31,19 +37,20 @@ export function createAssistantNoticeDelivery({ adapter, plugin, settingsFor, is
             await plugin.assistantTask(undefined, 'notification-ack', { localControl: true, id: notice.id });
             continue;
           }
+          const grant = notice.rosterGrant ?? 'legacy';
+          if (
+            deliveryControls &&
+            !deliveryControls.requireAssistantReply(notice.key, grant, [notice.id], notice.sender)
+          )
+            continue;
           const receipt = await adapter.sendText({
             kind,
             target,
             text,
             deliveryId: notice.id,
-            rosterGrant: notice.rosterGrant ?? 'legacy',
+            rosterGrant: grant,
           });
-          const confirmed =
-            receipt?.confirmed === true ||
-            (receipt?.accepted === true &&
-              receipt?.delivered === 'database-confirmed' &&
-              receipt?.response?.data?.receipt === 'wechat-server-id');
-          if (confirmed) {
+          if (replyDeliveryStatus(receipt) === 'confirmed') {
             await plugin.assistantTask(undefined, 'notification-ack', { localControl: true, id: notice.id });
             log(
               '[Assistant] notification_delivery=confirmed kind=' +

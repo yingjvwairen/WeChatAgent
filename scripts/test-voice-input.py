@@ -119,6 +119,13 @@ class VoiceBoundaries(unittest.TestCase):
             self.assertEqual(result['durationSeconds'], 0.02)
             self.assertEqual(base64.b64decode(result['b64']), FRAMED_SILK)
 
+    def test_reregistering_an_old_voice_does_not_evict_its_reference(self):
+        self.catalog.records.update({format(i, '064x'): {} for i in range(1000)})
+        self.assertEqual(self.catalog.remember('contact-alpha', self.payload, KEY), self.ref)
+        restarted = VoiceCatalog(self.root, self.account, lambda: True, grant_for=lambda _: 'grant')
+        self.assertEqual(restarted.record(self.ref['id'], KEY, 'speech-recognition')['localId'], 7)
+        self.assertEqual(len(restarted.records), 1000)
+
     def test_quoted_media_requires_one_registered_original_and_live_scope(self):
         reader = types.SimpleNamespace(
             root=self.root,

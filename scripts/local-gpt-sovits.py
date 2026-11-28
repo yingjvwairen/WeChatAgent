@@ -25,7 +25,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from local_model_control import control_routes, profile_revision, selected_profile, save_selection
+from local_model_control import control_routes, profile_data, profile_revision, selected_profile, save_selection
 
 MODEL_SCHEMA = json.loads(
     (Path(__file__).resolve().parents[1] / 'packages/speech-contract/local-model-fields.json').read_text(
@@ -55,10 +55,10 @@ def split_voice_text(text):
             yield part
 
 
-def profiles_from(file, root):
-    if file.stat().st_size > 262144:
-        raise ValueError('Profile file is too large')
-    rows = json.loads(file.read_text(encoding='utf-8-sig'))
+def profiles_from(file, root, *, data=None):
+    if data is None:
+        data = profile_data(file)
+    rows = json.loads(data.decode('utf-8-sig'))
     if not isinstance(rows, dict) or not 1 <= len(rows) <= 64:
         raise ValueError('Configure 1 to 64 named voices')
     result = {}
@@ -150,6 +150,10 @@ class VoiceService:
         self.phase = 'starting'
         self.loaded_signature = None
 
+    def unload(self):
+        self.current = self.engine = self.loaded_signature = None
+        gc.collect()
+
     def preload(self, name):
         profile = self.profiles[name]
         signature = tuple(
@@ -164,8 +168,7 @@ class VoiceService:
         )
         if self.current == name and self.loaded_signature == signature:
             return
-        self.current = self.engine = None
-        gc.collect()
+        self.unload()
         self.engine = self.load(self.profiles[name])
         self.current = name
         self.loaded_signature = signature
@@ -238,8 +241,11 @@ class VoiceService:
         return data.getvalue()
 
 
-def create_app(voices, key, *, control_key=None, reload_profiles=None, revision=None, selection_file=None):
+def create_app(
+    voices, key, *, control_key=None, reload_profiles=None, revision=None, loaded_revision=None, selection_file=None
+):
     lock = asyncio.Lock()
+    current_revision = revision or (lambda: profile_revision(profile_data(None, voices.profiles)))
 
     def authorize(request):
         token = request.headers.get('authorization', '').encode('latin-1')
@@ -300,8 +306,9 @@ def create_app(voices, key, *, control_key=None, reload_profiles=None, revision=
             voices,
             control_key,
             lock,
-            reload_profiles or (lambda: voices.profiles),
-            revision or (lambda: profile_revision(None, voices.profiles)),
+            reload_profiles or (lambda: (voices.profiles, current_revision())),
+            current_revision,
+            loaded_revision or current_revision(),
             selection_file,
         )
     )
@@ -322,7 +329,12 @@ def main(run_server=None):
     root = args.model_root.resolve(strict=True)
     profile_file = args.profiles.resolve()
     selection_file = args.selection_file.resolve() if args.selection_file else None
-    profiles = profiles_from(profile_file, root)
+
+    def snapshot():
+        data = profile_data(profile_file)
+        return profiles_from(profile_file, root, data=data), profile_revision(data)
+
+    profiles, loaded_revision = snapshot()
     selected = selected_profile(selection_file, profiles, args.preload)
     if selected not in profiles or not 1 <= args.port <= 65535:
         parser.error('Unknown preload profile or invalid port')
@@ -347,8 +359,9 @@ def main(run_server=None):
                 voices,
                 key,
                 control_key=control_key,
-                reload_profiles=lambda: profiles_from(profile_file, root),
-                revision=lambda: profile_revision(profile_file, voices.profiles),
+                reload_profiles=snapshot,
+                revision=lambda: profile_revision(profile_data(profile_file)),
+                loaded_revision=loaded_revision,
                 selection_file=selection_file,
             ),
             host='127.0.0.1',

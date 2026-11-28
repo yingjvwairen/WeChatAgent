@@ -1,4 +1,4 @@
-import { validChatKey } from '../wechat-identity.mjs';
+import { validChatKey, validReaderOrder } from '../wechat-identity.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -103,15 +103,21 @@ export class HistoryStore {
         this.db.prepare('INSERT OR REPLACE INTO metadata VALUES(?,?)').run('search-revision', '2');
       });
   }
-  transaction(action) {
-    this.db.exec('BEGIN IMMEDIATE');
+  transaction(action, { waitForLock = true } = {}) {
+    const timeout = waitForLock ? undefined : this.db.prepare('PRAGMA busy_timeout').get().timeout;
+    if (timeout !== undefined) this.db.exec('PRAGMA busy_timeout=0');
     try {
-      const result = action();
-      this.db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = action();
+        this.db.exec('COMMIT');
+        return result;
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      if (timeout !== undefined) this.db.exec('PRAGMA busy_timeout=' + timeout);
     }
   }
   hasIncoming(key, message) {
@@ -123,7 +129,7 @@ export class HistoryStore {
     const body = JSON.parse(row.body);
     return !body.outgoing;
   }
-  append(key, row, { source = 'bridge', fullText = row.text } = {}) {
+  append(key, row, { source = 'bridge', fullText = row.text, waitForLock = true } = {}) {
     if (!validKey(key)) throw Error('HISTORY_CHAT_INVALID');
     const id = row.delivery_id
       ? 'delivery:' + row.delivery_id
@@ -162,20 +168,41 @@ export class HistoryStore {
         .map(k => [k, row[k]]),
     );
     body.text = String(fullText ?? '');
-    body.images = (row.images ?? []).filter(x => /^[a-f0-9]{64}$/.test(x?.id ?? '')).map(x => ({ id: x.id }));
+    body.images = (row.images ?? [])
+      .filter(image => /^[a-f0-9]{64}$/.test(image?.id ?? ''))
+      .map(image => ({
+        id: image.id,
+        ...(image.quoted === true ? { quoted: true } : {}),
+        ...(Number.isInteger(image.forwardItem) && body.forwardedRecord?.items?.[image.forwardItem - 1]
+          ? { forwardItem: image.forwardItem }
+          : {}),
+      }));
     if (row.contextOnly === true) body.contextOnly = true;
     if (row.attachmentUnavailable === true) body.attachmentUnavailable = true;
     if (row.quoteKind) body.quoteKind = row.quoteKind;
     const at = Number(row.timestamp) || Date.now() / 1000;
-    return this.transaction(() => {
-      const previous = this.db.prepare('SELECT seq,body,text FROM records WHERE chat=? AND id=?').get(key, id);
+    const write = () => {
+      const previous = this.db.prepare('SELECT seq,at,body,text FROM records WHERE chat=? AND id=?').get(key, id);
       // A restart backfill must never replace a full text with its 4000-char buffer copy.
       if (previous) {
         const old = JSON.parse(previous.body);
         if (old.text.length > body.text.length && old.text.startsWith(body.text)) body.text = old.text;
         if (old.delivery_status === 'confirmed' && body.delivery_status !== 'confirmed') return previous.seq;
-        if (old.delivery_status === 'confirmed') body.delivery_status = 'confirmed';
-        if (JSON.stringify(body) !== previous.body) {
+        if (old.delivery_status === 'confirmed') {
+          body.delivery_status = 'confirmed';
+          if (old.outgoing && validReaderOrder(old.readerOrder) && !validReaderOrder(body.readerOrder)) {
+            body.readerOrder = old.readerOrder;
+            body.timestamp = old.timestamp;
+          }
+        }
+        const position =
+          body.outgoing &&
+          body.delivery_status === 'confirmed' &&
+          validReaderOrder(body.readerOrder) &&
+          Number(body.readerOrder.slice(0, 20)) === Number(body.timestamp)
+            ? Number(body.timestamp)
+            : previous.at;
+        if (JSON.stringify(body) !== previous.body || position !== previous.at) {
           const text = searchableText(body);
           if (text !== previous.text || body.sender_name !== old.sender_name) {
             this.db
@@ -185,7 +212,9 @@ export class HistoryStore {
               .prepare('INSERT INTO search(rowid,terms) VALUES(?,?)')
               .run(previous.seq, terms(text + ' ' + (body.sender_name ?? '')));
           }
-          this.db.prepare('UPDATE records SET body=?,text=? WHERE seq=?').run(JSON.stringify(body), text, previous.seq);
+          this.db
+            .prepare('UPDATE records SET at=?,body=?,text=? WHERE seq=?')
+            .run(position, JSON.stringify(body), text, previous.seq);
         }
         return previous.seq;
       }
@@ -197,7 +226,8 @@ export class HistoryStore {
         .prepare('INSERT INTO search(rowid,terms) VALUES(?,?)')
         .run(result.lastInsertRowid, terms(text + ' ' + (body.sender_name ?? '')));
       return Number(result.lastInsertRowid);
-    });
+    };
+    return this.transaction(write, { waitForLock });
   }
   backfill(key, rows) {
     for (const row of rows) this.append(key, row, { source: 'buffer-backfill' });

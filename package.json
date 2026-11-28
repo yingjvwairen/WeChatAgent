@@ -1,6 +1,6 @@
 {
   "name": "wechatagent",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "private": true,
   "type": "module",
   "description": "Personal WeChat AI assistant with NT database reading, desktop OCR/UIA sending and an external DSH desktop",
@@ -43,6 +43,9 @@
     "test:catalog": "node --test scripts/test-plugin-catalog.mjs scripts/test-extension-page.mjs scripts/test-persona-categories.mjs",
     "test:assistant-access": "node --test scripts/test-assistant-access.mjs scripts/test-assistant-mode.mjs scripts/test-native-session.mjs",
     "test": "node scripts/run-tests.mjs",
+    "check": "node scripts/check-project.mjs",
+    "check:integration": "node scripts/check-project.mjs --require-sdk",
+    "lint": "eslint . --max-warnings=0",
     "test:assistant-controller": "node --test scripts/test-assistant-controller.mjs scripts/test-assistant-mode.mjs scripts/test-assistant-access.mjs scripts/test-file-transfers.mjs scripts/test-assistant-feedback.mjs",
     "test:assistant-feedback": "node --test scripts/test-assistant-feedback.mjs",
     "test:layout": "node --test scripts/test-workspace-layout.mjs scripts/test-extension-page.mjs",
@@ -72,18 +75,25 @@
     "test:python": "node scripts/run-tests.mjs --python",
     "test:integration": "node scripts/run-tests.mjs --require-sdk",
     "desktop:draft-inspect": "node scripts/desktop-sender/draft-probe.mjs --inspect",
+    "desktop:window-probe": "node scripts/window-message-probe.mjs",
     "media:prepare": "python scripts/prepare-local-whisper.py --download",
-    "media:check": "python scripts/prepare-local-whisper.py",
-    "desktop:window-probe": "node scripts/window-message-probe.mjs"
+    "media:check": "python scripts/prepare-local-whisper.py"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
     "7zip-bin": "5.2.0",
-    "electron": "41.1.1",
-    "electron-builder": "26.8.1",
+    "electron": "43.8.12",
+    "electron-builder": "26.18.0",
+    "eslint": "10.15.0",
+    "globals": "17.14.0",
     "prettier": "3.10.1",
     "resedit": "1.7.2",
-    "sharp": "0.34.5"
+    "sharp": "0.35.5",
+    "typescript": "5.9.3",
+    "yaml": "2.9.1"
   },
-  "releaseVersion": "0.4.5"
+  "overrides": {
+    "minimatch@>=7.0.0 <11.0.1": "11.0.9"
+  },
+  "releaseVersion": "0.4.6"
 }

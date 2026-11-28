@@ -4,7 +4,7 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
-import { brokerPaths, normalizeServices } from './local-speech-broker.mjs';
+import { brokerPaths, normalizeServices, speechServiceRevision } from './local-speech-broker.mjs';
 import { processIdentity } from './speech-process-identity.mjs';
 export { managedSpeechCommand } from './local-speech-owned.mjs';
 
@@ -53,7 +53,8 @@ export class LocalSpeechProcesses {
     const identity = await this.identify(process.pid);
     if (!identity) throw Error('LOCAL_SPEECH_OWNER_INVALID');
     const locations = brokerPaths(this.root);
-    let launched = false;
+    let launchAttempts = 0;
+    let launching = false;
     const deadline = Date.now() + 15000;
     while (!this.closed && Date.now() < deadline) {
       let socket;
@@ -121,14 +122,18 @@ export class LocalSpeechProcesses {
       } catch {
         socket?.destroy();
         this.socket = null;
-        if (!launched && !this.closed) {
-          launched = true;
+        if (!launching && launchAttempts < 2 && !this.closed) {
+          launching = true;
+          launchAttempts++;
           const child = this.spawn(
             this.nodeExecutable,
             [path.join(this.root, 'scripts/local-speech-broker.mjs'), this.root],
             { cwd: this.root, windowsHide: true, detached: true, stdio: 'ignore', shell: false },
           );
           child.on('error', () => {});
+          child.once('close', () => {
+            launching = false;
+          });
           child.unref();
         }
         await delay(100);
@@ -166,9 +171,11 @@ export class LocalSpeechProcesses {
     } while (Date.now() < deadline);
     throw Error('LOCAL_SPEECH_TIMEOUT');
   }
-  async model(kind, operation, body) {
+  async model(kind, operation, body, beforeRequest) {
+    const serviceRevision = speechServiceRevision(this.services[kind]);
     await this.ready(kind);
-    return this.request('model', { kind, operation, body });
+    beforeRequest?.();
+    return this.request('model', { kind, operation, body, serviceRevision });
   }
   modelStatus(kind) {
     return this.request('model', { kind, operation: 'status' });

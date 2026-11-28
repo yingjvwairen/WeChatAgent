@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import pathlib
 import tempfile
 import time
@@ -14,7 +15,7 @@ class Files(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = pathlib.Path(self.temp.name)
+        self.root = pathlib.Path(self.temp.name).resolve()
         self.account = self.root / 'account'
         (self.account / 'msg/file/2026-10').mkdir(parents=True)
         (self.root / 'config').mkdir()
@@ -86,7 +87,7 @@ class Files(unittest.TestCase):
         result = restarted.resolve(ref, KEY, SENDER)
         self.assertEqual(result['status'], 'ready')
         self.assertEqual(result['sha256'], hashlib.sha256(data).hexdigest())
-        self.assertEqual(pathlib.Path(result['path']), target)
+        self.assertEqual(pathlib.Path(result['path']), target.resolve())
 
     def test_not_downloaded_returns_immediately_and_unauthorized_refs_are_rejected(self):
         ref = self.remember()['id']
@@ -101,16 +102,65 @@ class Files(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.catalog.resolve(ref, KEY, SENDER)
 
-    def test_no_digest_never_exposes_a_unique_matching_name_and_size(self):
-        (self.account / 'msg/file/2026-10/报告.txt').write_bytes(b'wrong data')
+    def test_reregistering_an_old_file_does_not_evict_its_reference(self):
+        original = self.remember()
+        self.catalog.records.update({format(i, '064x'): {} for i in range(1000)})
+        self.assertEqual(self.remember(), original)
+        restarted = FileCatalog(self.reader)
+        self.assertEqual(restarted.resolve(original['id'], KEY, SENDER)['status'], 'not_downloaded')
+        self.assertEqual(len(restarted.records), 1000)
+
+    def test_no_digest_uses_only_a_unique_recent_cache_file(self):
+        target = self.account / 'msg/file/2026-10/报告.txt'
+        target.write_bytes(b'wrong data')
         ref = self.remember()['id']
         self.assertEqual(self.catalog.resolve(ref, KEY, SENDER)['status'], 'integrity_failed')
-        info = self.info()
-        info['md5'] = ''
-        self.remember(info)
+        target.write_bytes(b'file proof')
+        ref = self.remember({**self.info(), 'md5': ''})['id']
+        duplicate = self.account / 'FileStorage/File/报告.txt'
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_bytes(b'file proof')
+        stale = self.row['createTime'] - 121
+        os.utime(duplicate, (stale, stale))
         result = self.catalog.resolve(ref, KEY, SENDER)
-        self.assertEqual(result['status'], 'unverified')
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(pathlib.Path(result['path']), target.resolve())
+        now = time.time()
+        os.utime(duplicate, (now, now))
+        result = self.catalog.resolve(ref, KEY, SENDER)
+        self.assertEqual(result['status'], 'ambiguous')
         self.assertNotIn('path', result)
+
+    def test_local_confirmation_pins_no_digest_attachment_to_its_bytes_and_grant(self):
+        info = {**self.info(), 'md5': ''}
+        target = self.account / 'msg/file/2026-10' / info['name']
+        target.write_bytes(b'file proof')
+        duplicate = self.account / 'msg/file' / info['name']
+        duplicate.write_bytes(b'file proof')
+        ref = self.remember(info)['id']
+        self.assertEqual(self.catalog.resolve(ref, KEY, SENDER)['status'], 'ambiguous')
+        outside = self.root / info['name']
+        outside.write_bytes(b'file proof')
+        with self.assertRaises(PermissionError):
+            self.catalog.confirm(ref, str(outside), KEY, self.generation)
+        for key, grant in [('wechat:group:124@chatroom', self.generation), (KEY, 'another-grant')]:
+            with self.assertRaises(PermissionError):
+                self.catalog.confirm(ref, str(target), key, grant)
+        with self.assertRaises(ValueError):
+            target.write_bytes(b'incomplete file')
+            self.catalog.confirm(ref, str(target), KEY, self.generation)
+        target.write_bytes(b'file proof')
+        self.assertEqual(self.catalog.confirm(ref, str(target), KEY, self.generation)['status'], 'confirmed')
+
+        restarted = FileCatalog(self.reader)
+        result = restarted.resolve(ref, KEY, SENDER)
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['sha256'], hashlib.sha256(b'file proof').hexdigest())
+        target.write_bytes(b'other data')
+        self.assertEqual(restarted.resolve(ref, KEY, SENDER)['code'], 'FILE_LOCAL_CONFIRMATION_CHANGED')
+        self.generation = 'second'
+        with self.assertRaises(PermissionError):
+            restarted.resolve(ref, KEY, SENDER)
 
     def test_recalled_source_cannot_reuse_an_attachment_from_the_cache(self):
         (self.account / 'msg/file/2026-10/报告.txt').write_bytes(b'file proof')

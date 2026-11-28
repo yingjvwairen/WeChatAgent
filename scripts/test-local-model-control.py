@@ -1,8 +1,10 @@
-"""Operator loading uses fake model engines and real loopback ASGI requests."""
+"""Operator loading uses fake model engines with ASGI and loopback requests."""
 
+import asyncio
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -59,6 +61,38 @@ def call(origin, route, body=None, key='operator'):
         timeout=6,
     ) as response:
         return response.read()
+
+
+async def load_status(app, body, key, disconnected=None):
+    data = json.dumps(body).encode()
+    incoming = [{'type': 'http.request', 'body': data, 'more_body': False}]
+    outgoing = []
+
+    async def receive():
+        if incoming:
+            return incoming.pop()
+        if disconnected is not None and disconnected.is_set():
+            return {'type': 'http.disconnect'}
+        await asyncio.Future()
+
+    async def send(message):
+        outgoing.append(message)
+
+    await app(
+        {
+            'type': 'http',
+            'method': 'POST',
+            'path': '/wca/load',
+            'headers': [
+                (b'authorization', ('Bearer ' + key).encode()),
+                (b'content-type', b'application/json'),
+                (b'content-length', str(len(data)).encode()),
+            ],
+        },
+        receive,
+        send,
+    )
+    return next(message['status'] for message in outgoing if message['type'] == 'http.response.start')
 
 
 class ControlTests(unittest.TestCase):
@@ -130,14 +164,12 @@ class ControlTests(unittest.TestCase):
                 'speech',
                 control_key='operator',
                 revision=lambda: 'revision',
-                reload_profiles=lambda: rows,
+                reload_profiles=lambda: (rows, 'revision'),
                 selection_file=selection,
             )
+            denied = asyncio.run(load_status(app, {'profile': 'two', 'revision': 'revision'}, 'speech'))
+            self.assertEqual(denied, 401)
             with running(app) as origin:
-                with self.assertRaises(HTTPError) as denied:
-                    call(origin, '/wca/load', {'profile': 'two', 'revision': 'revision'}, key='speech')
-                self.assertEqual(denied.exception.code, 401)
-                denied.exception.close()
                 with self.assertRaises(HTTPError) as changed:
                     call(origin, '/wca/load', {'profile': 'two', 'revision': 'old'})
                 self.assertEqual(changed.exception.code, 409)
@@ -153,6 +185,47 @@ class ControlTests(unittest.TestCase):
                 rows['two']['refAudio'] = 'replacement.wav'
                 call(origin, '/wca/load', {'profile': 'two', 'revision': 'revision'})
                 self.assertEqual(calls[-1], ('load', 'replacement.wav'))
+
+    def test_disconnected_model_load_keeps_the_previous_selection_and_can_retry(self):
+        for kind in ('asr', 'tts'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                selection = folder / 'selected.json'
+                selection.write_text('{"version": 1, "profile": "one"}', encoding='utf-8')
+                original = selection.read_bytes()
+                disconnected = threading.Event()
+
+                if kind == 'asr':
+                    profiles = {name: (folder / name, '', '') for name in ('one', 'two')}
+                    service = asr.Recognizer(profiles, lambda _: object())
+                    create_app = asr.create_app
+                else:
+                    profiles = {name: {'refAudio': name} for name in ('one', 'two')}
+                    service = tts.VoiceService(profiles, lambda _: object())
+                    service.preload('one')
+                    create_app = tts.create_app
+                preload = service.preload
+
+                def finish_and_disconnect(name):
+                    preload(name)
+                    disconnected.set()
+
+                service.preload = finish_and_disconnect
+                app = create_app(
+                    service, 'speech', control_key='operator', revision=lambda: 'r', selection_file=selection
+                )
+                for name, current, phase in (('one', 'one', 'ready'), ('two', None, 'failed')):
+                    disconnected.clear()
+                    result = asyncio.run(load_status(app, {'profile': name, 'revision': 'r'}, 'operator', disconnected))
+                    self.assertTrue(disconnected.is_set())
+                    self.assertEqual(result, 408)
+                    self.assertEqual(service.selected, 'one')
+                    self.assertEqual((service.current, service.phase), (current, phase))
+                    self.assertEqual(selection.read_bytes(), original)
+
+                self.assertEqual(asyncio.run(load_status(app, {'profile': 'two', 'revision': 'r'}, 'operator')), 200)
+                self.assertEqual(service.selected, 'two')
+                self.assertEqual(json.loads(selection.read_bytes())['profile'], 'two')
 
     def test_use_serializes_with_inflight_synthesis(self):
         rendering, release, loaded_second = threading.Event(), threading.Event(), threading.Event()
@@ -249,6 +322,60 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(changed.exception.code, 409)
             changed.exception.close()
             self.assertEqual(voices.phase, 'failed')
+            self.assertIsNone(json.loads(call(origin, '/wca/status'))['loadedProfile'])
+
+    def test_failed_asr_selection_write_releases_only_the_uncommitted_model(self):
+        rows = {'one': (Path('one'), 'zh', ''), 'two': (Path('two'), 'zh', '')}
+        for requested in ('one', 'two'):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as folder:
+                selection = Path(folder) / 'blocked-selection.json'
+                selection.mkdir()
+                recognizer = asr.Recognizer(rows, lambda path: object())
+                app = asr.create_app(
+                    recognizer,
+                    'speech',
+                    control_key='operator',
+                    revision=lambda: 'r',
+                    selection_file=selection,
+                )
+                with running(app) as origin:
+                    with self.assertRaises(HTTPError) as failed:
+                        call(origin, '/wca/load', {'profile': requested, 'revision': 'r'})
+                    self.assertEqual(failed.exception.code, 503)
+                    failed.exception.close()
+                    status = json.loads(call(origin, '/wca/status'))
+                    self.assertEqual(status['phase'], 'failed')
+                    self.assertEqual(status['selectedProfile'], 'one')
+                    self.assertEqual(status['loadedProfile'], 'one' if requested == 'one' else None)
+
+    def test_saving_an_existing_profile_does_not_change_the_loaded_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'profiles.json'
+            path.write_text(json.dumps({'voice': {'refAudio': 'before.wav'}}), encoding='utf-8')
+
+            def revision():
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
+            voices = tts.VoiceService(json.loads(path.read_text(encoding='utf-8')), lambda row: row['refAudio'])
+            voices.preload('voice')
+            app = tts.create_app(
+                voices,
+                'speech',
+                control_key='operator',
+                revision=revision,
+                reload_profiles=lambda: (json.loads(path.read_text(encoding='utf-8')), revision()),
+            )
+            with running(app) as origin:
+                original = json.loads(call(origin, '/wca/status'))
+                path.write_text(json.dumps({'voice': {'refAudio': 'after.wav'}}), encoding='utf-8')
+                saved = revision()
+                self.assertNotEqual(saved, original['revision'])
+                self.assertEqual(json.loads(call(origin, '/wca/status')), original)
+                self.assertEqual(voices.engine, 'before.wav')
+                result = json.loads(call(origin, '/wca/load', {'profile': 'voice', 'revision': saved}))
+                self.assertEqual(result['revision'], saved)
+                self.assertEqual(json.loads(call(origin, '/wca/status'))['revision'], saved)
+                self.assertEqual(voices.engine, 'after.wav')
 
 
 if __name__ == '__main__':

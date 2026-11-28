@@ -32,7 +32,13 @@ MODELS = {
         '3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671',
     ),
 }
-REQUIREMENTS = ['faster-whisper==1.2.1', 'starlette==1.10.0', 'uvicorn==0.54.0', 'python-multipart==0.0.32']
+REQUIREMENTS = [
+    'faster-whisper==1.2.1',
+    'av==15.1.0',  # faster-whisper 1.2.1 still calls av.open(metadata_errors=...).
+    'starlette==1.10.0',
+    'uvicorn==0.54.0',
+    'python-multipart==0.0.32',
+]
 
 
 def verified(file, size, digest):
@@ -94,6 +100,10 @@ def main():
         subprocess.run([str(python), '-m', 'pip', 'install', *REQUIREMENTS], check=True)
     subprocess.run([str(python), '-IB', '-c', 'import faster_whisper, starlette, uvicorn, multipart'], check=True)
     prepare_model(args.model, directory, args.download)
+    subprocess.run(
+        [str(python), '-IB', str(ROOT / 'scripts/local-whisper.py'), '--model-dir', str(directory), '--check'],
+        check=True,
+    )
     print(f'Python: {python}\nModel: {directory}')
 
 

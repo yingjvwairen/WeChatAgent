@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { HistoryStore } from '../packages/dsh-social-bridge-plugin/history-store.mjs';
 import {
   historyPolicy,
@@ -132,6 +133,147 @@ test('archive stores untruncated messages before buffer eviction, deduplicates a
   assert(store.search(key, '确认').length);
   assert.equal(store.search(key, '提交').length, 0);
 });
+for (const kind of ['quote', 'forwarded record']) {
+  test('an archived reply keeps its own identity and material after ' + kind, t => {
+    const f = fixture(t);
+    const archive = f.open();
+    const file = path.join(f.root, 'buffer.json');
+    let buffer = new MessageBuffer(file, { archive });
+    const marker = 'originalattachmentmarker';
+    const material =
+      kind === 'quote'
+        ? {
+            quoteReply: {
+              version: 1,
+              reply: '引用来信',
+              reference: {
+                senderId: 'peer',
+                senderName: '发件人',
+                conversationId: '456@chatroom',
+                messageId: '100',
+                time: '',
+                kind: '1',
+                text: marker,
+                senderRelation: 'other',
+              },
+            },
+          }
+        : {
+            forwardedRecord: {
+              version: 1,
+              title: '转发的内容',
+              items: [{ sender: '发件人', text: marker, time: '', depth: 0, kind: '1' }],
+            },
+          };
+    const incoming = buffer.append({
+      ...row(1, '收到的来信'),
+      kind: 'group',
+      conversation_id: '456@chatroom',
+      sender_key: 'd'.repeat(64),
+      self_id: 'fixture-owner',
+      images: [{ id: 'e'.repeat(64) }],
+      attachmentUnavailable: true,
+      ...material,
+    });
+    const deliveryId = 'f'.repeat(64);
+    const reply = {
+      ...incoming,
+      sender_id: 'fixture-owner',
+      timestamp: incoming.timestamp + 1,
+      text: '已发送的长回复'.repeat(900),
+      delivery_status: 'confirmed',
+    };
+    const archivedReply = () => archive.rows(other).find(item => item.delivery_id === deliveryId);
+
+    if (kind === 'forwarded record') {
+      const rename = fs.renameSync;
+      const failure = t.mock.method(fs, 'renameSync', (from, target) => {
+        if (target === file) throw Error('fixture buffer update failed');
+        return rename(from, target);
+      });
+      try {
+        assert.throws(() => buffer.recordReplyPart(other, { deliveryId }, reply), /fixture buffer update failed/);
+      } finally {
+        failure.mock.restore();
+      }
+      const id = archivedReply().id;
+      buffer = new MessageBuffer(file, { archive });
+      buffer.recordReplyPart(other, { deliveryId }, reply);
+      assert.equal(archivedReply().id, id);
+    } else buffer.recordReplyPart(other, { deliveryId }, reply);
+
+    const first = archivedReply();
+    assert.equal(first.id, buffer.findReplyPart(other, deliveryId).id);
+    assert.notEqual(first.id, incoming.id);
+    assert.equal(first.sender_id, 'fixture-owner');
+    assert.equal(first.self_id, 'fixture-owner');
+    assert.equal(first.sender_key, undefined);
+    assert.equal(first.quoteReply, undefined);
+    assert.equal(first.quoteKind, undefined);
+    assert.equal(first.forwardedRecord, undefined);
+    assert.equal(first.attachmentUnavailable, undefined);
+    assert.deepEqual(first.images, []);
+    assert.equal(first.text, reply.text);
+    assert.equal(archive.search(other, marker).length, 1);
+    const context = archive.recent(other, { ...policy, recentChars: 16000 }, [incoming.id]);
+    assert.deepEqual(
+      context.map(item => item.delivery_id),
+      [deliveryId],
+    );
+
+    new MessageBuffer(file, { archive });
+    assert.deepEqual(archivedReply(), first);
+  });
+}
+
+test('a background archive attempt returns promptly when another connection holds the write lock', t => {
+  const archive = fixture(t).open();
+  const other = new DatabaseSync(archive.file);
+  other.exec('BEGIN IMMEDIATE');
+  try {
+    const started = performance.now();
+    assert.throws(() => archive.append(key, row(1), { waitForLock: false }), { code: 'ERR_SQLITE_ERROR' });
+    assert(performance.now() - started < 4000);
+    assert.equal(archive.db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+  } finally {
+    other.close();
+  }
+  assert(archive.append(key, row(1), { waitForLock: false }));
+  assert.equal(archive.db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+});
+
+for (const restart of [false, true]) {
+  test('confirmed delivery remains durable during an archive write error, restart=' + restart, async t => {
+    const f = fixture(t);
+    const archive = f.open();
+    const file = path.join(f.root, 'buffer.json');
+    const options = { archive, maxPerChat: 10 };
+    let buffer = new MessageBuffer(file, options);
+    const item = { deliveryId: 'f'.repeat(64) };
+    const fullText = '收到明确送达确认的完整正文'.repeat(450);
+    const target = { ...row(1), sender_id: 'fixture-owner', text: fullText, delivery_status: 'confirmed' };
+    const write = archive.append.bind(archive);
+    const outage = t.mock.method(archive, 'append', (key, row, options) => {
+      if (row.delivery_id === item.deliveryId)
+        throw Object.assign(Error('fixture SQLite unavailable'), { code: 'ERR_SQLITE_ERROR' });
+      return write(key, row, options);
+    });
+    assert.doesNotThrow(() => buffer.recordReplyPart(key, item, target));
+    for (let n = 2; n <= 21; n++) buffer.append(row(n), { skipReason: 'context_only' });
+    assert.equal(buffer.findReplyPart(key, item.deliveryId)?.delivery_status, 'confirmed');
+    assert(!archive.rows(key).some(row => row.delivery_id === item.deliveryId));
+
+    outage.mock.restore();
+    if (restart) buffer = new MessageBuffer(file, options);
+    else assert.equal(await buffer.retryPendingArchives(), 0);
+
+    const result = archive.rows(key).find(row => row.delivery_id === item.deliveryId);
+    assert.equal(result?.text, fullText);
+    assert.equal(result.delivery_status, 'confirmed');
+    assert([...buffer.chats.values()].flat().every(row => !row.archivePending && row.archiveText === undefined));
+  });
+}
+
 test('Chinese and English retrieval is bounded, scoped and does not expose unrelated or reasoning content', t => {
   const f = fixture(t),
     a = f.open(),
@@ -187,6 +329,68 @@ test('expanding history uses Reader order for messages that arrived out of order
     chronological,
   );
 });
+for (const prior of ['new receipt', 'unchanged delivery ID from an unconfirmed row']) {
+  test('a late outgoing receipt uses the Reader order within the same second, ' + prior, t => {
+    const f = fixture(t);
+    const archive = f.open();
+    const file = path.join(f.root, 'buffer.json');
+    const buffer = new MessageBuffer(file, { archive });
+    const stamp = 1000;
+    const order = id => String(stamp).padStart(20, '0') + '-' + String(id).padStart(20, '0') + '-' + 'a'.repeat(64);
+    const input = (n, text) => ({ ...row(n, text), timestamp: stamp, readerOrder: order(n) });
+    const early = input(10, '先到的来信');
+    buffer.append(early);
+    const lateId = { deliveryId: 'b'.repeat(64) };
+    buffer.recordReplyPart(
+      key,
+      lateId,
+      { ...early, text: '较新的回复', delivery_status: 'confirmed' },
+      { inSendOrder: true, receiptOrder: order(30) },
+    );
+    buffer.append(input(40, '后到的来信'));
+    const oldId = { deliveryId: 'c'.repeat(64) };
+    let previousSeq;
+    if (prior !== 'new receipt') {
+      buffer.recordReplyPart(key, oldId, {
+        ...early,
+        text: '较早的回复',
+        timestamp: stamp + 5,
+        delivery_status: 'unconfirmed',
+      });
+      const uncertain = archive.rows(key).find(entry => entry.delivery_id === oldId.deliveryId);
+      assert.equal(uncertain.readerOrder, undefined);
+      previousSeq = uncertain.archiveSeq;
+    }
+    buffer.recordReplyPart(
+      key,
+      oldId,
+      { ...early, text: '较早的回复', delivery_status: 'confirmed' },
+      { inSendOrder: true, receiptOrder: order(20) },
+    );
+    const expected = ['先到的来信', '较早的回复', '较新的回复', '后到的来信'];
+    assert.deepEqual(
+      buffer.recent(key).map(entry => entry.text),
+      expected,
+    );
+    const rows = archive.rows(key);
+    assert.deepEqual(
+      rows.map(entry => entry.text),
+      expected,
+    );
+    assert.equal(rows[1].readerOrder, order(20));
+    assert.equal(rows[1].timestamp, stamp);
+    if (previousSeq) assert.equal(rows[1].archiveSeq, previousSeq);
+    assert.deepEqual(
+      new MessageBuffer(file, { archive }).recent(key).map(entry => entry.text),
+      expected,
+    );
+    assert.deepEqual(
+      archive.rows(key).map(entry => entry.text),
+      expected,
+    );
+  });
+}
+
 test('recent seed respects budgets and excludes the admitted batch; summary coverage survives late imports and failed attempts', t => {
   const f = fixture(t),
     s = f.open();

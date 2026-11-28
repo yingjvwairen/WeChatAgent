@@ -2,13 +2,22 @@
 // paused job holds its chat's FIFO position, not every other conversation.
 export function ownsDesktop(state) {
   if (state.recovery || state.state === 'conflict') return true;
-  if (state.operation !== 'voice') return state.inputStarted;
+  if (state.operation !== 'voice') return state.inputStarted && !state.inputReleased;
   // Confirmed bubbles retain their receipts, but own no draft or recording.
   return state.segments?.some(part => ['record-intent', 'submitted', 'unknown'].includes(part.state)) ?? false;
 }
 
-export function selectDelivery(candidates, waiting = new Set()) {
+export function selectDelivery(candidates, waiting = new Set(), inputPaused = false) {
   const ordered = candidates.sort((a, b) => a.row.sequence - b.row.sequence);
+  if (inputPaused) {
+    // Expiring untouched work needs no desktop ownership and must not wait
+    // behind another conversation's draft, recording, or unexpired work.
+    return (
+      ordered.find(({ revoked, state }) => revoked && !ownsDesktop(state) && !state.inputStarted && !state.submitted) ??
+      ordered.find(candidate => candidate.revoked || candidate.receiptOnly) ??
+      null
+    );
+  }
   const occupied = ordered.find(({ state }) => ownsDesktop(state));
   if (occupied) return occupied;
   const held = new Set();

@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createInputOperationsApi } from './console-input-operations.mjs';
 import { timingMarkup, recoveryMarkup } from '../public/console/input-operations.js';
+import { readerAccountId } from './reader-account-state.mjs';
+import { applyStoppedOffscreen, publishRecovery } from './desktop-sender/operations.mjs';
+import { createUiaOffscreenManager } from './desktop-sender/uia-offscreen.mjs';
+import { acquireDesktopQueue } from './desktop-sender/delivery-lock.mjs';
 const esc = value =>
   String(value ?? '').replace(
     /[&<>"']/g,
@@ -67,6 +74,72 @@ test('a snapshot cannot cross an account change during backend inspection', asyn
     },
   });
   await assert.rejects(api.snapshot(), { status: 409 });
+});
+
+test('stopped placement verifies the logged-in account and hands off the existing native window lease', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-stopped-placement-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const source = { dbPath: path.join(root, 'fixture'), myWxid: 'fixture' };
+  const accountRef = readerAccountId(root, source);
+  const state = path.join(root, 'state/weflow');
+  fs.mkdirSync(state, { recursive: true });
+  fs.writeFileSync(path.join(state, 'WeFlow-config.json'), JSON.stringify(source));
+  fs.writeFileSync(path.join(state, 'active-account.json'), JSON.stringify({ id: accountRef }));
+  const binding = { hwnd: '101', pid: 500, processCreatedFileTimeUtc: '12345678901234567' };
+  const calls = [];
+  let databaseAccounts = ['fixture'];
+  const config = {
+    runtime: { sender: 'wechat-ui' },
+    input: { controlMode: 'uia', offscreen: true, wechatExecutable: path.join(root, 'Weixin.exe') },
+  };
+  const options = {
+    root,
+    config,
+    assertStopped: () => true,
+    probe: async () => {
+      assert.equal(acquireDesktopQueue(root), null);
+      return { readOnly: true, version: '4.2.0.53', databaseAccounts, ...binding };
+    },
+    createOffscreen: placementOptions =>
+      createUiaOffscreenManager({
+        ...placementOptions,
+        createHost: () => ({
+          request: async (action, values) => {
+            calls.push(action);
+            if (action === 'park-explicit') {
+              assert.deepEqual(values.binding, {
+                version: 1,
+                executable: config.input.wechatExecutable,
+                ...binding,
+              });
+            }
+            return { parked: true, binding };
+          },
+          close: async () => calls.push('close'),
+        }),
+      }),
+  };
+  const parked = await applyStoppedOffscreen(options);
+  assert.equal(parked.windowState.parked, true);
+  assert.deepEqual(calls, ['park-explicit', 'handoff-offline', 'close']);
+  databaseAccounts = ['different-fixture'];
+  await assert.rejects(applyStoppedOffscreen(options), /DESKTOP_ACCOUNT_CHANGED/);
+  const lease = acquireDesktopQueue(root);
+  try {
+    await assert.rejects(applyStoppedOffscreen(options), /DESKTOP_QUEUE_BUSY/);
+  } finally {
+    lease.release();
+  }
+  publishRecovery({
+    root,
+    accountRef,
+    id: 'c'.repeat(64),
+    kind: 'draft',
+    reason: 'FIXTURE_DRAFT',
+    state: { entered: true },
+  });
+  await assert.rejects(applyStoppedOffscreen(options), /DESKTOP_CONFIGURATION_INPUT_PENDING/);
+  assert.equal(calls.length, 3);
 });
 
 test('foreground display reports each uninterrupted phase rather than cumulative occupation', () => {

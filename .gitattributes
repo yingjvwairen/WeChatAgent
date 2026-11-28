@@ -19,6 +19,7 @@ packages/dsh-social-bridge-plugin/** text=auto eol=lf
 packages/plugin-api/** text=auto eol=lf
 packages/extension-runtime/** text=auto eol=lf
 packages/wechat-*.mjs text eol=lf
+packages/delivery-contract.mjs text eol=lf
 packages/speech-contract/** text=auto eol=lf
 apps/console-desktop/** text=auto eol=lf
 public/console/** text=auto eol=lf

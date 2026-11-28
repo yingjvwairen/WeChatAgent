@@ -354,7 +354,7 @@ static void QtRevokeImage()
 }
 static void QtImageActionBoundary(string action)
 {
-    if (action != "submitUiaFileDialog")
+    if (action != "captureOcrFileDialog" && action != "submitFileDialog")
         QtPendingFileDialog = null;
     if (action == "releaseFocusHandoff")
     {
@@ -515,20 +515,7 @@ static object QtPasteUiaImage(QtClipboardOperation clipboard, Dictionary<string,
         var roles = QtUiaResolveRoles(source.Binding, new[] { "editor", "send", "header" });
         QtFileRequireWritableEditor(roles["editor"]);
         Need(roles["editor"].Node.Element.Current.HasKeyboardFocus, "QT_FILE_DRAFT_PRESENT");
-        dialog = new QtFileDialog { Source = source, Lease = lease, Name = Path.GetFileName(Text(request, "imagePath")),
-                                    Digest = Text(request, "imageSha256"), Header = roles["header"] };
-        dialog.TitleDigest = Text(QtFileConversation(dialog.Header, source.Binding, dialog.TitleParts), "sha256");
-        dialog.TargetName = dialog.TitleParts.Find(label => QtFileHash(label) == Text(request, "titleSha256"));
-        Need(!String.IsNullOrEmpty(dialog.TargetName), "QT_FILE_DIALOG_TARGET_CHANGED");
-        dialog.Path = Text(request, "imagePath");
-        dialog.Delivery = Text(request, "deliveryId");
-        int count = 0;
-        EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
-            if (IsWindowVisible(hwnd))
-                dialog.Visible.Add(hwnd);
-            return ++count < 4096;
-        }, IntPtr.Zero);
-        Need(count < 4096, "QT_FILE_WINDOW_ENUMERATION_FAILED");
+        dialog = QtPrepareFileDialog(source, request, roles["header"]);
     }
     var report = Map(QtPasteImage(clipboard, request, owner, true, ordinaryFile));
     if (ordinaryFile)
@@ -538,13 +525,8 @@ static object QtPasteUiaImage(QtClipboardOperation clipboard, Dictionary<string,
         {
             if (GetForegroundWindow() != source.Binding.Window)
             {
-                dialog.Window = GetForegroundWindow();
-                QtFileConfirmButton(dialog);
-                dialog.Id = Guid.NewGuid().ToString("N");
-                dialog.Issued = UtcMs();
-                QtPendingFileDialog = dialog;
-                QtImagePasteUnconfirmed = false;
-                report.Add("fileDialogProof", Data("id", dialog.Id, "sha256", dialog.Digest));
+                QtCaptureFileDialog(dialog);
+                report.Add("fileDialogProof", QtFileDialogProof(dialog));
                 return report;
             }
             QtInputStable(source, false);
@@ -588,12 +570,70 @@ sealed class QtFileDialog
     internal QtFocusLease Lease;
     internal QtUiaRole Header;
     internal readonly HashSet<IntPtr> Visible = new HashSet<IntPtr>();
-    internal readonly List<string> TitleParts = new List<string>();
     internal IntPtr Window;
-    internal string Name, TitleDigest, Digest, Id, ButtonId, TargetName, Path, Delivery;
+    internal string Name, TitleDigest, TargetDigest, Digest, Id, ButtonId, Path, Delivery, Pixels;
+    internal Rect Capture;
     internal long Issued;
 }
 static QtFileDialog QtPendingFileDialog;
+static QtFileDialog QtPrepareFileDialog(QtFrame source, Dictionary<string, object> request, QtUiaRole header = null)
+{
+    string path = Text(request, "imagePath");
+    var dialog =
+        new QtFileDialog { Source = source,
+                           Lease = QtFocus.Active,
+                           Name = Path.GetFileName(path),
+                           Digest = Text(request, "imageSha256"),
+                           Path = path,
+                           Delivery = Text(request, "deliveryId"),
+                           Header = header,
+                           TargetDigest = request.ContainsKey("titleSha256") ? Text(request, "titleSha256") : null };
+    if (header != null)
+    {
+        var titles = new List<string>();
+        dialog.TitleDigest = Text(QtFileConversation(header, source.Binding, titles), "sha256");
+        Need(titles.Exists(label => QtFileHash(label) == dialog.TargetDigest), "QT_FILE_DIALOG_TARGET_CHANGED");
+    }
+    int count = 0;
+    EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
+        if (IsWindowVisible(hwnd))
+            dialog.Visible.Add(hwnd);
+        return ++count < 4096;
+    }, IntPtr.Zero);
+    Need(count < 4096, "QT_FILE_WINDOW_ENUMERATION_FAILED");
+    return dialog;
+}
+static void QtCaptureFileDialog(QtFileDialog dialog)
+{
+    dialog.Window = GetForegroundWindow();
+    QtGuardFileDialog(dialog);
+    if (dialog.Header != null)
+    {
+        long deadline = Now() + 700;
+        for (;;)
+        {
+            try
+            {
+                QtFileConfirmButton(dialog);
+                break;
+            }
+            catch (Fault error)
+            {
+                if (error.Message != "QT_FILE_DIALOG_UNVERIFIED" || Now() >= deadline)
+                    throw;
+                Thread.Sleep(15);
+            }
+        }
+    }
+    dialog.Id = Guid.NewGuid().ToString("N");
+    dialog.Issued = Now();
+    QtPendingFileDialog = dialog;
+    QtImagePasteUnconfirmed = false;
+}
+static object QtFileDialogProof(QtFileDialog dialog)
+{
+    return Data("id", dialog.Id, "sha256", dialog.Digest);
+}
 static bool QtInlineFileStaged(Binding binding, string name)
 {
     var roles = QtUiaResolveRoles(binding, new[] { "editor", "send" });
@@ -633,7 +673,9 @@ static void QtGuardFileDialog(QtFileDialog dialog)
 static InvokePattern QtFileConfirmButton(QtFileDialog dialog)
 {
     QtGuardFileDialog(dialog);
-    Need(Text(QtFileConversation(dialog.Header, dialog.Source.Binding), "sha256") == dialog.TitleDigest,
+    Need(!String.IsNullOrEmpty(dialog.TargetDigest) &&
+             (dialog.Header == null ||
+              Text(QtFileConversation(dialog.Header, dialog.Source.Binding), "sha256") == dialog.TitleDigest),
          "QT_FILE_DIALOG_TARGET_CHANGED");
     var root = AutomationElement.FromHandle(dialog.Window);
     var walker = TreeWalker.RawViewWalker;
@@ -654,7 +696,7 @@ static InvokePattern QtFileConfirmButton(QtFileDialog dialog)
             string label = info.Name;
             if (label == dialog.Name)
                 file = true;
-            else if (label == dialog.TargetName)
+            else if (!String.IsNullOrEmpty(label) && QtFileHash(label) == dialog.TargetDigest)
                 target = true;
         }
         if (info.ControlType == ControlType.Button && QtUiaSendText(info.Name) && info.IsEnabled)
@@ -676,21 +718,100 @@ static InvokePattern QtFileConfirmButton(QtFileDialog dialog)
     QtGuardFileDialog(dialog);
     return (InvokePattern)invoke;
 }
-static object QtSubmitUiaFileDialog(Dictionary<string, object> request)
+static QtFileDialog QtFileDialogRequest(Dictionary<string, object> request)
+{
+    var dialog = QtPendingFileDialog;
+    Need(QtEnableInput && dialog != null && dialog.Id == Text(request, "proofId") &&
+             dialog.Digest == Text(request, "sha256") && Now() - dialog.Issued <= 30000,
+         "QT_FILE_DIALOG_PROOF_INVALID");
+    QtGuardFileDialog(dialog);
+    return dialog;
+}
+static Rect QtOcrFileDialogArea(QtFileDialog dialog)
+{
+    QtGuardFileDialog(dialog);
+    Rect client = default(Rect);
+    Point origin = new Point(0, 0);
+    Need(dialog.Header == null && GetClientRect(dialog.Window, out client) && ClientToScreen(dialog.Window, ref origin),
+         "QT_FILE_DIALOG_UNVERIFIED");
+    int inset = (int)Math.Ceiling(7 * dialog.Source.Binding.Dpi / 96.0);
+    var bounds =
+        new Rect(origin.X + inset, origin.Y + inset, origin.X + client.Width - inset, origin.Y + client.Height - inset);
+    Need(bounds.Width >= 100 && bounds.Width <= 1400 && bounds.Height >= 80 && bounds.Height <= 1200 &&
+             Contains(QtDesktopRect(), bounds) && FocusAreaOwned(bounds, dialog.Window, dialog.Source.Binding.Pid),
+         "QT_FILE_DIALOG_UNVERIFIED");
+    return bounds;
+}
+static object QtCaptureOcrFileDialog(Dictionary<string, object> request)
 {
     QtImageKeys(request, "proofId", "sha256");
-    var dialog = QtPendingFileDialog;
+    var dialog = QtFileDialogRequest(request);
+    var area = QtOcrFileDialogArea(dialog);
+    string pixels = FocusPixels(area);
+    using (var bitmap = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppArgb)) using (var memory =
+                                                                                                     new MemoryStream())
+    {
+        using (var graphics = Graphics.FromImage(bitmap))
+            graphics.CopyFromScreen(area.Left, area.Top, 0, 0, bitmap.Size, CopyPixelOperation.SourceCopy);
+        bitmap.Save(memory, ImageFormat.Png);
+        byte[] bytes = memory.ToArray();
+        Need(Same(area, QtOcrFileDialogArea(dialog)) && pixels == FocusPixels(area), "QT_FILE_DIALOG_CHANGED");
+        string file = Path.Combine(QtFrames, "qt-" + Guid.NewGuid().ToString("N") + ".png");
+        using (var output = new QtOwnedCaptureImage(file))
+        {
+            output.Write(bytes);
+            dialog.Capture = area;
+            dialog.Pixels = pixels;
+            output.Transfer();
+            return Data("width", area.Width, "height", area.Height, "image",
+                        Data("file", file, "sha256", QtHash(bytes)));
+        }
+    }
+}
+static bool QtFileDialogButtonInside(Rect capture, Rect label)
+{
+    return Contains(new Rect(0, 0, capture.Width, capture.Height), label) && label.Width >= 4 && label.Height >= 4;
+}
+static void QtClickOcrFileDialog(QtFileDialog dialog, Rect label)
+{
+    var area = QtOcrFileDialogArea(dialog);
+    Need(dialog.Pixels != null && Same(area, dialog.Capture) && QtFileDialogButtonInside(area, label) &&
+             FocusPixels(area) == dialog.Pixels,
+         "QT_FILE_DIALOG_CHANGED");
+    Point point = QtOcrQuoteCenter(QtQuoteScreenRect(label, area));
+    var events = ClickEvents(point.X, point.Y, QtDesktopRect());
+    QtGuardFileDialog(dialog);
+    Need(Owned(WindowFromPoint(point), dialog.Window, dialog.Source.Binding.Pid), "QT_FILE_DIALOG_OWNER_CHANGED");
+    InputAttempted = true;
+    QtCurrent = null;
+    uint done = SendInput(3, events, Marshal.SizeOf(typeof(Input)));
+    if (done == 2)
+        SendInput(1, new[] { Mouse(0, 0, 4) }, Marshal.SizeOf(typeof(Input)));
+    Need(done == 3, "QT_FILE_DIALOG_SUBMIT_UNCERTAIN");
+    QtRememberPointer(point, dialog.Source.Revision);
+}
+static object QtSubmitFileDialog(Dictionary<string, object> request)
+{
+    QtImageKeys(request, "proofId", "sha256", "buttonRect");
+    var dialog = QtFileDialogRequest(request);
     QtPendingFileDialog = null;
-    Need(dialog != null && dialog.Id == Text(request, "proofId") && dialog.Digest == Text(request, "sha256") &&
-             UtcMs() - dialog.Issued <= 30000,
-         "QT_FILE_DIALOG_PROOF_INVALID");
     using (QtOpenStagedFile(dialog.Path, dialog.Delivery, dialog.Digest))
     {
-        var invoke = QtFileConfirmButton(dialog);
-        InputAttempted = true;
-        invoke.Invoke();
+        if (dialog.Header == null)
+            QtClickOcrFileDialog(dialog, ParseRect(Get(request, "buttonRect")));
+        else
+        {
+            Need(!request.ContainsKey("buttonRect"), "QT_FILE_DIALOG_PROOF_INVALID");
+            var invoke = QtFileConfirmButton(dialog);
+            InputAttempted = true;
+            invoke.Invoke();
+        }
     }
-    return Data("performed", true, "attempted", true, "inputQueued", true, "revision", dialog.Source.Revision);
+    long deadline = Now() + 500;
+    while (IsWindowVisible(dialog.Window) && Now() < deadline)
+        Thread.Sleep(15);
+    return Data("performed", true, "attempted", true, "inputQueued", true, "dialogClosed",
+                !IsWindowVisible(dialog.Window), "revision", dialog.Source.Revision);
 }
 static object QtSubmitUiaImage(Dictionary<string, object> request)
 {
@@ -718,8 +839,54 @@ static object QtSubmitUiaImage(Dictionary<string, object> request)
             proof.Consumed = true;
             QtCurrent = null;
         });
+    bool released = proof.Format == "static" && QtUiaStaticDraftCleared(frame, sendRole);
     return Data("performed", true, "attempted", true, "submitted", false, "inputQueued", true, "submissionConfirmed",
-                false, "revision", frame.Revision, "pointerDelivery", delivery);
+                false, "revision", frame.Revision, "pointerDelivery", delivery, "inputReleased", released);
+}
+static bool QtUiaStaticDraftCleared(QtFrame frame, QtUiaRole sendRole)
+{
+    var header = frame.UiaRoles.Find(role => role.Role == "header");
+    long deadline = Now() + 350;
+    try
+    {
+        do
+        {
+            QtUiaPointerAfterInput(frame);
+            var roles = QtUiaResolveRoles(frame.Binding, new[] { "header", "editor", "send" });
+            if (header == null || !QtUiaRoleObservationMatches(header, roles["header"].Node, true) ||
+                !QtUiaRoleObservationMatches(sendRole, roles["send"].Node, false))
+                return false;
+            object pattern;
+            var editor = roles["editor"].Node.Element;
+            if (!roles["send"].Node.Element.Current.IsEnabled &&
+                editor.TryGetCurrentPattern(TextPattern.Pattern, out pattern))
+            {
+                var document = ((TextPattern)pattern).DocumentRange;
+                bool empty = document.GetChildren().Length == 0 && document.GetText(2).Trim().Length == 0;
+                QtUiaPointerAfterInput(frame);
+                if (empty)
+                    return true;
+            }
+            Thread.Sleep(15);
+        } while (Now() < deadline);
+    }
+    catch (Fault)
+    {
+        return false;
+    }
+    catch (ElementNotAvailableException)
+    {
+        return false;
+    }
+    catch (InvalidOperationException)
+    {
+        return false;
+    }
+    catch (COMException)
+    {
+        return false;
+    }
+    return false;
 }
 static object QtResumeUiaImage(Dictionary<string, object> request)
 {
@@ -856,6 +1023,11 @@ static int QtImageSelfTest()
              "QT_TEST_MEDIA_SEND_ENABLE_CONSUME_COLORS");
         count++;
         Need(!QtOcrMediaGreen(new byte[4 * 20]), "QT_TEST_MEDIA_SEND_MINIMUM_SUPPORT");
+        var dialogArea = new Rect(40, 50, 340, 260);
+        Need(QtFileDialogButtonInside(dialogArea, new Rect(150, 170, 230, 184)) &&
+                 !QtFileDialogButtonInside(dialogArea, new Rect(290, 170, 301, 184)) &&
+                 !QtFileDialogButtonInside(dialogArea, new Rect(150, 170, 150, 184)),
+             "QT_TEST_FILE_DIALOG_BUTTON_BOUNDS");
         count++;
         foreach (uint format in new uint[] { 8, 13, 15 })
         {
@@ -1316,19 +1488,34 @@ static bool QtOcrMediaNeutral(byte[] pixels)
     }
     return !QtOcrMediaGreen(pixels) && neutral > pixels.Length / 4 * .85;
 }
-static void QtWaitOcrMediaSend(QtFrame frame, Rect send, bool ready)
+static void QtWaitOcrMediaSend(QtFrame frame, Rect send, bool ready, QtFileDialog dialog = null)
 {
     Need(!frame.MetadataOnly && Contains(frame.Binding.Client, send) && frame.Anchors.Count >= 1,
          "QT_MEDIA_SEND_REGION_INVALID");
     long deadline = Now() + 1500;
     for (;;)
     {
-        QtStable(frame);
-        var header = frame.Anchors[0];
-        QtNeedAnchorPixels(header.Hash, QtHash(QtPixels(frame.Binding, header.Rect)), "media-header", 0);
-        byte[] pixels = QtPixels(frame.Binding, send);
-        if (ready ? QtOcrMediaGreen(pixels) : QtOcrMediaNeutral(pixels))
+        if (dialog != null && GetForegroundWindow() != frame.Binding.Window)
+        {
+            QtCaptureFileDialog(dialog);
             return;
+        }
+        try
+        {
+            QtStable(frame);
+            var header = frame.Anchors[0];
+            QtNeedAnchorPixels(header.Hash, QtHash(QtPixels(frame.Binding, header.Rect)), "media-header", 0);
+            byte[] pixels = QtPixels(frame.Binding, send);
+            if (ready ? QtOcrMediaGreen(pixels) : QtOcrMediaNeutral(pixels))
+                return;
+        }
+        catch (Fault)
+        {
+            if (dialog == null || GetForegroundWindow() == frame.Binding.Window)
+                throw;
+            QtCaptureFileDialog(dialog);
+            return;
+        }
         Need(Now() < deadline, ready ? "QT_MEDIA_IMPORT_UNCONFIRMED" : "QT_MEDIA_SUBMIT_UNCONFIRMED");
         Thread.Sleep(5);
     }
@@ -1376,6 +1563,7 @@ static object QtPasteImage(QtClipboardOperation clipboard, Dictionary<string, ob
                                                               QtRoot.Pid, QtRoot.Created, QtSurface),
                  "QT_FOCUS_LEASE_REQUIRED");
             QtNeedTextAnchors(frame, ParseRect(Get(request, "headerRect")), ParseRect(Get(request, "editorRect")));
+            var dialog = !uia && ordinaryFile ? QtPrepareFileDialog(frame, request) : null;
             if (trace != null)
                 trace.Stage = "original";
             ClipboardState original = QtReadOriginalClipboard(owner, false, QtAllowClipboardReplacement(request));
@@ -1504,7 +1692,7 @@ static object QtPasteImage(QtClipboardOperation clipboard, Dictionary<string, ob
                 }
             }
             if (!uia)
-                QtWaitOcrMediaSend(frame, ParseRect(Get(request, "sendRect")), true);
+                QtWaitOcrMediaSend(frame, ParseRect(Get(request, "sendRect")), true, dialog);
             var report = Data("performed", true, "attempted", true, "pasteApplied", true, "imageWidth", width,
                               "imageHeight", height, "imageFormat",
                               ordinaryFile ? "file"
@@ -1516,6 +1704,8 @@ static object QtPasteImage(QtClipboardOperation clipboard, Dictionary<string, ob
                 report.Add("clipboardReplaced", true);
             if (consumption != null)
                 report.Add("imageConsumption", consumption);
+            if (dialog != null && dialog.Id != null)
+                report.Add("fileDialogProof", QtFileDialogProof(dialog));
             return report;
         }
     }

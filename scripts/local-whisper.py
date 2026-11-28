@@ -23,18 +23,18 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from local_model_control import control_routes, profile_revision, selected_profile, save_selection
+from local_model_control import control_routes, profile_data, profile_revision, selected_profile, save_selection
 
 MAX_UPLOAD = 6 * 1024 * 1024
 MODEL_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 LANGUAGE = re.compile(r'[a-z]{2,3}')
 
 
-def read_profiles(model_dir, profiles_file):
+def read_profiles(model_dir, profiles_file, *, data=None):
     if profiles_file:
-        if profiles_file.stat().st_size > 65536:
-            raise ValueError('Profile settings exceed 64 KiB')
-        rows = json.loads(profiles_file.read_text(encoding='utf-8-sig'))
+        if data is None:
+            data = profile_data(profiles_file, limit=65536)
+        rows = json.loads(data.decode('utf-8-sig'))
         base = profiles_file.resolve().parent
     else:
         rows = {'default': {'modelDirectory': str(model_dir)}}
@@ -107,6 +107,9 @@ class Recognizer:
         self.loaded_signature = None
         self.preload(self.selected)
 
+    def unload(self):
+        self.model = self.directory = self.current = self.loaded_signature = self.last_result = None
+
     def preload(self, name):
         folder, language, prompt = self.profiles[name]
         signature = (
@@ -119,7 +122,7 @@ class Recognizer:
         )
         self.last_result = None
         if self.loaded_signature != signature:
-            self.model = self.directory = self.current = self.loaded_signature = None
+            self.unload()
             self.phase = 'loading'
             try:
                 self.model = self.loader(folder)
@@ -171,8 +174,11 @@ class Recognizer:
         return text
 
 
-def create_app(recognizer, key, *, control_key=None, reload_profiles=None, revision=None, selection_file=None):
+def create_app(
+    recognizer, key, *, control_key=None, reload_profiles=None, revision=None, loaded_revision=None, selection_file=None
+):
     processing = asyncio.Lock()
+    current_revision = revision or (lambda: profile_revision(profile_data(None, recognizer.profiles)))
 
     def authorize(request):
         supplied = request.headers.get('authorization', '').encode('latin-1')
@@ -209,7 +215,8 @@ def create_app(recognizer, key, *, control_key=None, reload_profiles=None, revis
             if await request.is_disconnected():
                 raise HTTPException(408)
             text = await run_in_threadpool(recognizer.transcribe, name, audio, language)
-        return JSONResponse({'text': text})
+        # The same model ID can use different settings after an operator reload.
+        return JSONResponse({'text': text}, headers={'Cache-Control': 'no-store'})
 
     return Starlette(
         routes=[
@@ -220,8 +227,9 @@ def create_app(recognizer, key, *, control_key=None, reload_profiles=None, revis
             recognizer,
             control_key,
             processing,
-            reload_profiles or (lambda: recognizer.profiles),
-            revision or (lambda: profile_revision(None, recognizer.profiles)),
+            reload_profiles or (lambda: (recognizer.profiles, current_revision())),
+            current_revision,
+            loaded_revision or current_revision(),
             selection_file,
         )
     )
@@ -234,6 +242,9 @@ def main(run_server=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--model-dir', type=Path, help='Local faster-whisper weights (model ID: default)')
     source.add_argument('--profiles', type=Path, help='JSON file of named model and language profiles')
+    parser.add_argument(
+        '--check', action='store_true', help='Transcribe the bundled test WAV without starting a service'
+    )
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--control-key-file', type=Path)
     parser.add_argument('--selection-file', type=Path)
@@ -242,21 +253,36 @@ def main(run_server=None):
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error('Port must be between 1 and 65535')
-    profiles = read_profiles(args.model_dir, args.profiles)
-    key = read_key(args.key_file)
-    control_key = read_key(args.control_key_file) if args.control_key_file else None
+
+    def saved_data():
+        return profile_data(args.profiles, [None, str(args.model_dir)], limit=65536)
+
+    def snapshot():
+        data = saved_data()
+        return read_profiles(args.model_dir, args.profiles, data=data), profile_revision(data)
+
+    profiles, loaded_revision = snapshot()
     os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1')
     if args.preload and args.preload not in profiles:
         parser.error('Unknown preload profile')
     selected = selected_profile(args.selection_file, profiles, args.preload)
+    if args.check:
+        sample = Path(__file__).resolve().parents[1] / 'optional-extensions/speech-recognition/assets/config-test.wav'
+        if not Recognizer(profiles, selected=selected).transcribe(selected, sample.read_bytes(), 'zh'):
+            raise RuntimeError('Bundled Whisper test audio produced an empty transcript')
+        print('Whisper transcription verified.')
+        return
+    key = read_key(args.key_file)
+    control_key = read_key(args.control_key_file) if args.control_key_file else None
     recognizer = Recognizer(profiles, selected=selected)
     save_selection(args.selection_file, selected)
     app = create_app(
         recognizer,
         key,
         control_key=control_key,
-        reload_profiles=lambda: read_profiles(args.model_dir, args.profiles),
-        revision=lambda: profile_revision(args.profiles, recognizer.profiles),
+        reload_profiles=snapshot,
+        revision=lambda: profile_revision(saved_data()),
+        loaded_revision=loaded_revision,
         selection_file=args.selection_file,
     )
     print(f'Local speech service: http://127.0.0.1:{args.port}/v1  |  API key file: {args.key_file}', flush=True)

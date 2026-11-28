@@ -3,8 +3,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { UiTextOutbox } from './ui-text-outbox.mjs';
 import { validSelectionScope } from './selection-scope.mjs';
-import { inspectReplyImage, REPLY_IMAGE_MAX_BYTES, staticImageReceiptMatches } from '../reply-image-format.mjs';
+import { inspectReplyImage, REPLY_IMAGE_MAX_BYTES, validStaticImageReceipt } from '../reply-image-format.mjs';
 import { acquireDeliveryLock } from './delivery-lock.mjs';
+import { receiptReservationRefusal } from '../../packages/delivery-contract.mjs';
 import { FILE_LIMIT, safeFileName } from '../../packages/wechat-file-reference.mjs';
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -114,6 +115,9 @@ export class UiImageOutbox {
         pasteText: (job, guard) => this.#paste(job, guard),
         submit: (job, guard) => this.#submit(job, guard),
         receipt: (job, options) => this.#receipt(job, options),
+        ...(typeof receipts.recordedSubmission === 'function'
+          ? { recordedSubmission: job => receipts.recordedSubmission(this.#receiptJob(job)) }
+          : {}),
         releaseTextFocus: () => driver.releaseTextFocus?.(),
       },
     });
@@ -218,8 +222,8 @@ export class UiImageOutbox {
       ...view,
       kind: metadata.extension === 'file' ? 'file' : 'image',
       mode: metadata.extension === 'file' ? 'file' : 'image',
-      nativeRecoveryRequired: Boolean(uncertain && !cleared),
-      imageDraftPresent: applied && !cleared && !['submitted', 'confirmed'].includes(job.state),
+      nativeRecoveryRequired: Boolean(uncertain && !cleared && !job.inputReleased),
+      imageDraftPresent: applied && !cleared && !job.inputReleased && !['submitted', 'confirmed'].includes(job.state),
       ...(cleared ? { manualDraftCleared: true } : {}),
       ...(applied && job.manualPause && job.state === 'paused' ? { reason: 'UI_IMAGE_DRAFT_RECOVERY_REQUIRED' } : {}),
       image: {
@@ -343,10 +347,14 @@ export class UiImageOutbox {
     if (!this.#application(job.id)) throw fault('UI_IMAGE_APPLICATION_UNKNOWN');
     const binding = this.#receiptJob(job),
       prepared = await this.receipts.prepare(binding, { signal: this.controller.signal });
+    if (prepared?.prepared === false && prepared.performed === false && prepared.attempted === false) return prepared;
     if (prepared?.prepared !== true || prepared.submissionAllowed !== true) throw fault('UI_IMAGE_SUBMISSION_RESERVED');
     if (!this.#allowed(job, 'submitting'))
       return { performed: false, attempted: false, reason: 'UI_IMAGE_SUBMISSION_PAUSED' };
-    await this.receipts.submitted(binding, this.now(), { baselineId: prepared.baselineId });
+    const refusal = receiptReservationRefusal(
+      await this.receipts.submitted(binding, this.now(), { baselineId: prepared.baselineId }),
+    );
+    if (refusal) return refusal;
     if (!this.#allowed(job, 'submitting')) {
       if (typeof this.receipts.notAttempted !== 'function') throw fault('UI_IMAGE_SUBMISSION_PAUSED');
       await this.receipts.notAttempted(binding, prepared.baselineId);
@@ -356,13 +364,6 @@ export class UiImageOutbox {
       this.#job(job, { verifyAsset: true }),
       this.#guard(job, guard, 'submitting'),
     );
-    if (
-      binding.mediaKind === 'image' &&
-      !binding.imageFormat &&
-      result?.performed === true &&
-      result.attempted === true
-    )
-      await this.receipts.imageInputApplied?.(binding, prepared.baselineId);
     // Only an explicit pre-input refusal releases the submission intent. The
     // applied image stays in place; a later continuation never pastes it again.
     if (result?.performed === false && result.attempted === false) {
@@ -376,7 +377,7 @@ export class UiImageOutbox {
     const binding = this.#receiptJob(job),
       result = await this.receipts.query(binding, options),
       r = result?.receipt;
-    if (result?.confirmed !== true) return result;
+    if (!r) return result;
     return r?.type === 'desktop-reader-media-v1' &&
       r.deliveryId === job.id &&
       r.account === job.account &&
@@ -389,7 +390,7 @@ export class UiImageOutbox {
         ? r.sourceImageMd5 === binding.sourceImageMd5 &&
           r.gifContentMd5Matched === true &&
           [47, 49, 34359738417].includes(r.localType)
-        : binding.mediaKind === 'file' || staticImageReceiptMatches(r))
+        : binding.mediaKind === 'file' || validStaticImageReceipt(r))
       ? result
       : { confirmed: false, reason: 'UI_IMAGE_RECEIPT_BINDING_MISMATCH' };
   }
@@ -547,7 +548,7 @@ export class UiImageOutbox {
       .find(
         job =>
           !this.isRetired(job.id) &&
-          (job.state === 'unconfirmed' ||
+          ((job.state === 'unconfirmed' && !job.inputReleased) ||
             (job.state === 'cancelled' &&
               !this.#cleared(job) &&
               (job.index > 0 || job.pendingInput || this.#application(job.id)))),

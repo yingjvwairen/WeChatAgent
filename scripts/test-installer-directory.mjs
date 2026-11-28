@@ -4,22 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { singleDirectoryTemplate } from './installer-directory-page.mjs';
 import storage from '../apps/console-desktop/storage-location.cjs';
+import product from '../apps/console-desktop/package.json' with { type: 'json' };
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const nsisName = 'nsis-3.0.4.1-nsis-3.0.4.1';
-const caches = [root, path.join(path.dirname(root), 'WeChatAgent')];
-const compiler = caches
-  .map(base => path.join(base, 'state/installer-cache/electron-builder/nsis', nsisName, 'makensis.exe'))
-  .find(file => fs.existsSync(file));
-const templates = [
-  path.join(root, 'node_modules/app-builder-lib/templates/nsis'),
-  path.join(root, 'components/WeFlowComplete/node_modules/app-builder-lib/templates/nsis'),
-];
-const templateFile = templates.map(base => path.join(base, 'assistedInstaller.nsh')).find(file => fs.existsSync(file));
+const require = createRequire(import.meta.url);
 const write = (file, text) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, text);
@@ -62,15 +55,24 @@ test('the installer has one native root selector and validates before uninstalli
   );
 });
 
+test('desktop sender uses its own installer identity, executable and data registry key', () => {
+  assert.equal(product.appId, 'local.wechatagent.desktop-sender');
+  assert.equal(product.productName, 'WeChatAgent Desktop');
+  assert.equal(product.executableName, 'WeChatAgentDesktop');
+  const include = fs.readFileSync(path.join(root, 'apps/console-desktop/installer-storage.nsh'), 'utf8');
+  assert.match(include, /ReadRegStr .* "\$\{INSTALL_REGISTRY_KEY\}" "DataHome"/);
+  assert.match(include, /WriteRegStr .* "\$\{INSTALL_REGISTRY_KEY\}" "DataHome"/);
+  assert.doesNotMatch(include, /"Software\\WeChatAgent"/u);
+});
+
 test(
   'compiled NSIS storage selection preserves upgrades and derives both folders from one root',
-  {
-    skip:
-      process.platform !== 'win32' || !compiler || !templateFile
-        ? 'Windows and the cached NSIS compiler/build dependencies are required'
-        : false,
-  },
+  { skip: process.platform !== 'win32' },
   async t => {
+    const { getMakeNsisPath } = require('app-builder-lib/out/toolsets/windows.js');
+    const { nsisTemplatesDir } = require('app-builder-lib/out/targets/nsis/nsisUtil.js');
+    const { path: compiler, env: compilerEnv } = await getMakeNsisPath();
+    const templateFile = path.join(nsisTemplatesDir, 'assistedInstaller.nsh');
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wca-one-directory-'));
     const id = crypto.randomUUID();
     // Only this disposable registry subtree is read/written by the fixture.
@@ -79,8 +81,7 @@ test(
     const failureFile = path.join(base, 'failure.ini');
     const include = fs
       .readFileSync(path.join(root, 'apps/console-desktop/installer-storage.nsh'), 'utf8')
-      .replaceAll('Software\\WeChatAgent', registry)
-      .replaceAll('$APPDATA\\WeChatAgent', quoteNsis(path.join(base, 'legacy')))
+      .replaceAll('$APPDATA\\${PRODUCT_NAME}', quoteNsis(path.join(base, 'legacy')))
       .replace(
         '    MessageBox MB_ICONEXCLAMATION "$WcaStorageError"',
         () =>
@@ -113,6 +114,8 @@ OutFile "${quoteNsis(exe)}"
 RequestExecutionLevel user
 Var ProbeEdit
 !define APP_GUID "WeChatAgent-Installer-Test\\${id}\\Install"
+!define INSTALL_REGISTRY_KEY "${quoteNsis(registry)}"
+!define PRODUCT_FILENAME "${product.executableName}"
 !include "${quoteNsis(fixtureInclude)}"
 ${page}
 !define MUI_PAGE_CUSTOMFUNCTION_PRE instFilesPre
@@ -183,10 +186,11 @@ SectionEnd
       windowsHide: true,
       encoding: 'utf8',
       timeout: 30000,
+      env: { ...process.env, ...compilerEnv },
     });
     assert.equal(compiled.status, 0, compiled.stdout + compiled.stderr);
     assert.doesNotMatch(compiled.stdout + compiled.stderr, /unknown variable\/constant/i);
-    function run(name, values = {}, setup = () => {}) {
+    function run(name, values = {}, setup = () => {}, expectedExit = 0) {
       const dir = path.join(base, name);
       fs.mkdirSync(dir, { recursive: true });
       setup(dir);
@@ -212,12 +216,12 @@ SectionEnd
       const result = spawnSync(exe, ['/S'], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
       assert.equal(
         result.status,
-        0,
+        expectedExit,
         fs.existsSync(failureFile)
           ? JSON.stringify(readIni(failureFile))
           : result.error?.message || result.stdout + result.stderr,
       );
-      return readIni(outputFile);
+      return readIni(expectedExit === 0 ? outputFile : failureFile);
     }
     try {
       await t.test('fresh Unicode path: app and data are siblings and storage.ini resolves to data', () => {
@@ -341,6 +345,17 @@ SectionEnd
         const denied = run('blocked', { selectedRoot: blocked }, () => write(path.join(blocked, 'data'), 'owned file'));
         assert.match(denied.error, /无法写入/);
         assert.equal(fs.readFileSync(path.join(blocked, 'data'), 'utf8'), 'owned file');
+      });
+      await t.test('another installation in the chosen root is left intact', () => {
+        for (const subdirectory of ['app', ''])
+          for (const name of ['WeChatAgent.exe', product.executableName + '.exe']) {
+            const fixture = (subdirectory || 'portable') + '-' + name;
+            const selected = path.join(base, fixture, 'selected');
+            const executable = path.join(selected, subdirectory, name);
+            const result = run(fixture, { selectedRoot: selected }, () => write(executable, 'other installation'), 2);
+            assert.match(result.error, /已有另一个 WeChatAgent 程序/);
+            assert.equal(fs.readFileSync(executable, 'utf8'), 'other installation');
+          }
       });
     } finally {
       spawnSync(exe, ['/S', '/cleanup'], { windowsHide: true, timeout: 15000 });

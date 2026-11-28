@@ -2,17 +2,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { withReleaseSnapshot } from './release-snapshot.mjs';
-import { assertPluginHost } from './plugin-host-check.mjs';
-import { BUNDLED_PLUGINS } from '../packages/plugin-api/bundled.mjs';
-import { releaseIdentity } from './release-version.mjs';
-import { verifyReaderKey } from './prepare-reader-key.mjs';
-import { deploymentVerification, verifyInstallerPayload } from './release-verification.mjs';
 
 const root = path.resolve(import.meta.dirname, '..'),
   hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 await withReleaseSnapshot(root, async ({ commit, directory: source, files, pluginHost }) => {
+  const fromSnapshot = relative => import(pathToFileURL(path.join(source, relative)).href);
+  const { assertPluginHost } = await fromSnapshot('scripts/plugin-host-check.mjs');
+  const { BUNDLED_PLUGINS } = await fromSnapshot('packages/plugin-api/bundled.mjs');
+  const { releaseIdentity } = await fromSnapshot('scripts/release-version.mjs');
+  const { verifyReaderKey } = await fromSnapshot('scripts/prepare-reader-key.mjs');
+  const { deploymentVerification, verifyInstallerDesktopApp, verifyInstallerOcrModel, verifyInstallerPayload } =
+    await fromSnapshot('scripts/release-verification.mjs');
+  const { installerRuntimeRevision, runtimeVersions, verifyInstallerRuntime } = await fromSnapshot(
+    'scripts/prepare-installer-runtime.mjs',
+  );
   const { version, packageVersion } = releaseIdentity(JSON.parse(fs.readFileSync(path.join(source, 'package.json'))));
+  const { wechatVersion } = JSON.parse(fs.readFileSync(path.join(source, 'release-profile.json'), 'utf8'));
   const sourceReport = JSON.parse(fs.readFileSync(path.join(root, 'state/source-release-' + version + '.json')));
   const builtFiles = Object.keys(sourceReport.sourceFiles).sort();
   if (sourceReport.commit !== commit || JSON.stringify(builtFiles) !== JSON.stringify(files))
@@ -25,14 +32,18 @@ await withReleaseSnapshot(root, async ({ commit, directory: source, files, plugi
   const reports = [],
     builtinPlugins = BUNDLED_PLUGINS.filter(item => item.builtin === true).map(item => item.id);
   for (const directory of [stage, unpacked]) {
+    verifyInstallerDesktopApp(path.join(directory, '../app'), source, { version, packageVersion }, root);
     await assertPluginHost(directory, { compareRoot: source });
     const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'deployment.json')));
     if (
       manifest.sourceCommit !== commit ||
       manifest.version !== version ||
       manifest.packageVersion !== packageVersion ||
+      manifest.runtimeRevision !== installerRuntimeRevision ||
+      manifest.node !== runtimeVersions.node ||
+      manifest.python !== runtimeVersions.python ||
       manifest.desktopRuntime !== true ||
-      manifest.wechatVersion !== '4.2.0.53' ||
+      manifest.wechatVersion !== wechatVersion ||
       manifest.bundledWechatVersions?.length !== 0
     )
       throw Error('INSTALLER_DESKTOP_MANIFEST_INVALID');
@@ -50,6 +61,8 @@ await withReleaseSnapshot(root, async ({ commit, directory: source, files, plugi
         throw Error('INSTALLER_NATIVE_CHANGED: ' + file);
     if (!verifyReaderKey(fs.readFileSync(path.join(directory, '../runtime/reader-key/wx_key.dll'))))
       throw Error('INSTALLER_READER_SETUP_CHANGED');
+    verifyInstallerRuntime(path.join(directory, '../runtime'));
+    await verifyInstallerOcrModel(path.dirname(directory));
     for (const [runtime, imports] of [
       ['python', 'import sqlcipher3,av,psutil,win32api,win32gui,win32process'],
       ['ocr', 'import rapidocr,onnxruntime,numpy,PIL'],
@@ -74,7 +87,7 @@ await withReleaseSnapshot(root, async ({ commit, directory: source, files, plugi
   const pe = installer.readUInt32LE(0x3c);
   if (installer.toString('ascii', 0, 2) !== 'MZ' || installer.readUInt32LE(pe) !== 0x4550)
     throw Error('INSTALLER_PE_INVALID');
-  await verifyInstallerPayload(path.join(root, installerRelative), path.resolve(unpacked, '../..'));
+  await verifyInstallerPayload(path.join(root, installerRelative), path.resolve(unpacked, '../..'), root);
   const assets = [
     installerRelative,
     sourceReport.asset.path,
@@ -101,7 +114,7 @@ await withReleaseSnapshot(root, async ({ commit, directory: source, files, plugi
     sourcePrivacy: { candidateFiles: files.length, findings: [] },
     templateFilesVerified: reports,
     desktopRuntime: true,
-    wechatVersion: '4.2.0.53',
+    wechatVersion,
     bundledWechatVersions: [],
     sourceFiles: sourceReport.sourceFiles,
     assets: assetRecords,
@@ -110,7 +123,7 @@ await withReleaseSnapshot(root, async ({ commit, directory: source, files, plugi
     pluginAutoEnabled: false,
     publication: 'local-build-only',
     validationLimits: [
-      'Artifact, source closure, plugin contract and runtime imports only; this command does not operate WeChat or claim live/second-machine acceptance.',
+      'Artifact, source closure, plugin contract, bundled OCR model and runtime imports only; this command does not operate WeChat or claim live/second-machine acceptance.',
     ],
   };
   const release = path.join(root, 'release/installer');

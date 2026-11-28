@@ -70,7 +70,7 @@ export const failureMessages = {
   VOICE_CLONE_TARGET: '当前语音合成方式不支持复刻音色。',
 };
 
-function endpoint(value, models) {
+function endpoint(value, models, exact = false) {
   let url;
   try {
     url = new URL(value.trim());
@@ -82,8 +82,10 @@ function endpoint(value, models) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
     throw codeError('VOICE_TTS_ENDPOINT');
   }
+  if (exact && !models) return url;
   const pathname = url.pathname.replace(/\/+$/, '');
   if (models) {
+    if (exact && !pathname.endsWith(speechPath)) throw codeError('VOICE_TTS_MODELS');
     const base = pathname.replace(/\/(audio\/(speech|transcriptions)|realtime)$/, '');
     if (pathname.endsWith('/realtime')) url.searchParams.delete('model');
     url.pathname = (base || (pathname ? '' : '/v1')) + '/models';
@@ -92,7 +94,7 @@ function endpoint(value, models) {
 }
 
 export function validateSettings(settings, models = false) {
-  const url = endpoint(settings.endpoint, models);
+  const url = endpoint(settings.endpoint, models, settings.endpointMode === 'exact');
   if (
     typeof settings.apiKey !== 'string' ||
     /[\r\n\0]/.test(settings.apiKey) ||
@@ -210,7 +212,7 @@ export function transcriptionUrl(value) {
   return url;
 }
 
-export async function transcriptionsTranscribe(service, wav, { signal, fetchImpl = fetch } = {}) {
+export async function transcriptionsTranscribe(service, wav, { signal, fetchImpl = fetch, allowEmpty = false } = {}) {
   const settings = service.flat;
   if (!shortString(settings.model, 200)) throw codeError('VOICE_TTS_CONFIG');
   const url = transcriptionUrl(settings.endpoint);
@@ -239,6 +241,7 @@ export async function transcriptionsTranscribe(service, wav, { signal, fetchImpl
       );
     }
     const { text } = JSON.parse(await responseBytes(response, 128 * 1024));
+    if (allowEmpty && typeof text === 'string' && !text.trim()) return '';
     if (!shortString(typeof text === 'string' ? text.trim().replace(/[\r\n\t]/g, ' ') : text, 4000)) {
       throw codeError('VOICE_TTS_TRANSCRIPT');
     }

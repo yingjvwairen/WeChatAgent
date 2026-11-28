@@ -20,8 +20,8 @@ Bridge 每 30 秒检查已允许的聊天。只有安静时间达到设置、没
   "maxTokens": 100000,
   "idleSeconds": 60,
   "chats": {
-    "wechat:private:123456": 50000,
-    "wechat:group:654321": 0
+    "wechat:private:wxid_example": 50000,
+    "wechat:group:654321@chatroom": 0
   }
 }
 ```

@@ -8,7 +8,7 @@ const sourceUnavailable = () =>
 const contains = (a, b) => b.left >= a.left && b.top >= a.top && b.right <= a.right && b.bottom <= a.bottom;
 const sameRect = (a, b) => a && b && ['left', 'top', 'right', 'bottom'].every(k => a[k] === b[k]);
 const full = (width, height) => ({ left: 0, top: 0, right: width, bottom: height });
-function linesIn(ocr, area) {
+export function linesIn(ocr, area) {
   if (!Array.isArray(ocr?.words) || ocr.words.length > 2000) return null;
   const groups = new Map();
   for (const word of ocr.words) {
@@ -225,15 +225,22 @@ export function ocrQuotePreview(ocr, area, text, kind) {
   return matches.length === 1 ? matches[0].box : null;
 }
 
-async function readImage(driver, image, width, height, area, signal, model = 'small') {
+export async function readImage(driver, image, width, height, area, signal, model = 'small') {
   const file = image?.file,
-    dir = path.join(driver.root, 'state/ui-host/qt-frames');
+    relativeDir = 'state/ui-host/qt-frames';
   if (
     typeof file !== 'string' ||
+    !path.isAbsolute(file) ||
     !/^qt-[a-f0-9]{32}\.png$/.test(path.basename(file)) ||
-    path.dirname(file) !== dir ||
-    fs.realpathSync.native(file) !== file ||
     !/^[a-f0-9]{64}$/.test(image.sha256)
+  )
+    throw fault('QT_QUOTE_FRAME_UNVERIFIED');
+  const dir = path.join(driver.root, relativeDir);
+  const canonicalDir = path.join(fs.realpathSync.native(driver.root), relativeDir);
+  if (
+    ![dir, canonicalDir].some(candidate => path.relative(candidate, path.dirname(file)) === '') ||
+    !fs.lstatSync(file).isFile() ||
+    path.relative(path.join(canonicalDir, path.basename(file)), fs.realpathSync.native(file)) !== ''
   )
     throw fault('QT_QUOTE_FRAME_UNVERIFIED');
   const region = driver.config.ocrBackend === 'rapidocr' ? area : undefined;
@@ -322,7 +329,7 @@ export async function attachOcrQuote(driver, job, frame, signal, { allowScroll =
     history.bottom <= history.top ||
     text.length > 4000 ||
     /[\r\n]/.test(text) ||
-    (rich && !Number.isInteger(job.quote.locator?.ocrAnchor))
+    (rich ? !Number.isInteger(job.quote.locator?.ocrAnchor) : job.quote.ocrTextUnique !== true)
   )
     throw sourceUnavailable();
   const { right: width, bottom: height } = frame.binding.clientRect;

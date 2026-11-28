@@ -59,11 +59,13 @@ class QtNavigationSession {
       throw fault(group ? 'UI_QT_GROUP_SEARCH_NAME_REQUIRED' : 'UI_QT_TARGET_SEARCH_NAME_REQUIRED');
     if (group && (contact.kind !== 'group' || contact.groupName !== title || query !== title || !contact.uniqueTitle))
       throw fault('UI_QT_GROUP_SEARCH_NAME_REQUIRED');
+    const digest = text => crypto.createHash('sha256').update(text).digest('hex');
     const lookup = {
       account,
       target,
       accountRef,
       displayedId: query,
+      ...(job.mode === 'file' && validName(title) ? { fileTitleSha256: digest(title) } : {}),
       ...(publicId
         ? {}
         : {
@@ -74,7 +76,6 @@ class QtNavigationSession {
       if (!validName(title)) throw fault('UI_QT_TARGET_SEARCH_NAME_REQUIRED');
       // Only a unique title permits reusing the open chat. A unique nickname
       // can navigate to its owner even when several chats display that remark.
-      const digest = text => crypto.createHash('sha256').update(text).digest('hex');
       lookup.uiaTarget = Object.freeze({
         version: 1,
         proof: contact.uniqueTitle === true ? 'database-unique-display-name-v1' : 'database-exact-search-v1',

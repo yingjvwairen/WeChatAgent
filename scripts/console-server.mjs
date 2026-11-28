@@ -1,7 +1,8 @@
 import { DESKTOP_WECHAT_VERSION } from './desktop-settings.mjs';
 import { pluginConfigUi } from './plugin-config-ui.mjs';
 import { createPluginUiHost, pluginUiHeaders } from './plugin-ui.mjs';
-import { restoreWindow as restoreDesktopWindow } from './desktop-sender/operations.mjs';
+import { applyStoppedOffscreen, restoreWindow as restoreDesktopWindow } from './desktop-sender/operations.mjs';
+import { inspectCableEndpoints } from './desktop-sender/runtime-driver.mjs';
 import { createDesktopControlClient, mergedDeliveries } from './desktop-control.mjs';
 import { inspectWeChatClient } from './wechat-client-selection.mjs';
 import { feedbackSnapshot, saveFeedback } from '../packages/dsh-social-bridge-plugin/assistant-feedback.mjs';
@@ -92,12 +93,12 @@ const portOpen = port =>
     socket.once('timeout', () => finish(false));
   });
 
-export function validateConsoleConfig(config, root) {
+export function validateConsoleConfig(config, root, consolePort) {
   try {
-    validateConfig(config);
+    validateConfig(config, { consolePort });
   } catch (error) {
     const translations = [
-      [/distinct|ports|Required ports/, '端口必须为 1024–65535 的整数，且不能互相重复。'],
+      [/ports|LOCAL_SPEECH_PORT_INVALID/, '服务端口必须为 1024–65535 的整数，且不能互相重复。'],
       [/loopback/, '发送后端地址必须是本机回环 HTTP 地址。'],
       [/matching|version/, '请选择受支持且与发送组件匹配的微信版本及程序。'],
       [/persona/, '人格名称不能包含路径、点号前缀或无效字符。'],
@@ -156,10 +157,12 @@ import {
   allowedConversation,
   validateConversationSettings,
   conversationWorkMode,
+  reconcileGroupWakeEpochs,
   reconcileRosterGrants,
 } from '../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 import { FileTransfers } from '../packages/dsh-social-bridge-plugin/file-transfers.mjs';
 import { ReplyDeliveryControls } from '../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
+import { reconcileAssistantReplay } from '../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 export function createConsole({
   root = projectRoot,
   port = 3210,
@@ -175,6 +178,7 @@ export function createConsole({
   voiceCapabilities,
   wechatClientInspector = inspectWeChatClient,
   restoreDesktopWindowImpl = restoreDesktopWindow,
+  applyStoppedOffscreenImpl = applyStoppedOffscreen,
   readLocalContacts = localContacts,
 } = {}) {
   const updates = createUpdateChecker({ root, fetchImpl });
@@ -207,6 +211,7 @@ export function createConsole({
   let latestJob = null;
   let protectingCredential = false;
   let processRecoveryBusy = false;
+  let applyingStoppedPlacement = false;
   let shutdownPromise = null,
     shuttingDown = false;
   const processRecovery = createProcessRecovery({ root, probe: processProbe, stop: processStop });
@@ -231,8 +236,10 @@ export function createConsole({
   });
   const desktopControl = createDesktopControlClient({ root, configFor: () => snapshot().config, fetchImpl });
   const assertDesktopStopped = async () => {
-    const runtime = optionalJson(path.join(root, 'state/runtime.json'));
-    if (!runtime.adapter && !runtime.bridge) return true;
+    if (!fs.existsSync(path.join(root, 'state/runtime.lock'))) {
+      const runtime = optionalJson(path.join(root, 'state/runtime.json'));
+      if (!runtime.adapter && !runtime.bridge) return true;
+    }
     let output = '';
     const code = await runConsoleCommand(
       {
@@ -252,6 +259,7 @@ export function createConsole({
     const result = output.trim().split(/\r?\n/u).at(-1);
     if (code === 0 && result === 'DESKTOP_RUNNING') throw fault('请先停止机器人，再处理未确认的输入或录音。', 409);
     if (code === 0 && result === 'DESKTOP_STOPPED') return true;
+    if (output.includes('RUNTIME_OPERATION_BUSY')) throw fault('已有一项服务操作正在执行，请稍后重试。', 409);
     throw fault('无法核对服务状态，请先停止机器人。', 409);
   };
   const inputOperations = createInputOperationsApi({
@@ -259,6 +267,28 @@ export function createConsole({
     account: () => activeReaderAccount(root).id,
     assertStopped: assertDesktopStopped,
   });
+  async function applyDesktopConfiguration(saved, expectedAccount, { stoppedWindow = false, running = true } = {}) {
+    const live = running
+      ? await desktopControl({ action: 'apply-configuration' }, { optional: true })
+      : { available: false };
+    if (live.available || !stoppedWindow) return live;
+    assertIdle();
+    applyingStoppedPlacement = true;
+    try {
+      return await applyStoppedOffscreenImpl({
+        root,
+        config: saved.config,
+        assertStopped: async () => {
+          await assertDesktopStopped();
+          if (snapshot().revision !== saved.revision || (activeReaderAccount(root).id || 'legacy') !== expectedAccount)
+            throw fault('账号或配置已变化，请刷新后重试。', 409);
+          return true;
+        },
+      });
+    } finally {
+      applyingStoppedPlacement = false;
+    }
+  }
   async function saveConfiguration(body, expectedAccount = activeReaderAccount(root).id || 'legacy') {
     const previous = snapshot();
     if (body.revision !== previous.revision) throw fault('配置已变化，请重新载入后保存。', 409);
@@ -273,15 +303,12 @@ export function createConsole({
       candidate.input.wechatExecutable = selected.path;
       candidate.input.expectedVersion = selected.version;
     }
-    const config = validateConsoleConfig(candidate, root);
-    await chatTargets.verifyAdditions(previous.config, config, expectedAccount);
+    const config = validateConsoleConfig(candidate, root, server.address()?.port ?? port);
+    const starts = await chatTargets.verifyAdditions(previous.config, config, expectedAccount);
     if ((activeReaderAccount(root).id || 'legacy') !== expectedAccount || snapshot().revision !== previous.revision)
       throw fault('账号或配置已变化，请重新载入后保存。', 409);
-    reconcileRosterGrants(previous.config.wechat, config.wechat);
-    const boundPort = server.address()?.port ?? port;
-    if (Object.values(config.ports).includes(boundPort)) throw fault('服务端口不能与控制台端口重复。');
-    backup(configFile);
-    atomic(configFile, config);
+    reconcileRosterGrants(previous.config.wechat, config.wechat, starts);
+    publishConfiguration(previous, config);
     localModels.refresh();
     const restart =
       JSON.stringify(withoutLiveSettings(previous.config)) !== JSON.stringify(withoutLiveSettings(config));
@@ -291,14 +318,19 @@ export function createConsole({
           previous.config.ports.dshPlugin !== config.ports.dshPlugin,
       );
     let desktopApply;
+    const offscreenChanged = (previous.config.input?.offscreen === true) !== (config.input?.offscreen === true);
     if (
-      !restart &&
-      ['controlMode', 'offscreen', 'typeText', 'paused'].some(
-        key => previous.config.input?.[key] !== config.input?.[key],
-      )
+      offscreenChanged ||
+      (!restart &&
+        ['controlMode', 'typeText', 'paused', 'voiceCable'].some(
+          key => JSON.stringify(previous.config.input?.[key]) !== JSON.stringify(config.input?.[key]),
+        ))
     ) {
       try {
-        desktopApply = await desktopControl({ action: 'apply-configuration' }, { optional: true });
+        desktopApply = await applyDesktopConfiguration(snapshot(), expectedAccount, {
+          stoppedWindow: offscreenChanged,
+          running: !restart,
+        });
       } catch (error) {
         desktopApply = { available: true, pending: true, error: error.code ?? 'DESKTOP_CONTROL_FAILED' };
       }
@@ -335,6 +367,14 @@ export function createConsole({
       path.join(dir, `${path.basename(file)}.${Date.now()}.${crypto.randomBytes(3).toString('hex')}.bak`),
     );
   };
+  function publishConfiguration(previous, next) {
+    if (applyingStoppedPlacement) throw fault('正在调整微信窗口位置，请完成后再保存设置。', 409);
+    if (snapshot().revision !== previous.revision) throw fault('配置已变化，请重新载入后保存。', 409);
+    backup(configFile);
+    reconcileAssistantReplay(previous.config.wechat, next.wechat);
+    reconcileGroupWakeEpochs(previous.config.wechat, next.wechat);
+    atomic(configFile, next);
+  }
   const markPending = (dsh = false) => {
     const previous = optionalJson(preferenceFile);
     atomic(preferenceFile, { ...previous, pendingApply: true, dshRestartRequired: previous.dshRestartRequired || dsh });
@@ -342,7 +382,7 @@ export function createConsole({
   };
   const assertIdle = () => {
     if (shuttingDown) throw fault('正在退出并停止后台服务，请等待操作完成。', 409);
-    if (activeJob || protectingCredential || processRecoveryBusy)
+    if (activeJob || protectingCredential || processRecoveryBusy || applyingStoppedPlacement)
       throw fault('有操作正在进行，请等它完成后再保存或执行其他操作。', 409);
   };
   function shutdown() {
@@ -384,11 +424,58 @@ export function createConsole({
     if (data.success === false) throw fault('读取服务返回错误，请查看运行日志。', 503);
     return data;
   }
-  async function reader(route) {
+  function readerConnection() {
     const { config } = snapshot();
     const io = optionalJson(path.join(root, 'state', 'wechat-io-config.json'));
-    if (!io.reader_token) throw fault('读取连接尚未准备，请先启动服务。', 503);
-    return remote(`http://127.0.0.1:${config.ports.weflow}${route}`, io.reader_token, 5000);
+    const port = config.ports.weflow;
+    if (
+      !Number.isInteger(port) ||
+      port < 1024 ||
+      port > 65535 ||
+      typeof io.reader_token !== 'string' ||
+      !io.reader_token
+    )
+      throw fault('读取连接尚未准备，请先启动服务。', 503);
+    return { base: `http://127.0.0.1:${port}`, token: io.reader_token };
+  }
+  async function reader(route) {
+    const { base, token } = readerConnection();
+    return remote(base + route, token, 5000);
+  }
+  async function confirmReceivedFile(body) {
+    const { key, id, path: source } = body ?? {};
+    if (
+      !validChatKey(key) ||
+      typeof id !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(id) ||
+      typeof source !== 'string' ||
+      source.length > 4096 ||
+      /[\0\r\n]/u.test(source) ||
+      !path.isAbsolute(source)
+    )
+      throw fault('请输入完整的附件 ID，并选择电脑微信缓存中的原文件。', 400);
+    const account = activeReaderAccount(root).id;
+    const grant = conversationGrant(snapshot().config.wechat, key);
+    if (!account || !grant) throw fault('请先验证读取账号并保存此聊天。', 403);
+    const { base, token } = readerConnection();
+    const response = await fetchImpl(base + '/api/v1/files/' + id + '/confirm', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: source, account, key, grant }),
+      redirect: 'error',
+      signal: AbortSignal.timeout(12000),
+    }).catch(() => {
+      throw fault('读取服务暂不可用。请启动服务后重试。', 503);
+    });
+    if (response.status === 403) throw fault('该附件不属于当前账号和聊天，或文件权限已变化。', 403);
+    if (response.status === 400) throw fault('无法核对所选文件。请从微信原消息重新定位附件。', 400);
+    if (!response.ok) throw fault('暂时无法确认附件。请检查读取服务。', 503);
+    const result = await response.json();
+    if (activeReaderAccount(root).id !== account || conversationGrant(snapshot().config.wechat, key) !== grant)
+      throw fault('微信账号或聊天授权已变化，请刷新后重试。', 409);
+    if (result.status !== 'confirmed' || result.id !== id || typeof result.name !== 'string')
+      throw fault('读取服务未能确认附件。', 503);
+    return { id, name: result.name };
   }
   async function stickerManager(route, body) {
     try {
@@ -459,7 +546,7 @@ export function createConsole({
     }
     return result;
   }
-  function buffered() {
+  function chatBuffers() {
     const buffer = optionalJson(path.join(root, 'state', 'social-messages.json'), { chats: {} });
     let member = { chats: {} };
     try {
@@ -469,6 +556,10 @@ export function createConsole({
         member,
       );
     } catch {}
+    return { buffer, member };
+  }
+  function buffered() {
+    const { buffer, member } = chatBuffers();
     const rows = [buffer, member].flatMap(item =>
       Object.entries(item.chats ?? {}).flatMap(([key, messages]) => messages.map(m => ({ ...m, key }))),
     );
@@ -477,6 +568,11 @@ export function createConsole({
       rows,
       chatCount: new Set([...Object.keys(buffer.chats ?? {}), ...Object.keys(member.chats ?? {})]).size,
     };
+  }
+  function assertChatModeIdle(key) {
+    const { buffer, member } = chatBuffers();
+    if ([buffer, member].some(item => item.pendingReplies?.[key] || item.pendingRequests?.[key]))
+      throw fault('此会话还有待处理的回复，请完成当前任务后再切换模式。', 409);
   }
   async function getStatus() {
     if (statusPromise && Date.now() - statusTime < 3000) return statusPromise;
@@ -513,6 +609,15 @@ export function createConsole({
         health.imageInput === 'native-attachment-v1' &&
         (!optionalJson(preferenceFile).dshRestartRequired || matchesDsh);
       const readerReady = !!readerState && !!value(1) && !readerState.lastError;
+      let intakeProgress = null;
+      try {
+        const account = activeReaderAccount(root).id;
+        if (!readerState) intakeProgress = savedIntakeProgress(root, account, config.wechat);
+        else if (!account || readerState.accountRef === account) intakeProgress = readerState.intakeProgress ?? null;
+      } catch {
+        /* Unavailable progress must not obscure the service health checks. */
+      }
+      const failedChats = Array.isArray(intakeProgress) ? intakeProgress.filter(chat => chat.error).length : 0;
       const bridgeReady = !!value(4) && adapter?.ob_connected === true;
       const senderReady =
         adapter?.backend === 'wechat-ui' &&
@@ -525,10 +630,10 @@ export function createConsole({
           id: 'reader',
           label: '微信读取',
           ready: readerReady,
-          detail: readerReady
-            ? '数据库可读，消息同步正常'
-            : readerState?.lastError === 'READER_CLOCK_MOVED_BACKWARD'
-              ? '系统时间已回拨。请校准时间，读取器会从原游标继续。'
+          detail: failedChats
+            ? `${failedChats} 个聊天读取异常，请查看读取进度`
+            : readerReady
+              ? '数据库可读，消息同步正常'
               : readerState?.lastError
                 ? '读取异常，请重新连接并验证'
                 : readerFailureDetail(),
@@ -557,14 +662,6 @@ export function createConsole({
         },
       ];
       const running = !!readerState || !!adapter || !!value(4);
-      let intakeProgress = null;
-      try {
-        const account = activeReaderAccount(root).id;
-        if (!readerState) intakeProgress = savedIntakeProgress(root, account, config.wechat);
-        else if (!account || readerState.accountRef === account) intakeProgress = readerState.intakeProgress ?? null;
-      } catch {
-        /* Unavailable progress must not obscure the service health checks. */
-      }
       return {
         ready,
         running,
@@ -968,6 +1065,10 @@ export function createConsole({
         assets['/memory-view.css'] = ['memory-view.css', 'text/css; charset=utf-8'];
         assets['/local-model-settings.mjs'] = ['local-model-settings.mjs', 'text/javascript; charset=utf-8'];
         assets['/local-model-schema.mjs'] = ['local-model-schema.mjs', 'text/javascript; charset=utf-8'];
+        assets['/packages/delivery-contract.mjs'] = [
+          '../../packages/delivery-contract.mjs',
+          'text/javascript; charset=utf-8',
+        ];
         assets['/packages/speech-contract/model-schema.mjs'] = [
           '../../packages/speech-contract/model-schema.mjs',
           'text/javascript; charset=utf-8',
@@ -1022,6 +1123,12 @@ export function createConsole({
         });
       if (req.headers['x-console-token'] !== csrf) throw fault('控制台连接已更新，请刷新页面。', 401);
       if (req.method === 'GET' && route === '/api/local-reply-media') return reply(200, localReplyMedia.snapshot());
+      if (req.method === 'GET' && route === '/api/desktop/voice-cable') {
+        const result = await inspectCableEndpoints(root).catch(() => {
+          throw fault('无法检查 VB-CABLE 线路。请先检查模拟输入依赖。', 503);
+        });
+        return reply(200, result);
+      }
       if (req.method === 'GET' && route === '/api/chat-targets') return reply(200, chatTargets.snapshot());
       if (req.method === 'GET' && route === '/api/input-operations') {
         const operations = await inputOperations.snapshot();
@@ -1206,6 +1313,7 @@ export function createConsole({
           .map(c => ({
             name: c.remark || c.displayName || c.nickname || c.username,
             id: c.username,
+            canSend: c.canSend === true,
           }));
         return reply(200, { account: selectedAccount, contacts });
       }
@@ -1301,12 +1409,18 @@ export function createConsole({
               ? 11300000
               : 128 * 1024;
       const body = await readBody(req, bodyLimit);
+      if (route === '/api/received-file/confirm') return reply(200, await confirmReceivedFile(body));
       if (route === '/api/local-reply-media/import') return reply(200, localReplyMedia.importDirectory(body));
       if (route === '/api/local-reply-media/save') return reply(200, localReplyMedia.update(body));
       if (route === '/api/chat-targets') return reply(200, await chatTargets.replace(body));
       if (route === '/api/input-operations/recover') return reply(200, await inputOperations.recover(body));
       if (route === '/api/desktop/apply')
-        return reply(200, await desktopControl({ action: 'apply-configuration' }, { optional: true }));
+        return reply(
+          200,
+          await applyDesktopConfiguration(snapshot(), activeReaderAccount(root).id || 'legacy', {
+            stoppedWindow: true,
+          }),
+        );
       if (route === '/api/local-models/profiles') return reply(200, await localModels.saveProfiles(body));
       if (route === '/api/local-models/discover') return reply(200, await localModels.discover(body));
       if (route === '/api/local-models/use') return reply(200, await localModels.use(body));
@@ -1445,7 +1559,8 @@ export function createConsole({
           await plugin(route.slice(4), { conversationKey: body.key, taskId: body.taskId, localControl: true }),
         );
       if (route === '/api/chat-settings') {
-        const previous = snapshot();
+        const previous = chatTargets.snapshot();
+        if (body.account !== previous.account) throw fault('微信账号已变化，请重新打开此会话设置。', 409);
         if (body.revision !== previous.revision) throw fault('配置已变化，请重新打开此会话设置。', 409);
         if (!allowedConversation(previous.config.wechat, body.key)) throw fault('只能设置已保存到聊天范围的会话。');
         const config = structuredClone(previous.config);
@@ -1454,9 +1569,7 @@ export function createConsole({
         const workModeChanged =
           conversationWorkMode(previous.config.wechat, body.key) !== conversationWorkMode(config.wechat, body.key);
         if (workModeChanged) {
-          const local = buffered().buffer;
-          if (local.pendingReplies?.[body.key] || local.pendingRequests?.[body.key])
-            throw fault('此会话还有待处理的回复，请完成当前任务后再切换模式。', 409);
+          assertChatModeIdle(body.key);
           // Offline configuration remains possible; a connected busy session must finish first.
           try {
             const sessions = await plugin('/sessions'),
@@ -1465,11 +1578,14 @@ export function createConsole({
           } catch (error) {
             if (error.status === 409) throw error;
           }
+          assertIdle();
+          if (chatTargets.snapshot().account !== previous.account)
+            throw fault('微信账号已变化，请重新打开此会话设置。', 409);
+          assertChatModeIdle(body.key);
         }
         const personaChanged =
           (previous.config.persona.chats?.[body.key] ?? null) !== (config.persona.chats?.[body.key] ?? null);
-        backup(configFile);
-        atomic(configFile, config);
+        publishConfiguration(previous, config);
         if (personaChanged) markPending();
         statusTime = 0;
         let modeReady = false;
@@ -1497,8 +1613,7 @@ export function createConsole({
         config.wechat.dshAccess ??= { chats: {} };
         config.wechat.dshAccess.chats[body.key] = { skills: body.skills, tools: body.tools };
         validateConversationSettings(config.wechat);
-        backup(configFile);
-        atomic(configFile, config);
+        publishConfiguration(previous, config);
         statusTime = 0;
         return reply(200, { ...snapshot(), pendingApply: false });
       }
@@ -1517,8 +1632,7 @@ export function createConsole({
         } catch (error) {
           throw error.status ? error : fault(error.message);
         }
-        backup(configFile);
-        atomic(configFile, config);
+        publishConfiguration(previous, config);
         return reply(200, { ...snapshot(), ...optionalJson(preferenceFile) });
       }
       if (route === '/api/reader-accounts') {
@@ -1612,7 +1726,7 @@ export function createConsole({
       if (route === '/api/wechat-client')
         return reply(200, await wechatClientInspector({ root, executable: body.path, allowForeground: true }));
       if (route === '/api/browse') {
-        if (!['exe', 'folder', 'workspace'].includes(body.kind)) throw fault('无效的文件类型。');
+        if (!['exe', 'folder', 'workspace', 'attachment'].includes(body.kind)) throw fault('无效的文件类型。');
         return reply(200, { path: filePicker ? await filePicker(body.kind) : await nativeHelper(body.kind) });
       }
       if (route === '/api/dsh-reopened') {

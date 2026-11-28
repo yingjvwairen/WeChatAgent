@@ -6,13 +6,21 @@ import { pipeline } from 'node:stream/promises';
 import { DatabaseSync } from 'node:sqlite';
 
 import { assistantSenderAllowed, assistantAdministrator } from './assistant-policy.mjs';
-import { FileReceiptHistory, fault, inside, noLinks, removeEmptyDirectory } from './file-storage.mjs';
+import {
+  FileReceiptHistory,
+  fault,
+  inside,
+  noLinks,
+  receiptWriteBlocked,
+  removeEmptyDirectory,
+} from './file-storage.mjs';
 import { conversationGrant, validChatKey } from './conversation-policy.mjs';
 import { validUserId } from '../wechat-identity.mjs';
 import { FILE_LIMIT, fileId, safeFileName } from '../wechat-file-reference.mjs';
 export { FILE_LIMIT, fileId, safeFileName } from '../wechat-file-reference.mjs';
 const terminalFileStates = new Set(['confirmed', 'failed', 'unconfirmed', 'cancelled', 'expired']);
 export const fileDeliveryFinished = state => terminalFileStates.has(state);
+export const hasNoFileSendIntent = job => job.state === 'queued' && !job.nativeAdmitted;
 export const awaitsFileReceipt = job => job.state === 'unconfirmed' && job.nativeAdmitted && !job.nativeReviewed;
 const activeLimit = 128;
 const byteLimit = 512 * 1024 * 1024;
@@ -26,6 +34,22 @@ const grantAllowsJob = (settings, job) =>
 const busyFile = error => ['EBUSY', 'EACCES', 'EPERM'].includes(error.code);
 const damagedCheckpoint = error =>
   error instanceof SyntaxError || ['FILE_JOB_INVALID', 'FILE_LINK_NOT_ALLOWED', 'EISDIR'].includes(error.code);
+const archiveIdentityFields = [
+  'id',
+  'accountScope',
+  'account',
+  'accountRef',
+  'key',
+  'sender',
+  'rosterGrant',
+  'name',
+  'size',
+  'md5',
+  'sha256',
+  'createdAt',
+  'deadlineAt',
+  'controlRevision',
+];
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 async function copyVerified(source, destination, expected, signal, mismatch) {
@@ -54,9 +78,11 @@ const publicJob = job => ({
   ...(job.error ? { error: job.error } : {}),
   ...(job.receipt ? { receipt: job.receipt } : {}),
   notice:
-    job.state === 'confirmed'
-      ? '微信已出现新的匹配文件消息及服务器回执。'
-      : '仅表示后台传输状态；未确认前不能声称文件已送达。',
+    job.state !== 'confirmed'
+      ? '后台仍未确认文件送达。'
+      : job.receipt?.fileContentMd5Matched === false
+        ? '微信已确认同名、同大小的出站文件消息，内容摘要未核实。'
+        : '微信已出现新的匹配文件消息及服务器回执。',
 });
 export class FileTransfers {
   constructor(root) {
@@ -93,18 +119,29 @@ export class FileTransfers {
     if (!filesAllowed(settings, key, sender)) throw fault('FILE_TRANSFER_NOT_ALLOWED');
     return { key, sender, accountScope: this.account(), rosterGrant: conversationGrant(settings, key) };
   }
-  find(id) {
+  find(id, archivedJson) {
     if (!fileId(id)) throw fault('FILE_REFERENCE_INVALID');
     const file = path.join(this.jobs, id + '.json');
     noLinks(this.root, file);
-    let job;
+    let active, failure;
     try {
       if (fs.statSync(file).size > 16384) throw fault('FILE_JOB_INVALID');
-      job = read(file);
+      active = read(file);
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      job = this.history.find(id);
-      if (!job) return;
+      if (error.code !== 'ENOENT') failure = error;
+    }
+    const archived = archivedJson === undefined ? this.history.find(id) : JSON.parse(archivedJson);
+    // Only an update to the same pending archive may supersede its saved state.
+    const finishesArchive =
+      archived &&
+      awaitsFileReceipt(archived) &&
+      fileDeliveryFinished(active?.state) &&
+      !awaitsFileReceipt(active) &&
+      archiveIdentityFields.every(field => active[field] === archived[field]);
+    const job = archived && !finishesArchive ? archived : active;
+    if (job === undefined) {
+      if (failure) throw failure;
+      return;
     }
     if (
       !job ||
@@ -130,19 +167,27 @@ export class FileTransfers {
       throw fault('FILE_JOB_INVALID');
     return job;
   }
-  read(id) {
-    const job = this.find(id);
+  read(id, archivedJson) {
+    const job = this.find(id, archivedJson);
     if (!job) throw fault('ENOENT');
     return job;
   }
   // Save the terminal checkpoint before removing its private copy. A crash or
   // a busy file leaves the checkpoint available for cleanup on the next scan.
   retire(job) {
-    this.history.save(job, awaitsFileReceipt(job));
+    try {
+      this.history.save(job, awaitsFileReceipt(job));
+    } catch (error) {
+      if (receiptWriteBlocked(error)) return false;
+      throw error;
+    }
     const directory = path.join(this.outgoing, job.id),
-      source = path.join(directory, job.name);
+      source = path.join(directory, job.name),
+      ready = path.join(this.outgoing, job.id + '.ready');
     try {
       noLinks(this.root, directory);
+      noLinks(this.root, ready);
+      fs.rmSync(ready, { force: true });
       fs.rmSync(source, { force: true });
       removeEmptyDirectory(directory);
       fs.rmSync(path.join(this.jobs, job.id + '.json'), { force: true });
@@ -164,7 +209,7 @@ export class FileTransfers {
     } finally {
       fs.rmSync(temporary, { force: true });
     }
-    if (fileDeliveryFinished(job.state)) this.retire(job);
+    if (fileDeliveryFinished(job.state)) return this.retire(job);
   }
   // A .ready copy and its active JSON are published under the same writer
   // lock. After a process exit we can complete the rename, or discard the
@@ -206,15 +251,21 @@ export class FileTransfers {
     return busy;
   }
   inspectActive() {
-    const usage = { jobs: [], count: 0, bytes: 0 };
+    const usage = { jobs: [], retiring: [], count: 0, bytes: 0 };
     const busy = this.recoverCopies();
     noLinks(this.root, this.jobs);
     if (!fs.existsSync(this.jobs)) return usage;
-    for (const name of fs.readdirSync(this.jobs)) {
-      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+    const ids = fs
+      .readdirSync(this.jobs)
+      .filter(name => /^[a-f0-9]{64}\.json$/.test(name))
+      .map(name => name.slice(0, -5));
+    const archived = this.history.metadataFor(ids);
+    const account = this.account(),
+      now = Date.now();
+    for (const id of ids) {
       let job;
       try {
-        job = this.read(name.slice(0, -5));
+        job = this.read(id, archived.get(id) ?? null);
       } catch (error) {
         // Reserve capacity for damaged checkpoints while other jobs continue.
         if (!busyFile(error) && !damagedCheckpoint(error)) throw error;
@@ -224,27 +275,45 @@ export class FileTransfers {
       }
       if (fileDeliveryFinished(job.state)) {
         if (this.retire(job)) continue;
-      } else if (!busy.has(job.id) || job.deadlineAt <= Date.now()) usage.jobs.push(job);
+        usage.retiring.push(job);
+      } else if (job.deadlineAt <= now && (hasNoFileSendIntent(job) || job.accountScope !== account)) {
+        // Keep current-account admissions for the worker to check against the desktop queue.
+        const expired = {
+          ...job,
+          state: job.nativeAdmitted ? 'unconfirmed' : 'expired',
+          error: 'FILE_DELIVERY_TIMEOUT',
+        };
+        try {
+          if (this.write(expired)) continue;
+          usage.retiring.push(expired);
+        } catch (error) {
+          if (!busyFile(error)) throw error;
+        }
+      } else if (!busy.has(job.id) || job.deadlineAt <= now) usage.jobs.push(job);
       usage.count++;
       usage.bytes += job.size;
     }
     return usage;
   }
-  list() {
+  list({ includeRetiring = false, account } = {}) {
     if (!fs.existsSync(this.directory)) return [];
-    return this.withDeliveryLock(() => this.inspectActive().jobs);
+    return this.withDeliveryLock(() => {
+      const { jobs, retiring } = this.inspectActive();
+      const result = includeRetiring ? [...jobs, ...retiring] : jobs;
+      return account === undefined ? result : result.filter(job => job.accountScope === account);
+    });
   }
   conversationDeliveries(key) {
     const account = this.account();
     const settings = this.settings().wechat;
     const senders = (settings.assistant?.administrators ?? []).filter(sender => filesAllowed(settings, key, sender));
     const jobsById = new Map(
-      this.list()
-        .filter(job => job.accountScope === account && job.key === key && grantAllowsJob(settings, job))
+      this.list({ includeRetiring: true, account })
+        .filter(job => job.key === key && grantAllowsJob(settings, job))
         .map(job => [job.id, job]),
     );
     for (const job of this.history.recent(account, key, conversationGrant(settings, key), senders))
-      jobsById.set(job.id, job);
+      if (!jobsById.has(job.id)) jobsById.set(job.id, job);
     const jobs = [...jobsById.values()].sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
     if (account !== this.account()) throw fault('FILE_ACCOUNT_CHANGED');
     return {
@@ -261,7 +330,12 @@ export class FileTransfers {
             ? 'paused'
             : (job.nativeState ?? job.state),
         revision: job.controlRevision ?? 0,
-        ...(job.nativeRecovery ? { recovery: job.nativeRecovery } : {}),
+        ...(job.receipt ? { receipt: job.receipt } : {}),
+        ...(job.nativeReviewed === true
+          ? { reviewed: true }
+          : job.nativeRecovery
+            ? { recovery: job.nativeRecovery }
+            : {}),
       })),
     };
   }
@@ -310,16 +384,18 @@ export class FileTransfers {
   saveProgress(job, { claim = false } = {}) {
     return this.withDeliveryLock(() => {
       const current = this.read(job.id);
+      if (job.accountScope !== current.accountScope || current.accountScope !== this.account()) return false;
+      const observing = awaitsFileReceipt(current);
+      const settlesObservation =
+        observing &&
+        fileDeliveryFinished(job.state) &&
+        (job.state !== 'unconfirmed' || job.nativeReviewed || job.receipt);
       if (
         (current.controlRevision ?? 0) !== (job.controlRevision ?? 0) ||
-        ((job.state === 'confirmed' || job.nativeReviewed) && !this.allowedJob(current)) ||
+        ((job.receipt || job.state === 'confirmed' || job.nativeReviewed) && !observing && !this.allowedJob(current)) ||
         (claim && (current.state !== 'queued' || current.nativeAdmitted)) ||
         (!claim && job.state === 'submitting' && current.state !== 'submitting') ||
-        (fileDeliveryFinished(current.state) &&
-          !(
-            awaitsFileReceipt(current) &&
-            (job.state === 'confirmed' || (job.state === 'unconfirmed' && job.nativeReviewed))
-          )) ||
+        (fileDeliveryFinished(current.state) && !settlesObservation) ||
         (current.queuePaused && job.state !== 'expired')
       )
         return false;
@@ -440,6 +516,13 @@ export class FileTransfers {
     if (!response.ok) throw fault('FILE_READER_UNAVAILABLE');
     const data = await response.json();
     if (!this.allowedJob(grant)) throw fault('FILE_ACCESS_CHANGED');
+    if (
+      ((data.status === 'ambiguous' && data.code === 'FILE_CACHE_AMBIGUOUS') ||
+        (data.status === 'unverified' && data.code === 'FILE_LOCAL_CONFIRMATION_CHANGED')) &&
+      data.id === id &&
+      safeFileName(data.name)
+    )
+      return { status: data.status, code: data.code, id, name: data.name, message: String(data.message).slice(0, 300) };
     if (data.status !== 'ready')
       return { status: data.status, message: String(data.message ?? '文件尚未准备好。').slice(0, 300) };
     if (

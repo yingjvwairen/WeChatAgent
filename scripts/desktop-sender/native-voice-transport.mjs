@@ -113,6 +113,91 @@ function bind(job) {
     durationMs: job.durationMs,
   };
 }
+function readTransportState(directory, binding) {
+  const state = read(path.join(directory, binding.id + '.json'));
+  if (!state) return null;
+  if (
+    !object(state) ||
+    Object.keys(binding).some(key => state[key] !== binding[key]) ||
+    !['prepared', 'record-intent', 'finished', 'unknown'].includes(state.state) ||
+    !Number.isSafeInteger(state.submittedAt) ||
+    !Number.isSafeInteger(state.deadlineAt) ||
+    state.deadlineAt <= state.submittedAt ||
+    state.deadlineAt - state.submittedAt > 60000 ||
+    typeof state.accountDirectory !== 'string' ||
+    state.accountDirectory.length > 256 ||
+    /[\\/\0]/.test(state.accountDirectory) ||
+    (state.recording !== undefined &&
+      (!object(state.recording) ||
+        !Number.isSafeInteger(state.recording.startedAt) ||
+        !Number.isSafeInteger(state.recording.releasedAt)))
+  )
+    throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
+  if (
+    state.submitAttempted !== undefined &&
+    state.submitAttempted !== null &&
+    typeof state.submitAttempted !== 'boolean'
+  )
+    throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
+  if (
+    state.focusRecoveryRequired !== undefined &&
+    (state.focusRecoveryRequired !== true ||
+      state.state !== 'finished' ||
+      !(
+        (state.attempted === false && state.submitAttempted === false) ||
+        (state.attempted === true &&
+          (state.submitAttempted === true ||
+            validVoiceRecordingCancellationEvidence(state.recordingCancellation, binding)))
+      ) ||
+      state.recordingPossible !== false ||
+      state.stopBarrier !== false ||
+      state.routeSafe !== true ||
+      safeCode(state.focusRecoveryError) !== state.focusRecoveryError)
+  )
+    throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
+  if (
+    state.interruptionCancellation !== undefined &&
+    (!validVoiceInterruptionEvidence(state.interruptionCancellation, binding) ||
+      state.state !== 'finished' ||
+      state.attempted !== true ||
+      state.submitAttempted !== false ||
+      state.recordingPossible !== false ||
+      state.stopBarrier !== false ||
+      state.routeSafe !== true ||
+      state.reason !== state.interruptionCancellation.reason)
+  )
+    throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
+  if (
+    state.recordingCancellation !== undefined &&
+    (state.interruptionCancellation !== undefined ||
+      !validVoiceRecordingCancellationEvidence(state.recordingCancellation, binding) ||
+      state.state !== 'finished' ||
+      state.attempted !== true ||
+      state.submitAttempted !== false ||
+      state.recordingPossible !== false ||
+      state.stopBarrier !== false ||
+      state.routeSafe !== true ||
+      state.reason !== state.recordingCancellation.reason)
+  )
+    throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
+  return state;
+}
+
+const canQueryVoiceReceipt = state =>
+  state?.attempted === true &&
+  state.submitAttempted !== false &&
+  !state.interruptionCancellation &&
+  !state.recordingCancellation;
+
+const recordingReleased = state =>
+  state.recordingPossible === false && state.stopBarrier === false && state.routeSafe === true;
+
+export function storedVoiceSubmission(root, job) {
+  const state = readTransportState(path.join(root, 'state/native-voice-transport'), bind(job));
+  if (!canQueryVoiceReceipt(state) || state.submitAttempted !== true) return null;
+  return { recording: state.recording, inputReleased: recordingReleased(state) && !state.focusRecoveryRequired };
+}
+
 function validateFresh(fresh, job, request, now) {
   const session = fresh?.session,
     proof = fresh?.accountProof,
@@ -204,71 +289,6 @@ export class NativeVoiceTransport {
   #file(id) {
     return path.join(this.directory, id + '.json');
   }
-  #load(binding) {
-    const state = read(this.#file(binding.id));
-    if (!state) return null;
-    if (
-      !object(state) ||
-      Object.keys(binding).some(key => state[key] !== binding[key]) ||
-      !['prepared', 'record-intent', 'finished', 'unknown'].includes(state.state) ||
-      !Number.isSafeInteger(state.submittedAt) ||
-      !Number.isSafeInteger(state.deadlineAt) ||
-      state.deadlineAt <= state.submittedAt ||
-      state.deadlineAt - state.submittedAt > 60000 ||
-      typeof state.accountDirectory !== 'string' ||
-      state.accountDirectory.length > 256 ||
-      /[\\/\0]/.test(state.accountDirectory)
-    )
-      throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
-    if (
-      state.submitAttempted !== undefined &&
-      state.submitAttempted !== null &&
-      typeof state.submitAttempted !== 'boolean'
-    )
-      throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
-    if (
-      state.focusRecoveryRequired !== undefined &&
-      (state.focusRecoveryRequired !== true ||
-        state.state !== 'finished' ||
-        !(
-          (state.attempted === false && state.submitAttempted === false) ||
-          (state.attempted === true &&
-            (state.submitAttempted === true ||
-              validVoiceRecordingCancellationEvidence(state.recordingCancellation, binding)))
-        ) ||
-        state.recordingPossible !== false ||
-        state.stopBarrier !== false ||
-        state.routeSafe !== true ||
-        safeCode(state.focusRecoveryError) !== state.focusRecoveryError)
-    )
-      throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
-    if (
-      state.interruptionCancellation !== undefined &&
-      (!validVoiceInterruptionEvidence(state.interruptionCancellation, binding) ||
-        state.state !== 'finished' ||
-        state.attempted !== true ||
-        state.submitAttempted !== false ||
-        state.recordingPossible !== false ||
-        state.stopBarrier !== false ||
-        state.routeSafe !== true ||
-        state.reason !== state.interruptionCancellation.reason)
-    )
-      throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
-    if (
-      state.recordingCancellation !== undefined &&
-      (state.interruptionCancellation !== undefined ||
-        !validVoiceRecordingCancellationEvidence(state.recordingCancellation, binding) ||
-        state.state !== 'finished' ||
-        state.attempted !== true ||
-        state.submitAttempted !== false ||
-        state.recordingPossible !== false ||
-        state.stopBarrier !== false ||
-        state.routeSafe !== true ||
-        state.reason !== state.recordingCancellation.reason)
-    )
-      throw fault('NATIVE_VOICE_TRANSPORT_STATE_INVALID');
-    return state;
-  }
   #receiptJob(state) {
     return {
       id: state.id,
@@ -304,20 +324,14 @@ export class NativeVoiceTransport {
     };
   }
   #result(state, receipt) {
-    const safe = state.recordingPossible === false && state.stopBarrier === false && state.routeSafe === true;
+    const safe = recordingReleased(state);
     const cancellation = validVoiceInterruptionEvidence(state.interruptionCancellation, state)
       ? state.interruptionCancellation
       : undefined;
     const recordingCancellation = validVoiceRecordingCancellationEvidence(state.recordingCancellation, state)
       ? state.recordingCancellation
       : undefined;
-    const confirmed =
-      !cancellation &&
-      !recordingCancellation &&
-      state.submitAttempted !== false &&
-      safe &&
-      state.attempted === true &&
-      receipt?.confirmed === true;
+    const confirmed = canQueryVoiceReceipt(state) && safe && receipt?.confirmed === true;
     const foregroundTiming = sanitizeForegroundTiming(state.foregroundTiming);
     const adaptiveRecordingUi = sanitizeAdaptiveRecordingUi(state.adaptiveRecordingUi);
     const uiaRecordingUi = sanitizeUiaRecordingUi(state.uiaRecordingUi);
@@ -343,7 +357,7 @@ export class NativeVoiceTransport {
   }
   async querySegment(job, { signal } = {}) {
     const binding = bind(job),
-      state = this.#load(binding);
+      state = readTransportState(this.directory, binding);
     if (!state)
       return {
         confirmed: false,
@@ -352,11 +366,11 @@ export class NativeVoiceTransport {
         routeSafe: false,
         reason: 'NATIVE_VOICE_ATTEMPT_MISSING',
       };
-    if (state.interruptionCancellation || state.recordingCancellation) return this.#result(state);
+    if (!canQueryVoiceReceipt(state)) return this.#result(state);
     let result;
     try {
       const { receipts } = await this.#receipts(job, state.accountDirectory);
-      result = await receipts.query(this.#receiptJob(state), { signal });
+      result = await receipts.query(this.#receiptJob(state), { signal, recording: state.recording });
     } catch (error) {
       result = { confirmed: false, reason: safeCode(error.code) };
     }
@@ -400,7 +414,7 @@ export class NativeVoiceTransport {
     try {
       noLinks(this.directory);
       fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-      state = this.#load(binding);
+      state = readTransportState(this.directory, binding);
       if (state) return await this.querySegment(job, { signal });
       const interactionPlan = voicePlan(this.currentPlan());
       const planUnchanged = () => {
@@ -425,12 +439,13 @@ export class NativeVoiceTransport {
       active();
       const { receipts, accountDirectory } = await this.#receipts(job);
       active();
+      const submittedAt = this.now();
       state = {
         ...binding,
         accountDirectory,
         state: 'prepared',
-        submittedAt: this.now(),
-        deadlineAt: this.now() + 60000,
+        submittedAt,
+        deadlineAt: submittedAt + 60000,
         attempted: false,
         recordingPossible: false,
         stopBarrier: false,
@@ -500,11 +515,7 @@ export class NativeVoiceTransport {
       nativeStarted = true;
       const recordingStartedAt = this.now();
       const native = await this.runNative({ ...request, session });
-      if (typeof receipts.submitted === 'function')
-        await receipts.submitted(this.#receiptJob(state), this.now(), {
-          baselineId: prepared.baselineId,
-          recording: { startedAt: recordingStartedAt, releasedAt: this.now() },
-        });
+      const recording = { startedAt: recordingStartedAt, releasedAt: this.now() };
       if (native?.nativeStarted === false && native?.recordingPossible === false) nativeStarted = false;
       const ended = native?.recordingPossible === false && native?.stopBarrier === false;
       const foregroundTiming = makeForegroundTiming({
@@ -526,9 +537,10 @@ export class NativeVoiceTransport {
         ((focus.initialReturnAttempted && !focus.initialReturnConfirmed) ||
           (focus.finalReturnAttempted && !focus.finalReturnConfirmed)),
       );
-      if (foregroundTiming) recordForegroundTiming({ root: this.root, timing: foregroundTiming, now: this.now });
+      // Preserve the native result before Reader I/O so a journal outage cannot erase it.
       write({
         state: ended ? 'finished' : 'unknown',
+        recording,
         attempted: native?.recordingAttempted === false && native?.submitAttempted === false ? false : true,
         submitAttempted: typeof native?.submitAttempted === 'boolean' ? native.submitAttempted : null,
         ...(foregroundTiming ? { foregroundTiming } : {}),
@@ -544,11 +556,12 @@ export class NativeVoiceTransport {
         routeSafe: native?.systemSettingsChanged === false,
         reason: native?.reason ? safeCode(native.reason) : null,
       });
-      if (interruptionCancellation || recordingCancellation) return result(state);
-      // Receipt reads remain permitted after cancellation; they never retry input.
+      if (foregroundTiming) recordForegroundTiming({ root: this.root, timing: foregroundTiming, now: this.now });
+      if (!canQueryVoiceReceipt(state)) return result(state);
+      // Receipt checks for an attempted submission cannot retry input.
       const query = async () => {
         try {
-          return await receipts.query(this.#receiptJob(state), { signal });
+          return await receipts.query(this.#receiptJob(state), { signal, recording });
         } catch (error) {
           return { confirmed: false, reason: safeCode(error.code) };
         }

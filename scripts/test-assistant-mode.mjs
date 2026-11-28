@@ -13,6 +13,10 @@ import { bindDshAccess, DSH_ACCESS_POLICY, dshCatalog } from '../packages/dsh-so
 import { chatSettingsSnapshot, applyChatSettings } from '../public/console/conversation-settings.mjs';
 import { MessageBuffer } from '../components/qq-bridge/src/core/message-buffer.js';
 import { SocialEngine } from '../components/qq-bridge/src/core/social-engine.js';
+import {
+  assistantReplayAllowed,
+  reconcileAssistantReplay,
+} from '../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 const key = 'wechat:private:123',
   group = 'wechat:group:456@chatroom';
 const config = () => ({
@@ -35,6 +39,38 @@ test('legacy chats keep social mode, assistant groups default to mention, invali
   assert.equal(conversationWorkMode(c.wechat, 'wechat:group:999@chatroom'), 'social');
   assert.throws(() => validateConversationSettings({ ...c.wechat, workModes: { [key]: 'full-access' } }));
 });
+test('assistant replay only uses the saved administrator and chat grant after its effective second', () => {
+  const previous = config().wechat;
+  const initial = {
+    ...previous,
+    workModes: { [key]: 'assistant', [group]: 'assistant' },
+    assistant: { replayOffline: true, administrators: ['123'] },
+  };
+  reconcileAssistantReplay(previous, initial, 100750);
+  validateConversationSettings(initial);
+  assert.equal(assistantReplayAllowed(initial, group, 100), false);
+  assert.equal(assistantReplayAllowed(initial, group, 101), true);
+  const promoted = structuredClone(initial);
+  promoted.assistant.administrators.push('other');
+  assert.equal(assistantReplayAllowed(promoted, group, 130), false);
+  reconcileAssistantReplay(initial, promoted, 150000);
+  assert.equal(assistantReplayAllowed(promoted, group, 150), false);
+  assert.equal(assistantReplayAllowed(promoted, group, 151), true);
+  const reordered = structuredClone(promoted);
+  reordered.assistant.administrators.reverse();
+  reconcileAssistantReplay(promoted, reordered, 170000);
+  assert.equal(assistantReplayAllowed(reordered, group, 151), true);
+  const regranted = { ...structuredClone(reordered), rosterGrants: { [group]: 'new-grant' } };
+  assert.equal(assistantReplayAllowed(regranted, group, 180), false);
+  reconcileAssistantReplay(reordered, regranted, 180000);
+  assert.equal(assistantReplayAllowed(regranted, group, 180), false);
+  assert.equal(assistantReplayAllowed(regranted, group, 181), true);
+  const stopped = { ...structuredClone(regranted), assistant: { replayOffline: false } };
+  reconcileAssistantReplay(regranted, stopped, 190000);
+  assert.equal(assistantReplayAllowed(stopped, group, 191), false);
+  assert.equal(stopped.assistant.replayAuthorization, undefined);
+});
+
 test('mode settings keep distinct personas and grants; switching back restores the original settings', () => {
   const c = config(),
     old = chatSettingsSnapshot(c, key);

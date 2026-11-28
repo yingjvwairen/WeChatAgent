@@ -179,14 +179,14 @@ function template(value, variables, depth = 0, budget = { left: 8 * 1024 * 1024 
   return value;
 }
 
-export function responseText(value, path) {
+export function responseText(value, path, allowEmpty = false) {
   if (path)
     for (const key of path.split('.')) {
       if (forbidden.has(key) || !value || typeof value !== 'object' || !Object.hasOwn(value, key))
         throw fault('VOICE_API_RESPONSE_INVALID');
       value = value[key];
     }
-  if (typeof value !== 'string' || !value.trim()) throw fault('VOICE_API_EMPTY_TRANSCRIPT');
+  if (typeof value !== 'string' || (!allowEmpty && !value.trim())) throw fault('VOICE_API_EMPTY_TRANSCRIPT');
   return value.trim();
 }
 
@@ -269,7 +269,7 @@ export async function limitedBody(response, maxBytes = 65536) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-export async function transcribeAudio(config, audio, { signal, fetchImpl = fetch } = {}) {
+async function requestTranscription(config, audio, { signal, fetchImpl = fetch, allowEmpty = false } = {}) {
   config = effectiveSpeechSettings(config);
   validateConfig(config);
   const { url, protocol } = resolveApi(config);
@@ -296,15 +296,10 @@ export async function transcribeAudio(config, audio, { signal, fetchImpl = fetch
   let text;
   if (['openai-chat', 'chat-audio-data-url'].includes(protocol)) {
     const content = value?.choices?.[0]?.message?.content;
-    text = responseText(
-      Array.isArray(content)
-        ? content
-            .filter(item => item?.type === 'text' && typeof item.text === 'string')
-            .map(item => item.text)
-            .join('\n')
-        : content,
-      '',
-    );
+    const parts = Array.isArray(content)
+      ? content.filter(item => item?.type === 'text' && typeof item.text === 'string')
+      : [];
+    text = responseText(parts.length ? parts.map(item => item.text).join('\n') : content, '', allowEmpty);
   } else
     text = responseText(
       value,
@@ -315,9 +310,15 @@ export async function transcribeAudio(config, audio, { signal, fetchImpl = fetch
         : config.responseMode === 'text'
           ? ''
           : config.responsePath,
+      allowEmpty,
     );
   if (text.length > config.maxTranscriptChars) throw fault('VOICE_TRANSCRIPT_TOO_LONG');
-  return text;
+  const cacheable = !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get('cache-control') ?? '');
+  return { text, cacheable };
+}
+
+export async function transcribeAudio(config, audio, options) {
+  return (await requestTranscription(config, audio, options)).text;
 }
 
 export function voiceErrorCode(error) {
@@ -342,19 +343,26 @@ export async function recognize(ctx, { id }) {
       .digest('hex');
     if (config.cacheResults && cache.has(identity)) return { ...cache.get(identity), cached: true };
     const transcripts = [];
+    let cacheable = config.cacheResults;
     stage = 'audio';
     for await (const audio of ctx.audio.segments(id, {
       format: config.audioFormat,
       maxDurationSeconds: config.maxDurationSeconds,
     })) {
       stage = 'api';
-      transcripts.push(await transcribeAudio(config, audio, { signal: ctx.signal }));
+      const part = await requestTranscription(config, audio, { signal: ctx.signal, allowEmpty: true });
+      if (part.text) transcripts.push(part.text);
+      cacheable = cacheable && part.cacheable;
       if (transcripts.join('\n').length > config.maxTranscriptChars) throw fault('VOICE_TRANSCRIPT_TOO_LONG');
       stage = 'audio';
     }
     const text = transcripts.join('\n');
+    if (!text) {
+      stage = 'api';
+      throw fault('VOICE_API_EMPTY_TRANSCRIPT');
+    }
     const result = { ok: true, id, text };
-    if (config.cacheResults) {
+    if (cacheable) {
       cache.set(identity, result);
       while (cache.size > 128) cache.delete(cache.keys().next().value);
     }

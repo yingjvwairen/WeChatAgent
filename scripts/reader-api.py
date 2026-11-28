@@ -8,11 +8,12 @@ import base64
 import ctypes
 import ctypes.wintypes as wintypes
 import hashlib
+import hmac
 from itertools import islice
 import json
 import pathlib
-import queue
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -21,28 +22,33 @@ import subprocess
 import concurrent.futures
 import urllib.request
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from wechat_files import FILE_TYPE as FILE_TYPE, parse_file_message, FileCatalog
+from wechat_files import FILE_TYPE as FILE_TYPE, FileCatalog
 from wechat_voice_input import (
     VoiceCatalog,
-    voice_info,
     audio_policy,
     load_voice_blob,
     audio_result,
     silk_frame_digest,
     silk_duration,
 )
-from wechat_video import VideoPreviews, frame_count
+from wechat_video import VideoPreviews
 from wechat_reference_media import register_quoted_original
-from wechat_media import clean_account_wxid, image_cache_current, extract_blob_md5s
+from wechat_media import (
+    clean_account_wxid,
+    image_cache_current,
+    extract_blob_md5s,
+    configured_image_keys,
+    resolve_v2_media_key,
+)
+from wechat_image_receipt import match_outgoing_images
 from wechat_mentions import group_mention_flags
 from wechat_forwarded import FORWARD_TYPE as FORWARD_TYPE
-from wechat_quote import QUOTE_TYPE, parse_quote_receipt
+from wechat_quote import QUOTE_TYPE as QUOTE_TYPE
 from wechat_sticker_send import (
     sticker_send_fields,
-    sticker_receipt_md5,
     APPMSG_STICKER_TYPE,
     native_gif_bytes,
     stage_sticker_resource,
@@ -55,14 +61,17 @@ from wechat_meme_library import import_library_sticker, inspect_library_sticker
 from wechat_identity import chat_key, group_username, reader_account_scope, valid_chat_id
 from desktop_targets import DesktopTargets
 from reader_http import create_reader_server, reader_request_handler
-from reader_intake import ReaderIntake, cache_evictions
+from reader_intake import ReaderIntake, cache_evictions, touch_media_record
 from reader_message_binding import MessageBinding
 from reader_message_rows import (
-    outgoing_image_md5,
+    MAX_RECEIPT_RESPONSE_BYTES,
+    MAX_RECEIPT_ROWS,
+    attachment_fields,
     chronological_rows,
     intake_shard_heads,
     media_source_row,
     message_page,
+    recorded_voice_duration,
     server_event_id,
     shard_id,
 )
@@ -259,6 +268,44 @@ class ContactDirectory:
             and talker in self.desktop_targets.active
         )
 
+    def can_send_to_contact(self, talker):
+        navigation = self.desktop_targets.navigation(talker, self.display_name(talker))
+        return navigation['uniqueSearchName'] and (not group_username(talker) or navigation['uniqueTitle'])
+
+    def open_messages(self):
+        pairs, failures = nt.connect_message_shards_detailed(str(self.message_db), '', '', self.passphrase)
+        if failures or not pairs:
+            for _, connection in pairs:
+                connection.close()
+            raise RuntimeError('One or more message shards could not be read')
+        connections = [connection for _, connection in pairs]
+        for connection in connections:
+            connection.execute('PRAGMA query_only=ON')
+        return connections
+
+    def selection_boundary(self, ids):
+        selected = [peer for peer in ids if self.selectable_contact(peer)]
+        if not selected:
+            return {'contacts': []}
+        connections = self.open_messages()
+        try:
+            shards = {shard_id(db): db for db in connections}
+            since = int(time.time())
+            return {
+                'since': since,
+                'contacts': [
+                    {
+                        'username': peer,
+                        'canSend': self.can_send_to_contact(peer),
+                        'heads': {shard: str(head) for shard, head in intake_shard_heads(nt, shards, peer).items()},
+                    }
+                    for peer in selected
+                ],
+            }
+        finally:
+            for connection in connections:
+                connection.close()
+
     def contacts(self, keyword='', kind='', limit=100, refresh=False):
         # Metadata discovery includes unselected chats without opening message shards.
         self.refresh_names(max_age=0 if refresh else 30)
@@ -280,6 +327,7 @@ class ContactDirectory:
                     'username': talker,
                     'displayName': name,
                     'alias': public_alias if not group else '',
+                    'canSend': self.can_send_to_contact(talker),
                 }
             )
             if len(contacts) >= limit:
@@ -292,16 +340,17 @@ class Reader(ContactDirectory):
         super().__init__(root)
         if nt.verify_passphrase_native(self.passphrase, str(self.message_db)) is not True:
             raise RuntimeError('Selected account database credential verification failed')
-        self.clients = set()
         self.lock = threading.Lock()
         self.seen = OrderedDict()
         self.started_at = int(time.time())
         self.intake = ReaderIntake(self.root, self.account_ref)
         self.consumer_session = None
+        self.retired_consumer_clients = set()
         self.consumer_lock = threading.Lock()
         self.last_intake_request = 0
         self.last_poll = 0
         self.last_error = ''
+        self.chat_scan_errors = {}
         self.pushed = 0
         self.image_dir = self.root / 'state' / 'media'
         self.image_dir.mkdir(parents=True, exist_ok=True)
@@ -353,15 +402,13 @@ class Reader(ContactDirectory):
 
     def status(self, *, include_progress=False):
         with self.lock:
-            subscribers = len(self.clients)
             images_registered = len(self.image_index)
-        durable = self.last_intake_request > 0 and time.monotonic() - self.last_intake_request < 45
         return {
             'backend': 'weflow-cli-nt',
             'lastPoll': self.last_poll,
             **({'intakeProgress': self.intake_progress()} if include_progress else {}),
             'lastError': self.last_error,
-            'subscribers': subscribers + int(durable),
+            'consumerActive': self.consumer_active(),
             'pushed': self.pushed,
             'intakeProtocol': 'reader-inbox-v2',
             'accountRef': self.account_ref,
@@ -394,17 +441,6 @@ class Reader(ContactDirectory):
             'accountRef': self.account_ref,
         }
 
-    def open_messages(self):
-        pairs, failures = nt.connect_message_shards_detailed(str(self.message_db), '', '', self.passphrase)
-        if failures or not pairs:
-            for _, connection in pairs:
-                connection.close()
-            raise RuntimeError('One or more message shards could not be read')
-        connections = [connection for _, connection in pairs]
-        for connection in connections:
-            connection.execute('PRAGMA query_only=ON')
-        return connections
-
     def selected_talkers(self):
         wechat = read_json(self.root / 'config/wechatagent.json')['wechat']
         return [
@@ -423,23 +459,28 @@ class Reader(ContactDirectory):
             or any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)() for p in (file, *file.parents))
         ):
             return set()
-        key, salt = nt.derive_database_key(str(file), '', '', self.passphrase)
-        db, cursor = nt.connect_nt_db(str(file), key, salt)
         try:
-            cursor.execute('PRAGMA query_only=ON')
-            rows = cursor.execute(
-                """SELECT CASE WHEN length(packed_info)<=8192 THEN packed_info END
-                FROM MessageResourceInfo WHERE message_svr_id=? AND message_local_id=? AND message_create_time=? LIMIT 9""",
-                (int(record['serverId']), record['localId'], record['createTime']),
-            ).fetchall()
-            if len(rows) > 8 or any(not isinstance(row[0], bytes) for row in rows):
-                raise ValueError('MEDIA_RESOURCE_LIMIT')
-            names = {name for (packed,) in rows for name in extract_blob_md5s(packed)}
-            if len(names) > 4096:
-                raise ValueError('MEDIA_RESOURCE_LIMIT')
-            return names
-        finally:
-            db.close()
+            key, salt = nt.derive_database_key(str(file), '', '', self.passphrase)
+            db, cursor = nt.connect_nt_db(str(file), key, salt)
+            try:
+                cursor.execute('PRAGMA query_only=ON')
+                rows = cursor.execute(
+                    """SELECT CASE WHEN length(packed_info)<=8192 THEN packed_info END
+                    FROM MessageResourceInfo WHERE message_svr_id=? AND message_local_id=? AND message_create_time=? LIMIT 9""",
+                    (int(record['serverId']), record['localId'], record['createTime']),
+                ).fetchall()
+            finally:
+                db.close()
+        except Exception:
+            # The resource index suggests filenames. The source-message digest
+            # still governs whether a cache file can be opened.
+            return set()
+        if len(rows) > 8 or any(not isinstance(row[0], bytes) for row in rows):
+            raise ValueError('MEDIA_RESOURCE_LIMIT')
+        names = {name for (packed,) in rows for name in extract_blob_md5s(packed)}
+        if len(names) > 4096:
+            raise ValueError('MEDIA_RESOURCE_LIMIT')
+        return names
 
     def native_quote_source(self, talker, event_id):
         from desktop_quote_source import QuoteSources
@@ -472,12 +513,64 @@ class Reader(ContactDirectory):
             for connection in connections:
                 connection.close()
 
-    def outgoing_receipt_rows(self, talker, after, before, *, watermarks=None):
-        grant = self.intake_grant(talker)
-        if not grant or talker not in self.selected_talkers() or not self.sticker_account_active():
-            raise PermissionError('Receipt chat is not selected')
+    def verify_submitted_receipt(self, proof, talker, after, before, recording):
+        # The adapter gives Reader the private baseline ID of an existing attempt.
+        # This grants a bounded outgoing lookup, independent of the current roster.
+        denied = PermissionError('Submitted receipt is not authorized')
+        if not re.fullmatch(r'[a-f0-9]{64}:[a-f0-9]{64}', proof) or not self.sticker_account_active():
+            raise denied
+        attempt, baseline = proof.split(':')
+        journal = self.root / 'state/desktop/receipts.sqlite'
+        if not journal.is_file():
+            raise denied
+        with closing(sqlite3.connect(journal.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
+            row = db.execute('SELECT body FROM attempts WHERE id = ?', (attempt,)).fetchone()
+        state = json.loads(row[0]) if row else {}
+        if (
+            state.get('key') != attempt
+            or not hmac.compare_digest(str(state.get('baselineId', '')), baseline)
+            or state.get('accountRef') != self.account_ref
+            or state.get('accountWxid') != self.own_wxid
+            or state.get('target') != talker
+            or not state.get('submittedAt')
+            or state.get('window') != {'after': after, 'before': before}
+            or (state.get('operation') == 'voice') != (recording is not None)
+        ):
+            raise denied
+        if recording is not None and (
+            recording.get('baseline') != []
+            or any(recording.get(field) != state.get(field) for field in ('durationMs', 'shape', 'watermarks'))
+        ):
+            raise denied
+        return state
+
+    def receipt_image_keys(self, deadline):
+        keys = configured_image_keys(read_json(self.settings_file), local_secret)
+        if not keys:
+            derived = resolve_v2_media_key(str(self.account), self.own_wxid, deadline=deadline)
+            if derived:
+                keys.append(derived)
+        return keys
+
+    def outgoing_receipt_rows(self, talker, after, before, *, watermarks=None, receipt_proof=None, recording=None):
         if not 0 < after <= before <= after + 120:
             raise ValueError('Invalid receipt interval')
+        grant = self.intake_grant(talker) if receipt_proof is None else None
+
+        def authorize():
+            if receipt_proof is not None:
+                if watermarks is not None:
+                    raise PermissionError('Submitted receipts cannot create a baseline')
+                return self.verify_submitted_receipt(receipt_proof, talker, after, before, recording)
+            elif (
+                not grant
+                or talker not in self.selected_talkers()
+                or not self.sticker_account_active()
+                or self.intake_grant(talker) != grant
+            ):
+                raise PermissionError('Receipt chat authorization changed')
+
+        attempt = authorize()
 
         def read(connections):
             shards = {shard_id(db): db for db in connections}
@@ -485,17 +578,24 @@ class Reader(ContactDirectory):
                 for shard, head in intake_shard_heads(nt, shards, talker).items():
                     watermarks[shard] = str(head)
             stream = chronological_rows(nt, shards, talker, after, before, self.names, self.own_wxid, outgoing=True)
-            rows = list(islice(stream, 513))
-            if len(rows) > 512:
-                raise RuntimeError('Receipt interval contains too many outgoing messages')
-            return self.enrich_messages(shards, talker, rows, receipt=True)
+            rows, size = [], 2  # JSON array brackets.
+            for row in stream:
+                size += len(json.dumps(row, ensure_ascii=False).encode('utf-8')) + (2 if rows else 0)
+                if len(rows) >= MAX_RECEIPT_ROWS or size > MAX_RECEIPT_RESPONSE_BYTES:
+                    raise RuntimeError('READER_RECEIPT_LIMIT')
+                rows.append(row)
+            return rows
 
         result = self.receipt_connections.run(read)
-        if not self.sticker_account_active() or self.intake_grant(talker) != grant:
-            raise PermissionError('Receipt chat authorization changed')
+        if attempt and attempt['operation'] == 'image' and attempt.get('imageFingerprint'):
+            try:
+                match_outgoing_images(self, talker, result, attempt, self.receipt_image_keys)
+            except (OSError, ValueError):
+                pass  # The cache is optional evidence. Database rows remain available.
+        authorize()
         return result
 
-    def enrich_messages(self, shards, talker, rows, *, receipt=False):
+    def enrich_messages(self, shards, talker, rows):
         table = 'Msg_' + hashlib.md5(talker.encode()).hexdigest()
         sources = {
             key
@@ -518,32 +618,24 @@ class Reader(ContactDirectory):
             image = message.get('localType') == 3
             origin = message['sourceShard']
             connection, has_source = shards[origin], origin in sources
-            if image and not has_source and not receipt:
+            if image and not has_source:
                 continue
-            columns = (
-                'NULL'
-                if image and not receipt
-                else 'CASE WHEN length(message_content)<=1048576 THEN message_content END'
-            )
+            columns = 'NULL' if image else 'CASE WHEN length(message_content)<=1048576 THEN message_content END'
             if has_source:
                 columns += ', CASE WHEN length(source) <= 65536 THEN source END'
+            server_id = message['serverId'] or 0
             row = connection.execute(
                 'SELECT '
                 + columns
                 + ' FROM "'
                 + table
-                + '" WHERE local_id=? AND create_time=? AND server_id=? LIMIT 1',
-                (message['localId'], message['createTime'], message['serverId'] or 0),
+                + '" WHERE local_id=? AND create_time=? AND (server_id=? OR (server_id IS NULL AND ?=0)) LIMIT 1',
+                (message['localId'], message['createTime'], server_id, server_id),
             ).fetchone()
             if row:
                 if has_source:
                     message.update(group_mention_flags(nt._decode_content(row[1]), self.own_wxid))
                 if image:
-                    if receipt:
-                        content = nt._decode_content(row[0])
-                        if talker.endswith('@chatroom'):
-                            content = nt._strip_group_speaker(content, {sender})
-                        message['imageMd5'] = outgoing_image_md5(content)
                     continue
                 text = nt._decode_content(row[0])
                 message['fullText'] = (
@@ -551,29 +643,12 @@ class Reader(ContactDirectory):
                     if '@chatroom' in talker
                     else text
                 )
-                if message.get('isSend') and message.get('localType') in (49, QUOTE_TYPE):
-                    quote = parse_quote_receipt(message['fullText'])
-                    if quote:
-                        message['quoteSourceServerId'] = quote['sourceServerId']
-                        message['quoteReplyText'] = quote['body']
-                if talker == 'filehelper' and message['localType'] == 34 and message.get('isSend') == 1:
-                    voice = voice_info(message['fullText'])
-                    if voice:
-                        message['recordedDurationMs'] = round(voice['durationSeconds'] * 1000)
-                file_info = parse_file_message(message.get('localType'), message['fullText'])
-                if file_info:
-                    message.update(
-                        {
-                            'fileKind': 'appmsg-6',
-                            'fileName': file_info['name'],
-                            'fileSize': file_info['size'],
-                            'fileMd5': file_info['md5'],
-                        }
-                    )
-                md5 = sticker_receipt_md5(message.get('localType'), message['fullText'])
-                if md5:
-                    message['stickerMd5'] = md5
-                    message['stickerKind'] = 'emoji-47' if message.get('localType') == 47 else 'appmsg-8'
+                outgoing = message.get('isSend') == 1
+                message.update(attachment_fields(message['localType'], message['fullText'], outgoing=outgoing))
+                if talker == 'filehelper' and message['localType'] == 34 and outgoing:
+                    duration = recorded_voice_duration(message['fullText'])
+                    if duration is not None:
+                        message['recordedDurationMs'] = duration
         if hasattr(self, 'root') and hasattr(self, 'account'):
             from desktop_quote_source import QuoteSources
 
@@ -597,9 +672,16 @@ class Reader(ContactDirectory):
     def image_talker_allowed(self, talker):
         return self.intake_grant(talker) is not None
 
-    def match_outgoing_voice(self, talker, account, after, before, excluded, digest, recording=None):
+    def match_outgoing_voice(
+        self, talker, account, after, before, excluded, digest, recording=None, *, receipt_proof=None
+    ):
         def authorized():
-            if account != self.own_wxid or talker not in self.selected_talkers() or not self.sticker_account_active():
+            if account != self.own_wxid or not self.sticker_account_active():
+                return False
+            if receipt_proof is not None:
+                self.verify_submitted_receipt(receipt_proof, talker, after, before, recording)
+                return True
+            if talker not in self.selected_talkers():
                 return False
             if recording is None or talker == 'filehelper':
                 return True
@@ -615,7 +697,8 @@ class Reader(ContactDirectory):
             return None
         try:
             deadline = time.monotonic() + 3
-            rows = self.outgoing_receipt_rows(talker, after, before)
+            scope = {'receipt_proof': receipt_proof, 'recording': recording} if receipt_proof is not None else {}
+            rows = self.outgoing_receipt_rows(talker, after, before, **scope)
             candidates = [
                 row
                 for row in rows
@@ -636,10 +719,6 @@ class Reader(ContactDirectory):
                 try:
                     if recording:
                         duration = row.get('recordedDurationMs')
-                        if duration is None:
-                            metadata = voice_info(row.get('fullText', ''))
-                            if metadata:
-                                duration = round(metadata['durationSeconds'] * 1000)
                         if (
                             not isinstance(duration, int)
                             or duration < recording['durationMs'] - 200
@@ -704,7 +783,7 @@ class Reader(ContactDirectory):
         try:
             if 'video' in record or 'forwardPart' in record:
                 if format != 'wav':
-                    raise ValueError('VOICE_FORMAT_UNSUPPORTED')
+                    raise RuntimeError('VOICE_FORMAT_UNSUPPORTED')
                 raw, duration = self.video_previews.read(record, audio=True)
                 from wechat_video import audio_segment
 
@@ -724,7 +803,7 @@ class Reader(ContactDirectory):
             silk = raw.startswith((b'#!SILK_V3', b'\x02#!SILK_V3'))
             if not silk:
                 if format != 'wav':
-                    raise ValueError('VOICE_FORMAT_UNSUPPORTED')
+                    raise RuntimeError('VOICE_FORMAT_UNSUPPORTED')
                 from wechat_video import decode_isolated
 
                 raw, duration = decode_isolated(raw, 1, audio=True, kind='audio')
@@ -766,6 +845,10 @@ class Reader(ContactDirectory):
             raise PermissionError('MEDIA_ACCESS_REVOKED')
         return media_source_row(self, nt, talker, server_id)
 
+    def image_descriptor(self, image_id):
+        with self.lock:
+            return self.image_index.get(image_id)
+
     def image_row(self, talker, descriptor):
         row = MessageBinding(self, {**descriptor, 'talker': talker}).row
         kind, content = row['localType'], row['fullText'].lstrip()
@@ -788,7 +871,7 @@ class Reader(ContactDirectory):
             'sender': payload['talkerId'],
         }
         with self.lock:
-            self.image_index[image_id] = descriptor
+            touch_media_record(self.image_index, image_id, descriptor)
             for expired in cache_evictions(self.image_index, self.intake.pinned_media):
                 self.image_index.pop(expired, None)
                 cache = self.image_dir / (expired + '.json')
@@ -845,32 +928,30 @@ class Reader(ContactDirectory):
                 and (kind == '34' or str(row.get('localType')) == kind)
                 and (not ref['time'] or str(row.get('createTime')) == ref['time'])
             ]
-        if len(matches) != 1:
-            return register_quoted_original(self, talker, ref)
-        identifier, row = matches[0]
-        if kind == '34':
-            return {
-                'kind': 'voice',
-                'id': identifier,
-                **({'durationSeconds': row['durationSeconds']} if 'durationSeconds' in row else {}),
-            }
-        return {'kind': 'sticker' if kind == '47' else 'image', 'id': identifier}
+            if len(matches) == 1:
+                identifier, row = matches[0]
+                touch_media_record(catalog, identifier, row)
+                if kind == '34':
+                    return {
+                        'kind': 'voice',
+                        'id': identifier,
+                        **({'durationSeconds': row['durationSeconds']} if 'durationSeconds' in row else {}),
+                    }
+                return {'kind': 'sticker' if kind == '47' else 'image', 'id': identifier}
+        return register_quoted_original(self, talker, ref)
 
     def video_playback(self, talker, sender, record):
         try:
             return self.video_previews.read({**record, 'talker': talker, 'sender': sender}, metadata_only=True)
-        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired):
+        except Exception:
+            # Intake can retain the original message before its optional
+            # media is available. The attachment is bound again when read.
             seconds = record.get('video', {}).get('durationSeconds')
             return {'durationSeconds': seconds} if seconds is not None else None
 
-    def register_frames(self, talker, source, record, count):
-        refs = []
-        for index in range(count):
-            image = {**record, 'localType': record['videoType'], 'frame': index, 'frameCount': count}
-            ref = self.register_image(talker, {**source, 'rawid': f'{source["rawid"]}:frame:{index}', 'image': image})
-            if ref:
-                refs.append(ref)
-        return refs
+    def register_preview(self, talker, source, record):
+        image = {**record, 'localType': record['videoType']}
+        return self.register_image(talker, {**source, 'rawid': f'{source["rawid"]}:preview', 'image': image})
 
     def register_video(self, talker, payload):
         record = payload.pop('video')
@@ -879,8 +960,9 @@ class Reader(ContactDirectory):
         if playback is not None:
             payload['videoPlayback'] = playback
         seconds = (playback or {}).get('durationSeconds')
-        count = frame_count(seconds) if seconds is not None else record['video']['frames']
-        payload['videoFrames'] = self.register_frames(talker, payload, record, count)
+        preview = self.register_preview(talker, payload, record)
+        if preview:
+            payload['image'] = {'id': preview}
         if (playback or {}).get('audioPresent') is False:
             return
         if seconds is not None:
@@ -894,33 +976,17 @@ class Reader(ContactDirectory):
         parts = parent.pop('parts')
         sender = payload['talkerId']
         key = chat_key(talker)
-        visual = [part for part in parts if part['kind'] in ('image', 'sticker', 'video')][:4]
-        desired, videos = {}, {}
-        for part in visual:
-            playback = (
-                self.video_playback(talker, sender, {**parent, 'forwardPart': part})
-                if part['kind'] == 'video'
-                else None
-            )
-            index = part['index']
-            if playback:
-                videos[index] = playback
-            desired[index] = frame_count(playback['durationSeconds']) if playback else 1
-        # Reserve a frame for each visible item before distributing spare slots to longer videos.
-        counts = dict.fromkeys(desired, 1)
-        for level in range(2, 5):
-            for index, wanted in desired.items():
-                if wanted >= level and sum(counts.values()) < 4:
-                    counts[index] += 1
-
-        images, voices = [], []
+        images, voices, videos = [], [], {}
         for part in parts:
             record = {**parent, 'forwardPart': part}
             rawid = hashlib.sha256((payload['rawid'] + ':forward:' + str(part['index'])).encode()).hexdigest()
             source = {'rawid': rawid, 'talkerId': sender}
-            if count := counts.get(part['index']):
-                frames = self.register_frames(talker, source, record, count)
-                images.extend({'index': part['index'], 'id': ref} for ref in frames)
+            if len(images) < 4 and part['kind'] in ('image', 'sticker', 'video'):
+                ref = self.register_preview(talker, source, record)
+                if ref:
+                    images.append({'index': part['index'], 'id': ref})
+                    if part['kind'] == 'video' and (playback := self.video_playback(talker, sender, record)):
+                        videos[part['index']] = playback
             if (
                 len(voices) < 4
                 and part['kind'] in ('audio', 'video')
@@ -932,7 +998,7 @@ class Reader(ContactDirectory):
         if images or voices:
             payload['forwardAttachments'] = {'images': images, 'voices': voices, 'videos': videos}
 
-    def resolve_image(self, image_id):
+    def resolve_image(self, image_id, *, max_frames=4):
         prepared = getattr(self, 'meme_send_resources', None)
         if prepared:
             preview = prepared.preview(image_id)
@@ -946,7 +1012,7 @@ class Reader(ContactDirectory):
                 preview = None
             if preview:
                 return preview
-        descriptor = self.image_index.get(image_id)
+        descriptor = self.image_descriptor(image_id)
         if (
             not descriptor
             or descriptor.get('account') != self.account.name
@@ -955,7 +1021,9 @@ class Reader(ContactDirectory):
         ):
             raise PermissionError('Image is unavailable or not authorized')
         if 'video' in descriptor or 'forwardPart' in descriptor:
-            result = self.video_previews.read(descriptor)
+            result = self.video_previews.read(descriptor, max_frames=max_frames)
+            if self.intake_grant(descriptor['talker']) != descriptor['grant']:
+                raise PermissionError('Image grant changed')
             key = chat_key(descriptor['talker'])
             return {**result, 'imageId': image_id, 'conversationKey': key}
         binding = MessageBinding(self, descriptor)
@@ -1054,7 +1122,9 @@ class Reader(ContactDirectory):
     def sticker_candidates(self, key, query='', include_images=False):
         self.pump_sticker_collection()
         candidates = []
-        for image_id, descriptor in list(self.image_index.items()):
+        with self.lock:
+            registered = list(self.image_index.items())
+        for image_id, descriptor in registered:
             if descriptor.get('localType') != 47 or descriptor.get('account') != self.account.name:
                 continue
             talker = descriptor['talker']
@@ -1167,7 +1237,7 @@ class Reader(ContactDirectory):
                 resource = None
             if resource:
                 return resource['sourceMd5']
-        descriptor = self.image_index.get(image_id)
+        descriptor = self.image_descriptor(image_id)
         if not descriptor or descriptor.get('localType') != 47 or descriptor.get('account') != self.account.name:
             raise PermissionError('Sticker is unavailable')
         talker = descriptor['talker']
@@ -1227,7 +1297,7 @@ class Reader(ContactDirectory):
                 return stage_sticker_resource(self.root, resource)
         if collected:
             raise PermissionError('Sticker is not admitted to the shared pool')
-        descriptor = self.image_index.get(image_id)
+        descriptor = self.image_descriptor(image_id)
         return self.resolve_received_sticker(image_id, key, descriptor)
 
     def resolve_received_sticker(self, image_id, key, descriptor):
@@ -1412,42 +1482,37 @@ class Reader(ContactDirectory):
             self.sticker_collection.review_failed(ticket)
             print('Sticker pool full; DS selection pending, current pool retained.', flush=True)
 
-    @contextmanager
-    def push_events(self):
-        """Register before HTTP advertises the stream and detach on any exit."""
-        client = queue.Queue(maxsize=500)
+    def consumer_active(self):
+        return self.last_intake_request > 0 and time.monotonic() - self.last_intake_request < 45
 
-        def events():
-            while not self.stop.is_set():
-                try:
-                    payload = client.get(timeout=2)
-                except queue.Empty:
-                    payload = None
-                yield payload
-
-        with self.lock:
-            self.clients.add(client)
-        try:
-            yield events()
-        finally:
-            with self.lock:
-                self.clients.discard(client)
-
-    def next_intake(self, session, busy_tokens=()):
+    def next_intake(self, session, busy_tokens=(), exclude_routes=()):
         # A session boundary and its first observation belong to the same consumer.
         with self.consumer_lock:
-            if self.consumer_session != session:
+            previous = self.consumer_session
+            client = session[:24]
+            previous_client = previous[:24] if previous is not None else None
+            # The client nonce stays fixed while its connection number advances.
+            if client in self.retired_consumer_clients or (client == previous_client and session < previous):
+                return None
+            if previous != session:
                 settings = read_json(self.root / 'config/wechatagent.json')['wechat']
                 second = int(time.time())
+                incomplete = set()
+                boundary = list(self.connection_boundary(second, incomplete=incomplete))
                 self.intake.connect(
                     session,
                     second,
                     lambda chat, row: self.offline_wake(chat, row, settings),
-                    self.connection_boundary(second),
+                    boundary,
+                    incomplete,
                 )
+                if incomplete:
+                    print('Reader reconnect: incomplete boundary for ' + str(len(incomplete)) + ' chat(s).', flush=True)
+                if previous_client is not None and previous_client != client:
+                    self.retired_consumer_clients.add(previous_client)
                 self.consumer_session = session
             self.last_intake_request = time.monotonic()
-            return self.intake.next(self.intake_grant, busy_tokens)
+            return self.intake.next(self.intake_grant, busy_tokens, exclude_routes)
 
     def acknowledge_intake(self, token, rawid):
         return self.intake.acknowledge(token, rawid)
@@ -1471,7 +1536,13 @@ class Reader(ContactDirectory):
                 return chat_key(talker)
             return None
 
-        return self.intake.progress(visible_key)
+        scans = {row['key']: row for row in self.intake.progress(visible_key)}
+        for talker, error in getattr(self, 'chat_scan_errors', {}).items():
+            if self.talker_grant(talker, wechat) is None:
+                continue
+            key = chat_key(talker)
+            scans.setdefault(key, dict(key=key, scannedThrough=None, catchUpThrough=None, pending=0))['error'] = error
+        return list(scans.values())
 
     def replay_role(self, talker, payload, wechat):
         group = group_username(talker)
@@ -1482,7 +1553,25 @@ class Reader(ContactDirectory):
         sender = payload.get('talkerId')
         if settings.get('replayOffline') is not True or not sender or payload.get('contextOnly'):
             return None
-        if sender in settings.get('administrators', []) and (group or sender == talker):
+        authorization = settings.get('replayAuthorization')
+        if not isinstance(authorization, dict):
+            return None
+        since, stamp = authorization.get('since'), payload.get('timestamp')
+        administrators = settings.get('administrators', [])
+        chats = authorization.get('chats')
+        grant = self.talker_grant(talker, wechat)
+        if (
+            type(since) is not int
+            or type(stamp) is not int
+            or not 0 < since <= stamp < 2**53
+            or not isinstance(chats, dict)
+            or not grant
+            or chats.get(key) != grant
+            or not isinstance(authorization.get('administrators'), list)
+            or set(authorization['administrators']) != set(administrators)
+        ):
+            return None
+        if sender in administrators and (group or sender == talker):
             return 'assistant-admin'
         return 'assistant-member' if group else None
 
@@ -1506,38 +1595,55 @@ class Reader(ContactDirectory):
             or any(word and word in payload.get('content', '') for word in wechat.get('wake_words', []))
         )
 
-    def connection_boundary(self, second, selected=None):
+    def connection_boundary(self, second, selected=None, *, incomplete=None):
         """Snapshot local row identities at the handshake, including provisional rows."""
         if selected is None:
             selected = self.selected_talkers()
         if not selected:
             return
-        connections = self.open_messages()
+        connections = []
         try:
-            for connection in connections:
-                origin = shard_id(connection)
-                tables = nt.msg_tables(connection)
-                for chat in selected:
-                    table = 'Msg_' + hashlib.md5(chat.encode()).hexdigest()
-                    if table in tables:
-                        query = f'SELECT local_id FROM "{table}" WHERE create_time=?'
-                        for (local_id,) in connection.execute(query, (second,)):
-                            yield chat, origin, local_id
+            connections = self.open_messages()
+            shards = [(db, shard_id(db), nt.msg_tables(db)) for db in connections]
+            for chat in selected:
+                table = 'Msg_' + hashlib.md5(chat.encode()).hexdigest()
+                query = f'SELECT local_id FROM "{table}" WHERE create_time=?'
+                try:
+                    yield from (
+                        (chat, origin, local_id)
+                        for connection, origin, tables in shards
+                        if table in tables
+                        for (local_id,) in connection.execute(query, (second,))
+                    )
+                except Exception:
+                    if incomplete is None:
+                        raise
+                    incomplete.add(chat)
+        except Exception:
+            if incomplete is None:
+                raise
+            incomplete.update(selected)
         finally:
             for connection in connections:
                 connection.close()
 
-    def intake_rows(self, talker, grant, start, through, *, scan_rows=None, appended=None, baseline_ids=None):
+    def intake_rows(
+        self, talker, grant, start, through, *, scan_rows=None, appended=None, baseline_ids=None, source_shards=None
+    ):
         scan_rows = scan_rows or self.scan_rows
         baseline_ids = baseline_ids or {}
         # Revisit only the rows still waiting for a canonical event ID.
         pending = self.intake.provisional_rows(talker, grant)
+        if source_shards is not None:
+            pending = {key for key in pending if key[1] in source_shards}
         windows = [(stamp, stamp) for stamp in sorted({key[0] for key in pending if key[0] < start})]
         for lower, upper in [*windows, (start, through)]:
             waiting = {key for key in pending if lower <= key[0] <= upper}
             before_grant = self.intake.baseline_rows(talker, grant, lower, upper)
             options = {'appended': appended} if appended and upper >= start else {}
             for row in scan_rows(talker, lower, upper, **options):
+                if self.stop.is_set():
+                    return
                 key = (row['createTime'], row['sourceShard'], row['localId'])
                 if key in before_grant or row['localId'] <= baseline_ids.get(row['sourceShard'], 0):
                     continue
@@ -1551,14 +1657,17 @@ class Reader(ContactDirectory):
                         self.intake.track_provisional(talker, grant, key, True)
                     waiting.discard(key)
                 else:
-                    yield ({**row, 'lateArrival': True} if options and row['createTime'] < start else row), payload
+                    yield ({**row, 'lateArrival': True} if row['createTime'] < start else row), payload
+            # A stopped or unavailable scan cannot confirm a provisional row is gone.
+            if self.stop.is_set():
+                return
             for key in waiting:
                 self.intake.track_provisional(talker, grant, key, False)
 
     def scan_rows(self, talker, start, end):
         if talker not in self.selected_talkers():
             raise PermissionError('Conversation is not selected')
-        with self.poll_source() as (scan, _):
+        with self.poll_source() as (scan, _, _):
             yield from scan(talker, start, end)
 
     @contextmanager
@@ -1578,7 +1687,7 @@ class Reader(ContactDirectory):
             def heads(talker):
                 return intake_shard_heads(nt, shards, talker)
 
-            yield scan, heads
+            yield scan, heads, frozenset(shards)
         finally:
             for connection in connections:
                 connection.close()
@@ -1588,24 +1697,16 @@ class Reader(ContactDirectory):
 
     def publish_diagnostic(self, talker, payload):
         # Caller holds self.lock. Re-reading a source never creates a second event identity.
-        durable = self.last_intake_request > 0 and time.monotonic() - self.last_intake_request < 45
-        if not durable and not self.clients:
+        if not self.consumer_active():
             raise RuntimeError('IMAGE_RECEIVER_NOT_CONNECTED')
         grant = self.intake_grant(talker)
         if grant is None:
             raise PermissionError('Conversation is not selected')
-        pushed = durable and self.intake.capture(payload, grant) is not None
-        for client in list(self.clients):
-            try:
-                client.put_nowait(payload)
-                pushed = True
-            except queue.Full:
-                self.clients.discard(client)
-        return pushed
+        return self.intake.capture(payload, grant) is not None
 
     def replay_image(self, image_id):
         # Explicit authenticated retry only; startup never replays history.
-        descriptor = self.image_index.get(image_id)
+        descriptor = self.image_descriptor(image_id)
         self.resolve_image(image_id)  # Account, whitelist and file validation.
         message = MessageBinding(self, descriptor).row
         payload = self.make_payload(descriptor['talker'], message)
@@ -1663,12 +1764,16 @@ class Reader(ContactDirectory):
 
 def serve(reader, port, token):
     server = create_reader_server(port, reader_request_handler(reader, token))
+    polling = threading.Thread(target=reader.poll, daemon=True)
     try:
-        threading.Thread(target=reader.poll, daemon=True).start()
+        polling.start()
         print('Independent reader ready; database and contacts verified.', flush=True)
         server.serve_forever()
     finally:
         try:
+            reader.stop.set()
+            if polling.ident is not None:
+                polling.join()
             reader.close()
         finally:
             server.server_close()
@@ -1683,10 +1788,10 @@ if __name__ == '__main__':
                 ids = request['ids']
                 if not isinstance(ids, list) or len(ids) > 1000:
                     raise ValueError('Invalid contact selection')
-                rows = [{'username': peer} for peer in ids if directory.selectable_contact(peer)]
+                result = directory.selection_boundary(ids)
             else:
-                rows = directory.contacts(request.get('keyword', ''), request['kind'])
-            print(json.dumps({'contacts': rows, 'account': directory.account_ref}, ensure_ascii=True))
+                result = {'contacts': directory.contacts(request.get('keyword', ''), request['kind'])}
+            print(json.dumps({**result, 'account': directory.account_ref}, ensure_ascii=True))
             sys.exit(0)
         reader = Reader()
         if '--check' in sys.argv:

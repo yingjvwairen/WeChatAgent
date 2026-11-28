@@ -11,6 +11,10 @@ from reader_message_rows import server_event_id
 from wechat_quote_locator import stored_token, rich_locator, ocr_text_keys, LABEL
 
 
+class QuoteSourceUnavailable(RuntimeError):
+    """The observed source cannot be used for a verified native quote."""
+
+
 def unique_text_source(connections, talker, quote, decode, strip_speaker, own, *, ocr=False):
     """Check exact UIA identity or the narrower conditions for OCR."""
     table = 'Msg_' + hashlib.md5(talker.encode()).hexdigest()
@@ -43,7 +47,9 @@ def unique_text_source(connections, talker, quote, decode, strip_speaker, own, *
             )
             for sid, stamp, sender, size, raw in rows:
                 if time.monotonic() >= deadline:
-                    return False
+                    if ocr:
+                        return False
+                    raise RuntimeError('QUOTE_LOOKUP_BUSY')
                 value = decode(raw)
                 if not value and size:
                     return False
@@ -123,18 +129,18 @@ class QuoteSources:
                             if event_id == server_event_id(talker, sid):
                                 found.append((str(sid), lid, stamp))
                             if len(found) > 1:
-                                raise RuntimeError('QUOTE_SOURCE_AMBIGUOUS')
+                                raise QuoteSourceUnavailable('QUOTE_SOURCE_AMBIGUOUS')
                     finally:
                         db.set_progress_handler(None, 0)
             finally:
                 for db in connections:
                     db.close()
             if len(found) != 1:
-                raise RuntimeError('QUOTE_SOURCE_UNAVAILABLE')
+                raise QuoteSourceUnavailable('QUOTE_SOURCE_UNAVAILABLE')
             hit = found[0]
         sid, lid, stamp = hit
         if event_id != server_event_id(talker, sid):
-            raise RuntimeError('QUOTE_SOURCE_INDEX_INVALID')
+            raise QuoteSourceUnavailable('QUOTE_SOURCE_INDEX_INVALID')
         rows = reader.messages(talker, limit=0, from_time=stamp, to_time=stamp)
         matches = [
             row
@@ -142,11 +148,11 @@ class QuoteSources:
             if str(row.get('serverId')) == sid and row.get('localId') == lid and row.get('createTime') == stamp
         ]
         if len(matches) != 1:
-            raise RuntimeError('QUOTE_SOURCE_CHANGED')
+            raise QuoteSourceUnavailable('QUOTE_SOURCE_CHANGED')
         row = matches[0]
         token = stored_token(row['localType'], row.get('fullText') or row.get('content') or '')
         if not token:
-            raise RuntimeError('QUOTE_SOURCE_TYPE_UNAVAILABLE')
+            raise QuoteSourceUnavailable('QUOTE_SOURCE_TYPE_UNAVAILABLE')
         kind, text = token
         quote = {
             'id': event_id,
@@ -160,7 +166,7 @@ class QuoteSources:
             if kind == 'text':
                 args = connections, talker, quote, decode, strip_speaker, reader.own_wxid
                 if not unique_text_source(*args):
-                    raise RuntimeError('QUOTE_SOURCE_AMBIGUOUS')
+                    raise QuoteSourceUnavailable('QUOTE_SOURCE_AMBIGUOUS')
                 if (
                     text.strip() == text
                     and not any(char in text for char in '\r\n')
@@ -173,7 +179,7 @@ class QuoteSources:
                     list(enumerate(connections)), talker, reader.own_wxid, quote, decode, strip_speaker
                 )
                 if not locator:
-                    raise RuntimeError('QUOTE_SOURCE_LOCATOR_UNAVAILABLE')
+                    raise QuoteSourceUnavailable('QUOTE_SOURCE_LOCATOR_UNAVAILABLE')
                 quote['locator'] = locator
         authorize()
         return quote

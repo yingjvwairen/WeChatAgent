@@ -44,7 +44,7 @@ export function desktopMediaAllowed(root, config, job, forInput = true) {
       const asset = catalog.resolve(job.localReference.id);
       return asset.md5 === job.md5 && path.resolve(asset.path).toLowerCase() === path.resolve(job.path).toLowerCase();
     }
-    const accountPath = path.resolve(job.accountDirectory ?? job.account);
+    const accountPath = fs.realpathSync.native(job.accountDirectory ?? job.account);
     const scope = hash(
       (process.platform === 'win32' ? accountPath.toLowerCase() : accountPath) + '|' + job.accountWxid,
     );
@@ -65,6 +65,7 @@ export function desktopMediaAllowed(root, config, job, forInput = true) {
       process.kill(generation.pid, 0);
       const grant = JSON.parse(fs.readFileSync(path.join(directory, ref.id + '.json'), 'utf8'));
       const expected = path.join(root, 'state/stickers/outgoing', job.md5 + '.gif');
+      const actual = fs.lstatSync(expected);
       return (
         generation.generation === ref.generation &&
         grant.generation === ref.generation &&
@@ -76,8 +77,9 @@ export function desktopMediaAllowed(root, config, job, forInput = true) {
         grant.size === job.size &&
         Number.isSafeInteger(grant.expiresAt) &&
         Date.now() < grant.expiresAt &&
-        path.resolve(expected).toLowerCase() === path.resolve(job.path).toLowerCase() &&
-        fs.statSync(expected).size === job.size &&
+        actual.isFile() &&
+        [expected, fs.realpathSync.native(expected)].some(file => path.relative(file, job.path) === '') &&
+        actual.size === job.size &&
         hash(fs.readFileSync(expected)) === job.sha256
       );
     }

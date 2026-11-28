@@ -148,7 +148,7 @@ export async function qwenSynthesize(service, input, { signal, fetchImpl } = {})
   return normalizeWav(waveFile(Buffer.concat(chunks, size), outputRate), outputRate, { maxSeconds });
 }
 
-export async function qwenTranscribe(service, wav, { signal, fetchImpl } = {}) {
+export async function qwenTranscribe(service, wav, { signal, fetchImpl, allowEmpty = false } = {}) {
   const settings = service.flat,
     model = settings.model.trim(),
     language = String(settings.language ?? '').trim();
@@ -180,12 +180,14 @@ export async function qwenTranscribe(service, wav, { signal, fetchImpl } = {}) {
   const json = parse(bytes.toString('utf8'));
   if (!response.ok) throw fault(statusCode(response.status, 'VOICE_TTS_HTTP'), json?.error?.code ?? json?.code);
   const content = json?.choices?.[0]?.message?.content;
-  const text =
-    typeof content === 'string'
-      ? content
-      : Array.isArray(content)
-        ? content.map(part => part?.text ?? '').join('')
-        : '';
-  if (!text.trim() || text.length > 4000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(text)) throw fault('VOICE_TTS_TRANSCRIPT');
+  const parts = Array.isArray(content) ? content.filter(part => typeof part?.text === 'string') : [];
+  const text = parts.length ? parts.map(part => part.text).join('') : content;
+  if (
+    typeof text !== 'string' ||
+    (!allowEmpty && !text.trim()) ||
+    text.length > 4000 ||
+    /[\x00-\x08\x0b-\x1f\x7f]/.test(text)
+  )
+    throw fault('VOICE_TTS_TRANSCRIPT');
   return text.trim();
 }

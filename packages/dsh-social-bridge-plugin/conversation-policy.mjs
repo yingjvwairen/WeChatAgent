@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { validateAssistantSettings } from './assistant-policy.mjs';
 import { validateReplyLayout } from './reply-layout-policy.mjs';
 import { validChatKey, allowedConversation } from '../wechat-identity.mjs';
@@ -77,6 +78,17 @@ export function validateConversationSettings(wechat) {
       ))
   )
     throw Error('Invalid per-chat wake_mode');
+  const wakeEpochs = wechat?.groupWakeEpochs;
+  if (
+    wakeEpochs !== undefined &&
+    (!wakeEpochs ||
+      typeof wakeEpochs !== 'object' ||
+      Array.isArray(wakeEpochs) ||
+      Object.entries(wakeEpochs).some(
+        ([key, epoch]) => !validChatKey(key) || !key.startsWith('wechat:group:') || !validGroupWakeEpoch(epoch),
+      ))
+  )
+    throw Error('Invalid group wake epoch');
   const access = wechat?.dshAccess;
   if (
     access !== undefined &&
@@ -104,6 +116,26 @@ export function conversationMode(wechat, key) {
     wechat?.chatModes?.[key] ??
     (conversationWorkMode(wechat, key) === 'assistant' ? 'mention' : (wechat?.wake_mode ?? 'hybrid'))
   );
+}
+
+export const initialGroupWakeEpoch = '0'.repeat(32);
+export const validGroupWakeEpoch = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
+
+export function naturalGroupWakeEpoch(wechat, key) {
+  if (conversationMode(wechat, key) === 'mention') return null;
+  return wechat.groupWakeEpochs?.[key] ?? initialGroupWakeEpoch;
+}
+
+export function reconcileGroupWakeEpochs(previous, next) {
+  const epochs = {};
+  for (const id of next.whitelist?.groups ?? []) {
+    const key = 'wechat:group:' + id;
+    if (conversationMode(next, key) === 'mention' && conversationMode(previous, key) !== 'mention')
+      epochs[key] = randomBytes(16).toString('hex');
+    else if (previous.groupWakeEpochs?.[key]) epochs[key] = previous.groupWakeEpochs[key];
+  }
+  if (Object.keys(epochs).length) next.groupWakeEpochs = epochs;
+  else delete next.groupWakeEpochs;
 }
 export function conversationAccess(wechat, key) {
   validateConversationSettings(wechat);

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { NativeVoiceTransport } from './native-voice-transport.mjs';
+import { DesktopReceipts } from '../desktop-receipts.mjs';
 import {
   voiceInterruptionEvidence,
   validVoiceInterruptionEvidence,
@@ -223,6 +224,17 @@ test('production transport binds fresh account/chat, prepares receipt before nat
   assert.equal(saved.includes('private-token'), false);
 });
 
+test('crossing a clock tick cannot invalidate the persisted voice reservation', async t => {
+  const f = fixture(t);
+  let now = f.config.now();
+  f.config.now = () => now++;
+  const transport = new NativeVoiceTransport(f.config);
+  assert.equal((await transport.sendSegment(f.job, f.options)).confirmed, true);
+  const restored = await new NativeVoiceTransport(f.config).querySegment(f.job);
+  assert.equal(restored.confirmed, true);
+  assert.equal(f.state.nativeCalls, 1);
+});
+
 test('filehelper is a normal production target and still requires its exact target proof and permission', t => {
   const f = fixture(t);
   f.job.target = 'filehelper';
@@ -298,6 +310,24 @@ test('a failed focus cleanup preserves the original proven unrecorded refusal ac
   assert.equal(calls, 1);
   assert(notifications.every(value => value.cleanupConfirmed === false));
 });
+test('a known lack of submission cannot consume a voice receipt during send or restart', async t => {
+  const f = fixture(t);
+  f.config.runNative = async () => ({
+    recordingAttempted: true,
+    submitAttempted: false,
+    recordingPossible: false,
+    stopBarrier: false,
+    systemSettingsChanged: false,
+  });
+  const first = await new NativeVoiceTransport(f.config).sendSegment(f.job, f.options);
+  assert.equal(first.confirmed, false);
+  assert.equal(first.submitAttempted, false);
+  const restored = await new NativeVoiceTransport(f.config).querySegment(f.job);
+  assert.equal(restored.confirmed, false);
+  assert.equal(restored.submitAttempted, false);
+  assert.equal(f.state.queries, 0);
+});
+
 test('a fully observed interrupted cancellation is durable and its old attempt can only return that evidence', async t => {
   for (const reason of ['DRAFT_HUMAN_ACTIVITY_CHANGED', 'VOICE_BACKGROUND_WECHAT_ACTIVATED']) {
     const f = fixture(t);
@@ -973,6 +1003,63 @@ test('a temporary receipt outage preserves proven recording end for query-only r
   f.state.receiptFails = false;
   f.state.allowed = false;
   assert.equal((await new NativeVoiceTransport(f.config).querySegment(f.job)).confirmed, true);
+  assert.equal(f.state.nativeCalls, 1);
+});
+test('a receipt timing write outage keeps the native submission and recovers the exact window', async t => {
+  const f = fixture(t);
+  let unavailable = true,
+    window,
+    cleanup;
+  const attempt = {
+    operation: 'voice',
+    accountRef: f.job.selectionScope.accountRef,
+    accountWxid: f.job.account,
+    target: f.job.target,
+    deliveryId: 'voice',
+    segment: { id: f.job.id, attemptId: f.job.id },
+    pcmBase64: Buffer.alloc(3200).toString('base64'),
+  };
+  const at = f.config.now();
+  const receipts = new DesktopReceipts(f.root, {
+    now: f.config.now,
+    authorize: (_job, forInput) => !forInput || f.state.allowed,
+    messages: async () => ({ messages: [], watermarks: {} }),
+    recordingReceipt: async request => {
+      window = request;
+      return {
+        success: true,
+        match: { serverId: '101', localId: '101', sourceShard: hex('c'), createTime: at / 1000 },
+      };
+    },
+  });
+  const observe = request => {
+    if (request.recording && unavailable) throw Object.assign(Error('SQLITE_BUSY'), { code: 'SQLITE_BUSY' });
+    return receipts.observe(attempt, request);
+  };
+  f.config.receiptsFactory = () => ({
+    prepare: () => observe({ phase: 'prepare' }),
+    submitted: (_job, submittedAt, options) => observe({ ...options, phase: 'submitted', submittedAt }),
+    query: (_job, options) => observe({ ...options, phase: 'query' }),
+  });
+  f.config.driver.finishVoiceInteraction = result => (cleanup = result);
+  const initial = await new NativeVoiceTransport(f.config).sendSegment(f.job, f.options);
+  assert.equal(initial.confirmed, false);
+  assert.equal(initial.submitAttempted, true);
+  assert.equal(initial.recordingPossible, false);
+  assert.equal(initial.stopBarrier, false);
+  assert.equal(cleanup.cleanupConfirmed, true);
+  assert.equal(window, undefined);
+  const saved = path.join(f.root, 'state/native-voice-transport', f.job.id + '.json');
+  const checkpoint = fs.readFileSync(saved, 'utf8');
+  assert.deepEqual(JSON.parse(checkpoint).recording, { startedAt: at, releasedAt: at });
+
+  unavailable = false;
+  f.state.allowed = false;
+  const recovered = await new NativeVoiceTransport(f.config).querySegment(f.job);
+  assert.equal(recovered.receipt.serverId, '101');
+  assert.equal(window.after, at / 1000 - 1);
+  assert.equal(window.before, at / 1000 + 30);
+  assert.equal(fs.readFileSync(saved, 'utf8'), checkpoint);
   assert.equal(f.state.nativeCalls, 1);
 });
 test('another reader account cannot prepare or query the saved target receipt', async t => {

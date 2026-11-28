@@ -14,7 +14,7 @@
 JSON 路径为：
 
 ```text
-<项目目录>/state/member-memory/<微信账号摘要>/<群聊ID>.json
+<项目目录>/state/member-memory/<微信账号摘要>/<完整会话键的 SHA-256 摘要>.json
 ```
 
 文件保存成员 ID、当前与旧昵称、标签、证据引用及更新时间，不复制完整聊天原文。每群最多保留最近活跃的 500 名成员，每人最多 6 个标签；超过 90 天的标签证据会失效。少量互动不足时，模型应正常聊天，不强行给人贴标签。
@@ -25,11 +25,11 @@ JSON 路径为：
 {
   "version": 1,
   "accountScope": "账号摘要",
-  "conversationKey": "wechat:group:123",
+  "conversationKey": "wechat:group:123@chatroom",
   "members": {
     "成员摘要": {
       "memberId": "成员摘要",
-      "senderId": "456",
+      "senderId": "wxid_example",
       "names": ["当前昵称", "以前的昵称"],
       "tags": [{"label": "表达简短", "status": "observed", "confidence": 0.55}]
     }

@@ -1,4 +1,6 @@
 import { deliveryPages } from '../public/console/workspace-layout.js';
+import { mergedDeliveries } from './desktop-control.mjs';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -283,6 +285,133 @@ test('file queue shows controls for upcoming deliveries and keeps confirmed reco
   assert(f.requests.every(({ body }) => body === undefined));
 });
 
+test('an image without digest proof stays pending while a confirmed file shows its limited evidence', async () => {
+  const createdAt = Date.now();
+  const image = {
+    id: 'a'.repeat(64),
+    state: 'unconfirmed',
+    name: 'fixture PNG',
+    createdAt,
+    channel: 'native',
+    reason: 'DESKTOP_IMAGE_CONTENT_UNVERIFIED',
+  };
+  const file = {
+    id: 'b'.repeat(64),
+    state: 'confirmed',
+    name: 'fixture PDF',
+    createdAt,
+    receipt: { fileContentMd5Matched: false },
+  };
+  const f = fixture({ tab: 'deliveries', deliveries: { account: 'fixture', native: [image], jobs: [file] } });
+  const html = await f.ui.chatsPage();
+  assert.match(html, /图片送达待核实/);
+  assert.match(html, /已确认送达，文件摘要未核实/);
+  assert.deepEqual(deliveryPages([image, file]).history, [file]);
+  assert.deepEqual(deliveryPages([image, file]).pending, [image]);
+});
+
+test('a recorded file receipt stays confirmed while the native queue view is stale', async () => {
+  const id = 'a'.repeat(64);
+  const receipt = {
+    type: 'wechat-file',
+    messageId: '17',
+    serverId: '201',
+    serverConfirmed: true,
+    fileContentMd5Matched: false,
+  };
+  const file = { id, name: 'fixture PDF', createdAt: Date.now(), state: 'confirmed', receipt };
+  const stale = {
+    id: 'b'.repeat(64),
+    parentId: id,
+    name: file.name,
+    createdAt: file.createdAt,
+    channel: 'native',
+    operation: 'file',
+    state: 'waiting',
+    confirmed: false,
+    pending: true,
+    canPause: true,
+    canCancel: true,
+  };
+  const merge = (item, delivery) =>
+    mergedDeliveries({ account: 'fixture', jobs: [item] }, { replies: [] }, { available: true, jobs: [delivery] });
+  const deliveries = merge(file, stale);
+  const [view] = deliveries.jobs;
+  assert.equal(view.state, 'confirmed');
+  assert.deepEqual(view.receipt, receipt);
+  assert.equal(view.pending, false);
+  assert.deepEqual(deliveries.native, []);
+  assert.deepEqual(deliveryPages(deliveries.jobs).pending, []);
+  const f = fixture({ tab: 'deliveries', deliveries });
+  const html = await f.ui.chatsPage();
+  assert.match(html, /已确认送达，文件摘要未核实/u);
+  assert.doesNotMatch(html, /data-file-delivery="cancel"/u);
+
+  const nativeReceipt = { source: 'wechat-server-id', serverId: receipt.serverId, fileContentMd5Matched: false };
+  const current = { ...stale, state: 'confirmed', confirmed: true, pending: false, receipt: nativeReceipt };
+  assert.deepEqual(merge(file, current).jobs[0].receipt, nativeReceipt);
+  const stronger = { ...receipt, fileContentMd5Matched: true };
+  assert.deepEqual(merge({ ...file, receipt: stronger }, current).jobs[0].receipt, stronger);
+});
+
+test('a reviewed native file replaces its stale recovery link in console history', async () => {
+  const id = 'a'.repeat(64);
+  const name = 'fixture PDF';
+  const file = { id, name, createdAt: Date.now(), state: 'unconfirmed', recovery: { canRecover: true } };
+  const native = {
+    id: 'b'.repeat(64),
+    parentId: id,
+    name,
+    channel: 'native',
+    operation: 'file',
+    state: 'unconfirmed',
+    reviewed: true,
+  };
+  const deliveries = mergedDeliveries(
+    { account: 'fixture', jobs: [file] },
+    { replies: [] },
+    {
+      available: true,
+      jobs: [native],
+    },
+  );
+  const f = fixture({ tab: 'deliveries', deliveries });
+  const html = await f.ui.chatsPage();
+  assert.match(html, /最近发送记录/);
+  assert.match(html, /送达待核实/);
+  assert.doesNotMatch(html, /检查草稿或录音并解除占用/);
+  assert.deepEqual(deliveryPages(deliveries.jobs).pending, []);
+});
+
+test('a text fallback claims its original voice entry only for the matching native text job', async () => {
+  const id = 'c'.repeat(64);
+  const reply = { id, kind: 'voice', state: 'submitted', revision: 2, createdAt: Date.now() };
+  const parentId = createHash('sha256')
+    .update(id + '\0voice-fallback')
+    .digest('hex');
+  const job = {
+    id: 'd'.repeat(64),
+    parentId,
+    operation: 'text',
+    name: '文字回复',
+    state: 'queued',
+    canCancel: true,
+    revision: 0,
+    channel: 'native',
+    createdAt: reply.createdAt,
+  };
+  const merge = native =>
+    mergedDeliveries({ account: 'fixture', jobs: [] }, { replies: [reply] }, { available: true, jobs: [native] });
+  const deliveries = merge(job);
+  assert.deepEqual(deliveries.replies, []);
+  assert.deepEqual(deliveries.native, [job]);
+  assert.deepEqual(merge({ ...job, operation: 'image' }).replies, [reply]);
+  const html = await fixture({ tab: 'deliveries', deliveries }).ui.chatsPage();
+  assert.match(html, /文字回复/u);
+  assert.match(html, /data-channel="native"/u);
+  assert.doesNotMatch(html, /语音回复/u);
+});
+
 test('model-selected image and GIF replies share the ordinary reply controls', async () => {
   const f = fixture({
     tab: 'deliveries',
@@ -338,6 +467,7 @@ test('task controls bind the actual task ID and file scope without running or ca
     html = await f.ui.chatsPage();
   assert.match(html, /data-assistant-task-id="T0123456789abcdef"/);
   assert.match(html, /data-assistant-cancel="wechat:private:123"/);
+  assert.match(html, /data-file-confirm="wechat:private:123"/);
   assert.match(html, /50 MB/);
   assert.equal(JSON.stringify(f.state.draft), before);
   assert.deepEqual(
@@ -348,6 +478,7 @@ test('task controls bind the actual task ID and file scope without running or ca
   const social = await f.ui.chatsPage();
   assert.match(social, /聊天模式不执行助手任务/);
   assert(!social.includes('data-assistant-cancel='));
+  assert(!social.includes('data-file-confirm='));
 });
 test('settings and network sections render only their own controls while drafts and native grants survive', async () => {
   const f = fixture(),
@@ -435,6 +566,13 @@ test('reader diagnostics show the current per-chat frontier and escaped display 
   assert.match(view.readerProgress(), /待补读至/);
   state.status.intakeProgress[0].scannedThrough = 151;
   assert.doesNotMatch(view.readerProgress(), /待补读至/);
+  state.status.intakeProgress.push({
+    key: 'wechat:private:other',
+    scannedThrough: null,
+    pending: 0,
+    error: '<invalid>',
+  });
+  assert.match(view.readerProgress(), /已扫描至[\s\S]+尚未完成首次扫描[\s\S]+&lt;invalid&gt;/);
 });
 
 test('queue history pages keep older pending and unresolved work on every page', () => {

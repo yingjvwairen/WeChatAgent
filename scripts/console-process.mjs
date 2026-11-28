@@ -99,6 +99,7 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
     );
   if (/SERVICE_PORT_INSPECTION_FAILED/.test(output))
     return '无法核对' + portLabel + '的进程归属，启动已停止。请完整退出并重新打开应用，仍失败时查看启动日志。';
+  if (/SERVICE_RESTART_REQUIRED/.test(output)) return '服务仍在原端口运行，请重新启动服务以应用新端口。';
   if (/ADAPTER_IDENTITY_MISMATCH/.test(output))
     return portLabel + '未返回本实例的适配器身份，可能仍在运行旧版服务。请先重启本实例服务；持续冲突时检查占用进程。';
   if (
@@ -113,6 +114,7 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
     );
   if (/ADAPTER_LISTEN_FAILED|ADAPTER_START_FAILED/.test(output))
     return '应用适配器未能启动。下方日志已保留失败阶段和系统错误码，请结合 adapter.stderr.log 检查。';
+  if (/RUNTIME_OPERATION_BUSY/.test(output)) return '已有一项服务操作正在执行，请稍后重试。';
   if (/SERVICE_START_TIMEOUT/.test(output))
     return portLabel + '对应的本实例服务未在期限内准备完成。请查看该服务日志，或重启本实例后重试。';
   if (/READER_PORT_UNAVAILABLE/.test(output))
@@ -133,6 +135,12 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
     return '桌面发送器尚未完成录音或输入清理，已保留运行进程。请稍后重试停止；不会强制关闭正在录音的微信。';
   if (/DESKTOP_VERSION_UNSUPPORTED/.test(output))
     return '当前桌面发送支持微信 ' + DESKTOP_WECHAT_VERSION + '，请在连接设置选择已安装的对应版本。';
+  if (/UI_QT_LAYOUT_THEME_UNSUPPORTED/.test(output))
+    return 'OCR 自动布局要求微信使用暗色界面。请切换微信主题、为当前窗口手工标定，或选择 UIA 后重试。';
+  if (/DESKTOP_UIA_ACCESSIBILITY_PROVIDER_REQUIRED/.test(output))
+    return '当前微信窗口尚无法只读核验 UIA 控件。请确认微信已登录并显示聊天，或切换 OCR 后重试。';
+  if (/stage=desktop-layout/.test(output))
+    return '发送依赖和账号已通过，窗口布局尚未验证。请完整显示微信聊天窗口后重试，具体原因见下方输出。';
   if (/DESKTOP_(?:CLIENT_REQUIRED|ACCOUNT_UNVERIFIED|SENDER_NOT_READY)|INPUT_WECHAT_NOT_RUNNING/.test(output))
     return '请在连接设置选择微信程序，并登录所选读取账号后重试。';
   if (/ACCOUNT_SWITCH_REQUIRES_DSH_RESTART/.test(output))
@@ -159,7 +167,7 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
       output,
     )
   )
-    return 'Windows PowerShell 安全模块未能加载。请退出应用后重新打开更新后的 WeChatAgent.exe。';
+    return 'Windows PowerShell 安全模块未能加载。请退出应用后重新打开更新后的 WeChatAgent。';
   if (/WECHAT_LAUNCH_EXITED/i.test(output))
     return '微信启动后已退出。若微信提示必须升级，当前固定版本的发送组件需要重新适配；请保留完整微信提示。';
   if (/Install the DSH plugin|Fully.*reopen DSH|ECONNREFUSED.*11230/i.test(output))
