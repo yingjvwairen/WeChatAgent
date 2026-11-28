@@ -2,6 +2,11 @@ import { audioSegments } from '../packages/plugin-api/audio.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { inspectPackage } from '../packages/plugin-api/catalog.mjs';
+import { managedSpeechAvailable, managedSpeechSettings } from '../packages/plugin-api/managed-speech.mjs';
 import {
   servicesOf,
   migrateServices,
@@ -248,6 +253,47 @@ test('every provider lists its capabilities honestly; only verified paths are ma
     assert(providersFor('tts').some(item => item.id === priority));
   assert.deepEqual(Object.keys(CUSTOM.tts), ['speech', 'realtime']);
   assert.deepEqual(Object.keys(CUSTOM.fileAsr), ['transcriptions']);
+});
+
+test('managed speech reuses the loopback transcription method with the host profile and private credential', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wca-managed-provider-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'config'));
+  fs.mkdirSync(path.join(root, 'state/local-whisper'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'config/wechatagent.json'),
+    JSON.stringify({
+      runtime: { localSpeech: { asr: { enabled: true, port: 39281 } } },
+    }),
+  );
+  const source = inspectPackage(path.resolve('optional-extensions/speech-synthesis'));
+  assert.equal(managedSpeechAvailable(source), true);
+  assert.deepEqual(managedSpeechSettings(root, { ...source, revision: 'locally-modified' }), {});
+  const settings = configured({
+    fileAsr: ['wechatagent-local', 'transcriptions', { endpoint: 'https://other.example/v1', model: 'other' }],
+    recognition: 'file',
+    owners: { fileAsr: { entry: 'openai' } },
+    keys: { fileAsr: 'saved-cloud-key' },
+  });
+  Object.assign(settings, managedSpeechSettings(root, source));
+  await assert.rejects(transcribeVoice(settings, wav16()), /VOICE_MANAGED_SPEECH_NOT_READY/);
+
+  const managedKey = 'loopback-only-fixture-secret-0a12';
+  fs.writeFileSync(path.join(root, 'state/local-whisper/api.key'), managedKey + '\n');
+  Object.assign(settings, managedSpeechSettings(root, source));
+  assert.equal(settings.managedSpeech.tts, undefined);
+  const tape = recorder(call => {
+    assert.equal(call.url, 'http://127.0.0.1:39281/v1/audio/transcriptions');
+    assert.equal(call.headers.Authorization, 'Bearer ' + managedKey);
+    assert.equal(call.body.get('model'), 'default');
+    return json({ text: 'Whisper transcribed this' });
+  });
+  assert.equal(await transcribeVoice(settings, wav16(), tape), 'Whisper transcribed this');
+  assert.equal(tape.calls.length, 1);
+  assert.equal(settings.fileAsrKey, 'saved-cloud-key');
+  settings.managedSpeech.fileAsr.endpoint = 'https://other.example/v1';
+  await assert.rejects(transcribeVoice(settings, wav16(), tape), /VOICE_MANAGED_SPEECH_DISABLED/);
+  assert.equal(tape.calls.length, 1);
 });
 
 // ---- credentials stay with their owners ----

@@ -105,8 +105,14 @@ async function readVoice(ctx, id) {
 // Credentials never appear in what a settings action returns.
 const hidden = (text, keys) => keys.filter(Boolean).reduce((value, key) => value.replaceAll(key, '[已隐藏]'), text);
 const keysOf = settings =>
-  ['apiKey', 'ttsKey', 'realtimeAsrKey', 'fileAsrKey']
-    .map(field => String(settings[field] ?? '').trim())
+  [
+    settings.apiKey,
+    settings.ttsKey,
+    settings.realtimeAsrKey,
+    settings.fileAsrKey,
+    ...Object.values(settings.managedSpeech ?? {}).map(service => service.key),
+  ]
+    .map(key => String(key ?? '').trim())
     .filter(key => key.length >= 6);
 
 // Everything the host needs to enable the plugin: each configured capability
@@ -117,7 +123,7 @@ function validate(value) {
   const configured = CAPABILITY_IDS.filter(capability => activeOf(services, capability).entry);
   if (!configured.length) throw new Error('VOICE_TTS_NOT_CONFIGURED');
   for (const capability of configured) {
-    const service = ready(value, capability);
+    const service = ready(value, capability, { validateOnly: true });
     if (service.entry === 'tencent') tencentCredential(service.key);
     if (service.entry === 'google') googleAccount(service.key);
   }
@@ -193,7 +199,7 @@ export function setup(api) {
         const text = await transcribeSegments(ctx, id, wav =>
           transcribeVoice(ctx.settings, wav, { signal: ctx.signal, allowEmpty: true }),
         );
-        return { ok: true, text };
+        return { ok: true, text: hidden(text, keysOf(ctx.settings)) };
       } catch (error) {
         return failure(error);
       }

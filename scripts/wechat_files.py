@@ -62,15 +62,10 @@ def file_policy(project, key, sender):
     match = parse_chat_key(key)
     if not match or not valid_chat_id('private', sender) or (match[0] == 'private' and sender != match[1]):
         return False
-    if (
-        match[1] not in w.get('whitelist', {}).get('groups' if match[0] == 'group' else 'private', [])
-        or w.get('workModes', {}).get(key, 'social') != 'assistant'
-    ):
+    if match[1] not in w.get('whitelist', {}).get('groups' if match[0] == 'group' else 'private', []):
         return False
-    policy = w.get('assistant', {})
-    if policy.get('fileTransferChats', {}).get(key) is not True:
-        return False
-    return sender in policy.get('administrators', [])
+    mode = w.get('workModes', {}).get(key, 'social')
+    return mode == 'social' or (mode == 'assistant' and sender in w.get('assistant', {}).get('administrators', []))
 
 
 def _ordinary(path):

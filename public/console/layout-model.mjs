@@ -1,3 +1,5 @@
+import { activeChatWorkMode, proactiveChatField } from './conversation-settings.mjs';
+
 export const MAIN_PAGES = ['overview', 'chats', 'roles', 'extensions', 'stickers', 'memory', 'settings'];
 export const SETTINGS_SECTIONS = {
   chat: '聊天默认值',
@@ -15,8 +17,12 @@ export const STICKER_SECTIONS = {
   sources: '来源与搜索',
   sending: '发送设置',
 };
-// 后两项是设置页而非能力分类，名称避免与能力目录里的分类（联网与阅读、DSH 插件）重复
-export const CAPABILITY_SECTIONS = { catalog: '能力目录', network: '联网默认设置', dsh: 'DSH 技能与工具' };
+export const CAPABILITY_SECTIONS = {
+  catalog: '能力目录',
+  voice: '语音服务',
+  network: '联网默认设置',
+  dsh: 'DSH 技能与工具',
+};
 // 保存后立即生效的 wechat 配置分区（服务器对比时忽略这些分区，其余改动需重启服务）。
 // 服务器判断是否需要重启与页面上的"需重启"标记共用这一份列表。
 export const LIVE_WECHAT_SECTIONS = [
@@ -41,10 +47,16 @@ export const LIVE_WECHAT_SECTIONS = [
 export const LIVE_INPUT_FIELDS = ['paused', 'controlMode', 'typeText', 'offscreen', 'voiceCable'];
 export const requiresRestart = path =>
   !LIVE_INPUT_FIELDS.some(field => path === 'input.' + field) &&
+  path !== 'runtime.localSpeech' &&
+  !path.startsWith('runtime.localSpeech.') &&
   !LIVE_WECHAT_SECTIONS.some(section => path === 'wechat.' + section || path.startsWith('wechat.' + section + '.'));
 export function withoutLiveSettings(config) {
   const copy = structuredClone(config);
   for (const section of LIVE_WECHAT_SECTIONS) delete copy.wechat?.[section];
+  if (copy.runtime) {
+    delete copy.runtime.localSpeech;
+    if (!Object.keys(copy.runtime).length) delete copy.runtime;
+  }
   // Retain runtime/interpreter/client selection in the restart comparison.
   if (copy.input) {
     for (const field of LIVE_INPUT_FIELDS) delete copy.input[field];
@@ -93,7 +105,7 @@ export function chatRows(config, names = new Map(), sessions = []) {
         id,
         kind,
         name: names.get(key) || (kind === 'groups' ? '群聊' : '好友') + ' · ' + id.slice(-4),
-        mode: config.wechat.workModes?.[key] ?? 'social',
+        mode: activeChatWorkMode(config, key),
         persona: config.persona.chats?.[key] ?? config.persona.default,
         session: byKey.get(key) ?? null,
       };
@@ -112,14 +124,25 @@ export function filterChats(rows, { kind = 'all', mode = 'all', query = '' } = {
   );
 }
 export function effectiveChatFeature(config, key, feature) {
-  const settings = config.wechat[feature] ?? {},
-    own = Object.hasOwn(settings.chats ?? {}, key),
-    value = settings.chats?.[key];
-  if (feature === 'proactive')
+  const settings = config.wechat[feature] ?? {};
+  if (feature === 'proactive') {
+    const mode = activeChatWorkMode(config, key),
+      selected = settings[proactiveChatField(mode)]?.[key] === true;
+    const privateRecipient = key.startsWith('wechat:private:') ? key.slice('wechat:private:'.length) : '';
+    if (
+      selected &&
+      mode === 'assistant' &&
+      privateRecipient &&
+      !config.wechat.assistant?.administrators?.includes(privateRecipient)
+    )
+      return { enabled: false, source: '此好友尚未设为助手管理员' };
     return {
-      enabled: settings.enabled === true && value === true,
-      source: settings.enabled !== true ? '总开关关闭' : value === true ? '本聊天已加入' : '本聊天未加入',
+      enabled: settings.enabled === true && selected,
+      source: settings.enabled !== true ? '总开关关闭' : selected ? '本聊天已加入' : '本聊天未加入',
     };
+  }
+  const own = Object.hasOwn(settings.chats ?? {}, key),
+    value = settings.chats?.[key];
   if (feature === 'context')
     return {
       enabled: settings.enabled === true && value !== 0,

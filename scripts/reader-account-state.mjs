@@ -58,6 +58,10 @@ export function cachedReaderAccount(root, id) {
   return read(path.join(root, 'state/weflow/reader-accounts.json')).entries?.[id];
 }
 
+export function assistantChatBufferFile(root, account = activeReaderAccount(root)) {
+  return path.join(root, 'state/accounts', account.id || account.legacyId || 'legacy', 'assistant-group-chat.json');
+}
+
 export function accountChatSettings(config) {
   return {
     assistant: structuredClone(config.wechat.assistant ?? {}),
@@ -69,6 +73,7 @@ export function accountChatSettings(config) {
     modeSettings: structuredClone(config.wechat.modeSettings ?? {}),
     chatModes: structuredClone(config.wechat.chatModes ?? {}),
     dshChats: structuredClone(config.wechat.dshAccess?.chats ?? {}),
+    assistantProactiveChats: structuredClone(config.wechat.proactive?.assistantChats ?? {}),
     featureChats: Object.fromEntries(
       chatFeatures.map(name => [name, structuredClone(config.wechat[name]?.chats ?? {})]),
     ),
@@ -145,6 +150,10 @@ export function applyReaderAccount(root, previousReader, nextReader, config) {
     for (const feature of chatFeatures)
       if (selectedConfig.wechat[feature])
         selectedConfig.wechat[feature].chats = structuredClone(chats.featureChats?.[feature] ?? {});
+    if (selectedConfig.wechat.proactive || chats.assistantProactiveChats) {
+      selectedConfig.wechat.proactive ??= {};
+      selectedConfig.wechat.proactive.assistantChats = structuredClone(chats.assistantProactiveChats ?? {});
+    }
     // Image credentials and explicit message filters belong to the selected account.
     for (const field of ['imageAesKey', 'imageXorKey', 'messagePushFilterList']) {
       if (incoming?.reader && Object.hasOwn(incoming.reader, field))

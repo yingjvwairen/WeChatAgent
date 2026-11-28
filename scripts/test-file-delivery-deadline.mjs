@@ -38,7 +38,7 @@ async function fixture(t, { additionalGroups = [], probeAccount } = {}) {
     wechat: {
       whitelist: { groups, private: [] },
       workModes: Object.fromEntries(keys.map(key => [key, 'assistant'])),
-      assistant: { administrators: [sender], fileTransferChats: Object.fromEntries(keys.map(key => [key, true])) },
+      assistant: { administrators: [sender] },
     },
   };
   const write = (file, value) => {
@@ -218,6 +218,8 @@ for (const expired of [false, true]) {
 test('pending desktop results and slow file receipts do not use the slots for new files', async t => {
   const f = await fixture(t, { additionalGroups: ['second@chatroom', 'third@chatroom'] });
   f.config.input.operationTimeoutMs = 20000;
+  f.source.deadlineAt = f.source.createdAt + 120000;
+  f.store.write(f.source);
   const second = await f.queue('wechat:group:second@chatroom');
   const firstTwo = new Set([f.id, second.id]);
   const accepted = id => {

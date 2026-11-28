@@ -19,6 +19,7 @@ import { PluginDocuments } from './documents.mjs';
 import { createAudioReader } from './audio.mjs';
 import { boundedTask, VOICE_TRANSCRIPTION_TIMEOUT_MS } from '../dsh-social-bridge-plugin/deadline.mjs';
 import { FEATURE_ENTRIES, adapterOwnsPlugin, featureConfigured } from './contract.mjs';
+import { managedSpeechSettings } from './managed-speech.mjs';
 export { createPluginModelUtility } from './model-utility.mjs';
 export const TOOL_POLICY = Symbol.for('wechatagent.extension-tools.v1');
 
@@ -220,7 +221,11 @@ export class PluginRuntime {
       now: this.now(),
       actor: { id: turn.actorId ?? '' },
       sessionId: turn.sessionId ?? '',
-      settings: structuredClone({ ...record.settings, ...this.policy().config.plugins[record.id]?.settings }),
+      settings: structuredClone({
+        ...record.settings,
+        ...this.policy().config.plugins[record.id]?.settings,
+        ...managedSpeechSettings(this.root, record),
+      }),
     };
   }
   service(record, turn, signal, readOnly = false) {

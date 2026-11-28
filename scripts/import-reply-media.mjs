@@ -10,10 +10,9 @@ export function importReplyMedia(source, root) {
   const manifest = JSON.parse(fs.readFileSync(source, 'utf8').replace(/^\uFEFF/, ''));
   if (manifest?.version !== 1 || Object.keys(manifest).some(key => !['version', 'enabled', 'items'].includes(key)))
     throw Error('REPLY_MEDIA_IMPORT_INVALID');
-  return new ReplyMediaCatalog({ root }).importIntoEmpty({
-    enabled: manifest.enabled === undefined ? true : manifest.enabled,
-    items: manifest.items,
-  });
+  if (manifest.enabled !== undefined && typeof manifest.enabled !== 'boolean')
+    throw Object.assign(Error('REPLY_MEDIA_CONFIG_INVALID'), { code: 'REPLY_MEDIA_CONFIG_INVALID' });
+  return new ReplyMediaCatalog({ root }).importIntoEmpty({ items: manifest.items });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

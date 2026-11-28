@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
-import { randomInt } from 'node:crypto';
+import { once } from 'node:events';
 import { FishNotebook, createNotebookWriter } from '../packages/dsh-social-bridge-plugin/fish-notebook.mjs';
 import { PluginInstaller } from '../packages/plugin-api/installer.mjs';
 import { packZip } from '../packages/plugin-api/zip.mjs';
@@ -279,7 +279,8 @@ test('Bridge routes diary questions through the existing reliable text outbox wi
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(result));
     });
-  await new Promise(r => server.listen(randomInt(20000, 60000), '127.0.0.1', r));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
   t.after(async () => {
     server.closeAllConnections();
     await new Promise(r => server.close(r));

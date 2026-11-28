@@ -140,7 +140,6 @@ class ReaderIntakeTest(unittest.TestCase):
                 intake_grant=lambda *_: grant,
                 connection_boundary=lambda *_: [],
                 intake_rows=rows,
-                replay_role=lambda *_: 'social',
                 offline_wake=lambda *_: True,
                 register_video=lambda *_: prepared.append(rawid),
             )
@@ -191,7 +190,7 @@ class ReaderIntakeTest(unittest.TestCase):
                 self.assertFalse(inbox.has_event(chat, grant, acknowledged['rawid']))
                 self.assertTrue(inbox.has_event(chat, grant, pending['rawid']))
 
-    def test_stopped_reader_does_not_promote_messages_from_before_assistant_authorization(self):
+    def test_stopped_reader_keeps_all_assistant_messages_as_history_with_legacy_settings(self):
         from collections import OrderedDict
         from reader_poll import poll_chat
 
@@ -238,9 +237,7 @@ class ReaderIntakeTest(unittest.TestCase):
             while event := reader.intake.next(reader.intake_grant):
                 delivered.append((event['timestamp'], event['offlineReplay'], event['readerRole']))
                 reader.intake.acknowledge(event['readerIntake']['token'], event['rawid'])
-            self.assertEqual(
-                delivered, [(150, 'context', None), (160, 'context', None), (162, 'reply', 'assistant-admin')]
-            )
+            self.assertEqual(delivered, [(150, 'context', None), (160, 'context', None), (162, 'context', None)])
 
     def test_physical_append_finds_backdated_rows_and_clock_rollback_keeps_progress(self):
         from collections import OrderedDict
@@ -475,7 +472,7 @@ class ReaderIntakeTest(unittest.TestCase):
                     journal.acknowledge(item['readerIntake']['token'], item['rawid'])
             self.assertEqual(delivered, [110, 112])
 
-    def test_assistant_catchup_requires_opt_in_and_rechecks_original_role(self):
+    def test_reconnect_downgrades_a_legacy_assistant_reply_candidate_to_history(self):
         spec = importlib.util.spec_from_file_location('reader_replay', Path(__file__).with_name('reader-api.py'))
         api = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(api)
@@ -484,21 +481,32 @@ class ReaderIntakeTest(unittest.TestCase):
         settings = {
             'whitelist': {'private': ['peer'], 'groups': []},
             'workModes': {key: 'assistant'},
-            'assistant': {'administrators': ['peer']},
+            'assistant': {
+                'administrators': ['peer'],
+                'replayOffline': True,
+                'replayAuthorization': {'since': 201, 'administrators': ['peer'], 'chats': {key: 'legacy'}},
+            },
         }
-        msg = {'talkerId': 'peer', 'readerRole': 'assistant-admin', 'timestamp': 201}
-        self.assertFalse(reader.offline_wake('peer', msg, settings))
-        settings['assistant']['replayOffline'] = True
-        self.assertFalse(reader.offline_wake('peer', msg, settings))
-        settings['assistant']['replayAuthorization'] = {
-            'since': 201,
-            'administrators': ['peer'],
-            'chats': {key: 'legacy'},
+        msg = {
+            'sessionId': 'peer',
+            'rawid': 'b' * 64,
+            'talkerId': 'peer',
+            'readerRole': 'assistant-admin',
+            'timestamp': 201,
         }
-        self.assertTrue(reader.offline_wake('peer', msg, settings))
-        self.assertFalse(reader.offline_wake('peer', {**msg, 'readerRole': 'social'}, settings))
-        settings['assistant']['administrators'].clear()
         self.assertFalse(reader.offline_wake('peer', msg, settings))
+        with tempfile.TemporaryDirectory() as folder:
+            inbox = ReaderIntake(folder, 'a' * 64)
+            inbox.scan('peer', 'legacy', 100, 100)
+            inbox.capture(msg, 'legacy', offline=True, eligible=True)
+            inbox.finish_scan('peer', 'legacy', 220, 220)
+            inbox.connect('a' * 32, 220, lambda chat, payload: reader.offline_wake(chat, payload, settings), [])
+            item = inbox.next(lambda _: 'legacy')
+            self.assertEqual(item['rawid'], msg['rawid'])
+            self.assertEqual(item['offlineReplay'], 'context')
+        settings['workModes'][key] = 'social'
+        self.assertFalse(reader.offline_wake('peer', msg, settings))
+        self.assertTrue(reader.offline_wake('peer', {**msg, 'readerRole': 'social'}, settings))
 
     def test_hashless_row_at_new_grant_boundary_cannot_become_a_new_request(self):
         spec = importlib.util.spec_from_file_location(

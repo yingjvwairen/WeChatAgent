@@ -230,13 +230,28 @@ SectionEnd
         assert.equal(result.program, path.join(selected, 'app'));
         assert.equal(result.data, path.join(selected, 'data'));
         assert.equal(result.error, '');
-        assert.equal(storage.resolveStorageLocation({ appDir: result.program }).dataHome, result.data);
+        const resolved = storage.resolveStorageLocation({ appDir: result.program });
+        assert.equal(resolved.dataHome, result.data);
+        assert.equal(resolved.migrationSource, '');
+        assert.equal(storage.migrationPlan(resolved).needed, false);
       });
       await t.test('silent installation derives app/data without displaying a directory page', () => {
         const result = run('silent');
         assert.equal(result.root, path.join(base, 'silent/selected'));
         assert.equal(result.program, path.join(result.root, 'app'));
         assert.equal(result.data, path.join(result.root, 'data'));
+      });
+      await t.test('reinstall drops a recorded default migration source that never existed', () => {
+        const program = path.join(base, 'stale/app');
+        const data = path.join(base, 'stale/data');
+        const result = run('stale', { initialDirectory: program, previousProgram: program }, () => {
+          write(
+            path.join(program, 'storage.ini'),
+            ini('Storage', { layoutVersion: '1', dataHome: data, migrationSource: path.join(base, 'legacy') }),
+          );
+        });
+        assert.equal(result.data, data);
+        assert.equal(storage.resolveStorageLocation({ appDir: program }).migrationSource, '');
       });
       await t.test('the directory leave callback reads the current edit value instead of the old root', () => {
         const selected = path.join(base, 'typed root');

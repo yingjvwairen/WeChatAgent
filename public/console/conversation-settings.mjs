@@ -1,32 +1,64 @@
 const adminOnly = (config, key) =>
   !key.startsWith('wechat:group:') || config.wechat.assistant?.adminOnlyGroups?.[key] !== false;
-const fileTransfer = (config, key) => config.wechat.assistant?.fileTransferChats?.[key] === true;
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const own = (object, key) => Object.hasOwn(object ?? {}, key);
 
-export function chatSettingsSnapshot(config, key, mode = config.wechat.workModes?.[key] ?? 'social') {
-  const active = config.wechat.workModes?.[key] ?? 'social';
+export const activeChatWorkMode = (config, key) => config.wechat.workModes?.[key] ?? 'social';
+export const proactiveChatField = mode => (mode === 'assistant' ? 'assistantChats' : 'chats');
+
+// Keep concurrent updates to untouched fields. Lists are a single setting so
+// competing grants and revocations never get merged into a wider permission.
+export function rebaseConfigDraft(previous, draft, current) {
+  const conflicts = [];
+  const object = value => value && typeof value === 'object' && !Array.isArray(value);
+  const merge = (before, pending, saved, path) => {
+    if (same(before, pending)) return structuredClone(saved);
+    if (same(before, saved) || same(pending, saved)) return structuredClone(pending);
+    if ((before === undefined || object(before)) && object(pending) && object(saved)) {
+      const keys = new Set([...Object.keys(saved), ...Object.keys(pending), ...Object.keys(before ?? {})]);
+      return Object.fromEntries(
+        [...keys]
+          .map(key => [
+            key,
+            merge(
+              own(before, key) ? before[key] : undefined,
+              own(pending, key) ? pending[key] : undefined,
+              own(saved, key) ? saved[key] : undefined,
+              [...path, key],
+            ),
+          ])
+          .filter(([, value]) => value !== undefined),
+      );
+    }
+    conflicts.push(path.join('.'));
+    return structuredClone(saved);
+  };
+  return { config: merge(previous, draft, current, []), conflicts };
+}
+
+export function chatSettingsSnapshot(config, key, mode = activeChatWorkMode(config, key)) {
+  const active = activeChatWorkMode(config, key);
   if (mode !== active) {
-    const stored = config.wechat.modeSettings?.[key]?.[mode];
+    const stored = structuredClone(config.wechat.modeSettings?.[key]?.[mode]);
+    if (stored) delete stored.settings.fileTransfer;
     return stored
       ? {
-          ...structuredClone(stored),
+          ...stored,
           settings: {
-            ...structuredClone(stored.settings),
+            ...stored.settings,
             adminOnly: adminOnly(config, key),
-            fileTransfer: fileTransfer(config, key),
+            ...(mode === 'assistant' ? { proactive: config.wechat.proactive?.assistantChats?.[key] === true } : {}),
           },
         }
       : {
           settings: {
-            fileTransfer: fileTransfer(config, key),
             adminOnly: adminOnly(config, key),
             workMode: mode,
             persona: null,
             mode: null,
             stickers: null,
             search: null,
-            proactive: false,
+            proactive: config.wechat.proactive?.[proactiveChatField(mode)]?.[key] === true,
             context: null,
           },
           access: { skills: [], tools: [] },
@@ -36,13 +68,12 @@ export function chatSettingsSnapshot(config, key, mode = config.wechat.workModes
   return {
     settings: {
       persona: config.persona.chats?.[key] ?? null,
-      workMode: w.workModes?.[key] ?? 'social',
+      workMode: active,
       adminOnly: adminOnly(config, key),
-      fileTransfer: fileTransfer(config, key),
       mode: w.chatModes?.[key] ?? null,
       stickers: w.stickers?.chats?.[key] ?? null,
       search: w.search?.chats?.[key] ?? null,
-      proactive: w.proactive?.chats?.[key] === true,
+      proactive: w.proactive?.[proactiveChatField(active)]?.[key] === true,
       context: w.context?.chats?.[key] ?? null,
     },
     access: {
@@ -79,7 +110,6 @@ export function applyChatSettings(config, key, settings, access) {
     !['persona', 'mode', 'stickers', 'search', 'proactive', 'context'].every(name => own(settings, name))
   )
     fail('会话设置不完整，请重新打开。');
-  if (own(settings, 'fileTransfer') && typeof settings.fileTransfer !== 'boolean') fail('微信文件收发必须使用开关值。');
   if (
     own(settings, 'adminOnly') &&
     (typeof settings.adminOnly !== 'boolean' || (!key.startsWith('wechat:group:') && !settings.adminOnly))
@@ -132,14 +162,6 @@ export function applyChatSettings(config, key, settings, access) {
     config.wechat.assistant.adminOnlyGroups ??= {};
     config.wechat.assistant.adminOnlyGroups[key] = settings.adminOnly;
   }
-  if (
-    own(settings, 'fileTransfer') &&
-    (settings.fileTransfer || own(config.wechat.assistant?.fileTransferChats, key))
-  ) {
-    config.wechat.assistant ??= {};
-    config.wechat.assistant.fileTransferChats ??= {};
-    config.wechat.assistant.fileTransferChats[key] = settings.fileTransfer;
-  }
   const previous = chatSettingsSnapshot(config, key);
   const saveModes =
     (own(settings, 'workMode') && settings.workMode !== previous.settings.workMode) ||
@@ -161,16 +183,21 @@ export function applyChatSettings(config, key, settings, access) {
   }
   config.wechat.chatModes ??= {};
   put(config.wechat.chatModes, settings.mode);
-  for (const name of ['stickers', 'search', 'proactive', 'context']) {
+  for (const name of ['stickers', 'search', 'context']) {
     config.wechat[name] ??= {};
     config.wechat[name].chats ??= {};
     put(config.wechat[name].chats, settings[name]);
   }
+  const field = proactiveChatField(activeChatWorkMode(config, key));
+  if (field === 'chats' || settings.proactive || own(config.wechat.proactive?.[field], key)) {
+    config.wechat.proactive ??= {};
+    config.wechat.proactive[field] ??= {};
+    put(config.wechat.proactive[field], settings.proactive);
+  }
   config.wechat.dshAccess ??= { chats: {} };
   config.wechat.dshAccess.chats ??= {};
   config.wechat.dshAccess.chats[key] = structuredClone(access);
-  if (saveModes)
-    config.wechat.modeSettings[key][config.wechat.workModes?.[key] ?? 'social'] = chatSettingsSnapshot(config, key);
+  if (saveModes) config.wechat.modeSettings[key][activeChatWorkMode(config, key)] = chatSettingsSnapshot(config, key);
   return config;
 }
 
@@ -200,21 +227,20 @@ export function mergeConversationSave(previous, draft, saved, key) {
         result.wechat[name] ??= {};
         accept(result.wechat[name], saved.wechat[name]);
       }
-    } else {
+    } else if (result.wechat[name]?.chats || saved.wechat[name]?.chats) {
       result.wechat[name] ??= {};
       result.wechat[name].chats ??= {};
       accept(result.wechat[name].chats, saved.wechat[name]?.chats);
     }
   }
+  if (saved.wechat.proactive?.assistantChats || result.wechat.proactive?.assistantChats) {
+    result.wechat.proactive.assistantChats ??= {};
+    accept(result.wechat.proactive.assistantChats, saved.wechat.proactive?.assistantChats);
+  }
   if (saved.wechat.assistant?.adminOnlyGroups || result.wechat.assistant?.adminOnlyGroups) {
     result.wechat.assistant ??= {};
     result.wechat.assistant.adminOnlyGroups ??= {};
     accept(result.wechat.assistant.adminOnlyGroups, saved.wechat.assistant?.adminOnlyGroups);
-  }
-  if (saved.wechat.assistant?.fileTransferChats || result.wechat.assistant?.fileTransferChats) {
-    result.wechat.assistant ??= {};
-    result.wechat.assistant.fileTransferChats ??= {};
-    accept(result.wechat.assistant.fileTransferChats, saved.wechat.assistant?.fileTransferChats);
   }
   result.wechat.dshAccess ??= { chats: {} };
   result.wechat.dshAccess.chats ??= {};

@@ -28,9 +28,46 @@ def progress(message):
     emit({'type': 'progress', 'message': message})
 
 
-def discover_accounts(selected=''):
+def running_account_directories(executable):
+    if os.name != 'nt' or not executable:
+        return set()
+    try:
+        import psutil
+    except ImportError:
+        return set()
+
+    expected = os.path.normcase(os.path.abspath(executable))
+    try:
+        owner = psutil.Process().username()
+    except (psutil.Error, OSError):
+        return set()
+    directories = set()
+    for process in psutil.process_iter(['exe', 'username']):
+        try:
+            info = process.info
+            if not info['exe'] or os.path.normcase(info['exe']) != expected or info['username'] != owner:
+                continue
+            for entry in process.open_files():
+                file = pathlib.Path(entry.path)
+                if file.suffix.lower() == '.db':
+                    directories.update(p.parent for p in file.parents if p.name.lower() == 'db_storage')
+        except (psutil.Error, OSError):
+            continue
+    return directories
+
+
+def discover_accounts(selected='', *, running_directories=(), saved_directory=''):
     roots = [pathlib.Path(selected)] if selected else []
+    running = set()
+    for directory in running_directories:
+        try:
+            running.add(os.path.normcase(str(directory.resolve())))
+        except (OSError, RuntimeError):
+            continue
     if not selected:
+        roots.extend(pathlib.Path(p) for p in running)
+        if saved_directory:
+            roots.append(pathlib.Path(saved_directory))
         home = pathlib.Path.home()
         documents = [home / 'Documents', home]
         for name in ('OneDrive', 'OneDriveConsumer', 'OneDriveCommercial'):
@@ -66,6 +103,7 @@ def discover_accounts(selected=''):
                 accounts[os.path.normcase(full)] = {
                     'dbPath': full,
                     'myWxid': candidate.name,
+                    'active': os.path.normcase(full) in running,
                     'ready': (candidate / 'db_storage' / 'message' / 'message_0.db').is_file()
                     and (candidate / 'db_storage' / 'contact' / 'contact.db').is_file(),
                 }
@@ -469,7 +507,12 @@ def main():
     try:
         request = json.loads(sys.stdin.read(128001))
         if request.get('operation') == 'discover':
-            emit({'type': 'result', 'ok': True, 'accounts': discover_accounts(request.get('dbPath', ''))})
+            accounts = discover_accounts(
+                request.get('dbPath', ''),
+                running_directories=running_account_directories(request.get('wechatExecutable', '')),
+                saved_directory=request.get('savedAccountPath', ''),
+            )
+            emit({'type': 'result', 'ok': True, 'accounts': accounts})
         else:
             emit(connect(request))
     except SetupError as error:

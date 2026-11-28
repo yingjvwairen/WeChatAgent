@@ -234,7 +234,7 @@ export function createAssistantControl({
         skills = catalog.skills.filter(item => native || access.skills.includes(item.name));
       return {
         ok: true,
-        text: `能力配置：${native ? '使用 DSH 可用能力' : '逐项授权'}\n工具：${tools.map(item => item.name).join('、') || '尚未授权'}\n技能：${skills.map(item => item.name).join('、') || '尚未授权'}\n微信文件：${w.assistant?.fileTransferChats?.[key] ? '开启' : '关闭'}\n联网搜索：${(w.search?.chats?.[key] ?? w.search?.enabled) ? '开启' : '关闭'}\n审批：${access.remoteApproval ? '原生审批可由管理员微信逐次确认，无法完整展示的操作仍在 DSH 确认' : '在 DSH 本机确认'}\n单任务上限：${access.timeoutMinutes ?? 30} 分钟 / ${access.toolLimit ?? 200} 次工具调用。`.slice(
+        text: `能力配置：${native ? '使用 DSH 可用能力' : '逐项授权'}\n工具：${tools.map(item => item.name).join('、') || '尚未授权'}\n技能：${skills.map(item => item.name).join('、') || '尚未授权'}\n联网搜索：${(w.search?.chats?.[key] ?? w.search?.enabled) ? '开启' : '关闭'}\n审批：${access.remoteApproval ? '原生审批可由管理员微信逐次确认，无法完整展示的操作仍在 DSH 确认' : '在 DSH 本机确认'}\n单任务上限：${access.timeoutMinutes ?? 30} 分钟 / ${access.toolLimit ?? 200} 次工具调用。`.slice(
           0,
           6000,
         ),

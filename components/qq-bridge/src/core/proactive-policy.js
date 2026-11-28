@@ -1,4 +1,5 @@
 import { validChatKey } from '../../../../packages/wechat-identity.mjs';
+import { scheduledAssistantChatAllowed } from '../../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import crypto from 'node:crypto';
 export const PROACTIVE_DEFAULTS = Object.freeze({
   enabled: false,
@@ -30,22 +31,31 @@ export function validateProactiveSettings(value) {
       throw Error('Invalid proactive ' + key);
   if ((value.startTime ?? PROACTIVE_DEFAULTS.startTime) === (value.endTime ?? PROACTIVE_DEFAULTS.endTime))
     throw Error('Invalid proactive window');
-  if (
-    value.chats !== undefined &&
-    (!value.chats ||
-      typeof value.chats !== 'object' ||
-      Array.isArray(value.chats) ||
-      Object.entries(value.chats).some(([key, flag]) => !validChatKey(key) || typeof flag !== 'boolean'))
-  )
-    throw Error('Invalid proactive chats');
+  for (const field of ['chats', 'assistantChats']) {
+    const chats = value[field];
+    if (
+      chats !== undefined &&
+      (!chats ||
+        typeof chats !== 'object' ||
+        Array.isArray(chats) ||
+        Object.entries(chats).some(([key, flag]) => !validChatKey(key) || typeof flag !== 'boolean'))
+    )
+      throw Error('Invalid proactive ' + field);
+  }
 }
-export function proactivePolicy(wechat, key) {
+export function proactivePolicy(wechat, key, assistant = wechat?.workModes?.[key] === 'assistant') {
   const settings = wechat?.proactive;
   validateProactiveSettings(settings);
   const values = Object.fromEntries(
     Object.entries(PROACTIVE_DEFAULTS).map(([name, value]) => [name, settings?.[name] ?? value]),
   );
-  return { ...values, enabled: values.enabled === true && settings?.chats?.[key] === true };
+  return {
+    ...values,
+    useSearch: !assistant && values.useSearch,
+    enabled: assistant
+      ? scheduledAssistantChatAllowed(wechat, key)
+      : values.enabled === true && settings?.chats?.[key] === true && wechat?.workModes?.[key] !== 'assistant',
+  };
 }
 export const proactivePolicyKey = policy => JSON.stringify(policy);
 const minute = time => Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
@@ -66,10 +76,12 @@ export function nextProactiveAt(now, policy, random = () => 0) {
   if (at <= proposed) at += 86400000;
   return at;
 }
-export function conversationSnapshot(rows) {
+export function conversationSnapshot(rows, taskRows) {
+  const identities = entries =>
+    entries.slice(-5).map(row => [row.id, row.message_id, row.timestamp, row.delivery_id ?? '']);
   return crypto
     .createHash('sha256')
-    .update(JSON.stringify(rows.slice(-5).map(row => [row.id, row.message_id, row.timestamp, row.delivery_id ?? ''])))
+    .update(JSON.stringify(taskRows ? [identities(rows), identities(taskRows)] : identities(rows)))
     .digest('hex');
 }
 export function declinedProactive(rows) {

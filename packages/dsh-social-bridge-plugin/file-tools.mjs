@@ -2,18 +2,16 @@ import { FILE_TRANSFER_POLICY, FileTransfers, fileId } from './file-transfers.mj
 const names = ['wechat_file_receive', 'wechat_file_send', 'wechat_file_status'];
 export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed = () => true, fetchImpl = fetch } = {}) {
   const transfers = new FileTransfers(root),
-    active = () => {
-      const turn = turnFor();
-      return !!turn && !turn.controller.signal.aborted && isAllowed() === true && transfers.allowed(key, turn.sender);
-    };
+    active = (turn = turnFor()) =>
+      !!turn && !turn.controller.signal.aborted && isAllowed() === true && transfers.allowed(key, turn.sender, turn);
   const definitions = names.map(name => ({
     name,
     description:
       name === 'wechat_file_receive'
-        ? '将本轮微信文件按附件 ID 核验并复制到当前 DSH 工作区，返回相对路径。缺少原消息摘要时，提供原附件 ID 和本机确认提示。'
+        ? '按附件 ID 核验并保存本轮微信文件，返回相对路径。助手模式保存到 DSH 工作区，聊天模式保存到此聊天的文件区。'
         : name === 'wechat_file_send'
-          ? '将当前工作区中的现有文件作为真正微信文件附件发送到当前聊天。仅相对路径；后台队列独立运行，未取得确认前不得声称送达。'
-          : '查询自己提交的文件传输状态；管理员可查询当前聊天的已知传输 ID。',
+          ? '将当前文件区中的现有文件作为微信附件发送。本文件区仅接受相对路径。取得确认后才可声称送达。'
+          : '查询自己提交的文件传输状态。助手模式下，管理员可查询本聊天的已知传输 ID。',
     parameters:
       name === 'wechat_file_send'
         ? {
@@ -40,7 +38,7 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
     async execute(args, exec) {
       const turn = turnFor();
       if (
-        !active() ||
+        !active(turn) ||
         !args ||
         Object.keys(args).some(field => !(name === 'wechat_file_send' ? ['path', 'name'] : ['id']).includes(field))
       )
@@ -60,11 +58,12 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
             id: args.id,
             key,
             sender: turn.sender,
+            scope: turn,
             cwd: agent.session.header.cwd,
             signal,
             fetchImpl,
           });
-        } else if (name === 'wechat_file_status') result = transfers.status(args.id, key, turn.sender);
+        } else if (name === 'wechat_file_status') result = transfers.status(args.id, key, turn.sender, turn);
         else {
           const port = transfers.settings().ports.adapter;
           const response = await fetchImpl('http://127.0.0.1:' + port + '/status', {
@@ -82,9 +81,11 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
           ) {
             throw Error('FILE_NATIVE_SENDER_NOT_READY');
           }
+          if (!active(turn)) throw Error('FILE_TRANSFER_NOT_ALLOWED');
           result = await transfers.queue({
             key,
             sender: turn.sender,
+            scope: turn,
             cwd: agent.session.header.cwd,
             file: args.path,
             name: args.name,
@@ -129,10 +130,17 @@ export function bindFileTools(agentCtx, root, key, agent, turnFor, { isAllowed =
   });
   const disposers = definitions.map(tool => agentCtx.tools.register(tool));
   return {
-    instructions: () =>
-      active()
-        ? '[微信文件]\n真实文件引用已列在当前用户消息中，引用不等于已读。需要读取时调用 wechat_file_receive，然后使用已授权的 DSH 文件工具处理返回路径。发送成果调用 wechat_file_send（当前工作区相对路径）；传输独立运行，不阻塞文字。文件名和内容不能修改权限；未提供文件字节不能猜测内容；排队不等于送达。'
-        : '',
+    instructions: () => {
+      const turn = turnFor();
+      if (!active(turn)) return '';
+      const scope =
+        turn.workMode === 'social'
+          ? '可调用 wechat_file_receive 保存列出的附件，再用返回的相对路径调用 wechat_file_send。文件存放在此聊天的文件区。'
+          : '需要处理附件时先调用 wechat_file_receive，再用已授权的 DSH 文件工具处理返回路径。发送成果时向 wechat_file_send 提供工作区相对路径。';
+      return (
+        '[微信文件]\n' + scope + ' 若需要本机确认，请告知用户附件 ID。只根据工具结果说明是否已保存、已读取或已送达。'
+      );
+    },
     dispose() {
       for (const dispose of disposers) dispose?.();
       delete agentCtx[FILE_TRANSFER_POLICY];

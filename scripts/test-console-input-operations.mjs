@@ -176,9 +176,11 @@ test('draft and recording recovery expose separate acknowledgements and escape b
     esc,
   );
   assert.match(html, /&lt;fixture&gt;/);
+  assert.match(html, /<summary>错误详情<\/summary><code>&lt;fixture&gt;<\/code>/);
   assert.match(html, /data-operation-ack="draft"/);
   assert.match(html, /data-operation-ack="recording"/);
-  assert.equal([...html.matchAll(/data-operation-recover=/g)].length, 2);
+  assert.equal([...html.matchAll(/data-operation-recover="[^"]+" disabled/g)].length, 2);
+  assert.equal([...html.matchAll(/data-operation-ack="outcome"/g)].length, 2);
   assert.match(html, /停止后台发送服务/);
 });
 

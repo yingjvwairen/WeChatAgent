@@ -27,7 +27,7 @@ function fixture(t) {
     wechat: {
       whitelist: { groups: ['123@chatroom'], private: [] },
       workModes: { [key]: 'assistant' },
-      assistant: { administrators: ['owner'], fileTransferChats: { [key]: true } },
+      assistant: { administrators: ['owner'] },
       stickers: { enabled: false },
     },
   };
@@ -75,10 +75,10 @@ test('file-derived GIFs use the existing file grant, not the ordinary sticker sw
     size: source.size,
   };
   assert.equal(desktopMediaAllowed(f.root, f.config, job), true);
-  f.config.wechat.assistant.fileTransferChats[key] = false;
+  f.config.wechat.workModes[key] = 'social';
   f.save();
   assert.equal(desktopMediaAllowed(f.root, f.config, job), false);
-  f.config.wechat.assistant.fileTransferChats[key] = true;
+  f.config.wechat.workModes[key] = 'assistant';
   f.config.wechat.assistant.administrators = [];
   f.save();
   assert.equal(desktopMediaAllowed(f.root, f.config, job), false);

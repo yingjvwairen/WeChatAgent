@@ -103,7 +103,7 @@ function cloudSpeechRoute({ id, feature, settings }) {
   if (feature === 'voice-input-v1' && services.recognition === 'off') return false;
   const slot = feature !== 'voice-input-v1' ? 'tts' : services.recognition === 'realtime' ? 'realtimeAsr' : 'fileAsr';
   const active = activeOf(services, slot);
-  if (!active.definition || active.definition.kind === 'gpt-sovits') return false;
+  if (!active.definition || active.definition.managed || active.definition.kind === 'gpt-sovits') return false;
   return active.entry !== 'custom' || cloudAddress(active.profile.endpoint);
 }
 

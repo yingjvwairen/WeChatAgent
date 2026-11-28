@@ -149,7 +149,13 @@ class ReaderMessageParityTest(unittest.TestCase):
             (root / 'config').mkdir()
             (root / 'config/wechatagent.json').write_text(
                 json.dumps(
-                    {'wechat': {'whitelist': {'private': ['peer']}, 'rosterGrants': {'wechat:private:peer': 'grant'}}}
+                    {
+                        'wechat': {
+                            'whitelist': {'private': ['peer']},
+                            'rosterGrants': {'wechat:private:peer': 'grant'},
+                            'workModes': {'wechat:private:peer': 'assistant'},
+                        }
+                    }
                 )
             )
             reader = api.Reader.__new__(api.Reader)

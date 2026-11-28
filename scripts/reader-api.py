@@ -1544,47 +1544,15 @@ class Reader(ContactDirectory):
             scans.setdefault(key, dict(key=key, scannedThrough=None, catchUpThrough=None, pending=0))['error'] = error
         return list(scans.values())
 
-    def replay_role(self, talker, payload, wechat):
-        group = group_username(talker)
-        key = chat_key(talker)
-        if wechat.get('workModes', {}).get(key) != 'assistant':
-            return 'social'
-        settings = wechat.get('assistant') or {}
-        sender = payload.get('talkerId')
-        if settings.get('replayOffline') is not True or not sender or payload.get('contextOnly'):
-            return None
-        authorization = settings.get('replayAuthorization')
-        if not isinstance(authorization, dict):
-            return None
-        since, stamp = authorization.get('since'), payload.get('timestamp')
-        administrators = settings.get('administrators', [])
-        chats = authorization.get('chats')
-        grant = self.talker_grant(talker, wechat)
-        if (
-            type(since) is not int
-            or type(stamp) is not int
-            or not 0 < since <= stamp < 2**53
-            or not isinstance(chats, dict)
-            or not grant
-            or chats.get(key) != grant
-            or not isinstance(authorization.get('administrators'), list)
-            or set(authorization['administrators']) != set(administrators)
-        ):
-            return None
-        if sender in administrators and (group or sender == talker):
-            return 'assistant-admin'
-        return 'assistant-member' if group else None
-
     def offline_wake(self, talker, payload, wechat):
-        if payload.get('contextOnly'):
-            return False
-        group = group_username(talker)
         key = chat_key(talker)
-        role = self.replay_role(talker, payload, wechat)
-        if not role or role != payload.get('readerRole', 'social'):
+        if (
+            payload.get('contextOnly')
+            or wechat.get('workModes', {}).get(key) == 'assistant'
+            or payload.get('readerRole', 'social') != 'social'
+        ):
             return False
-        default_wake = 'mention' if role.startswith('assistant-') else wechat.get('wake_mode')
-        if not group or wechat.get('chatModes', {}).get(key, default_wake) != 'mention':
+        if not group_username(talker) or wechat.get('chatModes', {}).get(key, wechat.get('wake_mode')) != 'mention':
             return True
         reference = (payload.get('quoteReply') or {}).get('reference') or {}
         return (
@@ -1784,7 +1752,18 @@ if __name__ == '__main__':
         if sys.argv[1:] == ['--contacts']:
             request = json.loads(sys.stdin.buffer.read(2 * 1024 * 1024))
             directory = ContactDirectory()
-            if 'ids' in request:
+            if 'namesFor' in request:
+                ids = request['namesFor']
+                if not isinstance(ids, list) or len(ids) > 1000 or any(not isinstance(peer, str) for peer in ids):
+                    raise ValueError('Invalid contact name selection')
+                result = {
+                    'contacts': [
+                        {'username': peer, 'displayName': directory.display_name(peer)}
+                        for peer in ids
+                        if directory.selectable_contact(peer)
+                    ]
+                }
+            elif 'ids' in request:
                 ids = request['ids']
                 if not isinstance(ids, list) or len(ids) > 1000:
                     raise ValueError('Invalid contact selection')

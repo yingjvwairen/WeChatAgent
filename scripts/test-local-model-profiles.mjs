@@ -5,7 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { createLocalModelControls, discoverModels, validateProfiles } from './local-model-profiles.mjs';
 import { LocalSpeechProcesses } from './local-speech-processes.mjs';
-import { profileEditorHtml, localModelSettings } from '../public/console/local-model-settings.mjs';
+import { profileEditorHtml, voiceSettings } from '../public/console/local-model-settings.mjs';
+import { consoleRoute, requiresRestart, withoutLiveSettings } from '../public/console/layout-model.mjs';
 import { createLocalModelDrafts, modelDefaults } from '../public/console/local-model-schema.mjs';
 import { createConsole } from './console-server.mjs';
 
@@ -374,7 +375,25 @@ test('editor escapes model names and provides distinct save/use, weights and ASR
   assert.ok(html.includes('data-model-action="use"'));
   assert.ok(html.includes('data-model-field="sovitsWeights"'));
   assert.ok(profileEditorHtml('asr', state, 'one', {}).includes('data-model-field="initialPrompt"'));
-  const settings = localModelSettings({ field: () => '', toggle: () => '' });
-  assert.ok(settings.includes('应用启动后自动预热'));
+  const settings = voiceSettings({
+    catalog: {
+      plugins: [
+        { id: 'speech-synthesis', builtin: true },
+        { id: 'speech-recognition', builtin: true, enabled: true },
+      ],
+    },
+    field: () => '',
+    toggle: label => label,
+    header: title => `<h2>${title}</h2>`,
+  });
+  assert.deepEqual(consoleRoute('#extensions/voice'), { page: 'extensions', section: 'voice' });
+  assert.match(settings, /data-plugin-settings="speech-synthesis">配置语音与聊天授权/);
+  assert.match(settings, /<details class="card technical-details" open>/);
+  assert.match(settings, /随应用启动/);
   assert.ok(settings.includes('model-editor="asr"'));
+  assert.ok(settings.includes('model-editor="tts"'));
+  assert.equal(requiresRestart('runtime.localSpeech.tts.enabled'), false);
+  assert.deepEqual(withoutLiveSettings({ runtime: { sender: 'wechat-ui', localSpeech: { asr: { enabled: true } } } }), {
+    runtime: { sender: 'wechat-ui' },
+  });
 });

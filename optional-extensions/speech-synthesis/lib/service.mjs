@@ -52,6 +52,8 @@ export const failureMessages = {
   VOICE_CLONE_HTTP: '语音服务拒绝了请求，请核对模型权限、录音要求或音色 ID。',
   VOICE_CLONE_UNCERTAIN: '提交结果未确认。请先在语音服务控制台查询是否已创建音色，再尝试重新提交。',
   VOICE_PROVIDER_CREDENTIAL: '请先填写所选服务的凭据。',
+  VOICE_MANAGED_SPEECH_DISABLED: '请先在“能力 → 语音服务”启用对应的本机服务并保存设置。',
+  VOICE_MANAGED_SPEECH_NOT_READY: '本机服务尚未就绪。请查看“能力 → 语音服务”的服务状态，待模型加载后再试。',
   VOICE_PROVIDER_HOST: '服务地址不属于所选提供商，已停止发送凭据。请恢复该提供商的官方地址，或改用“自定义模型 API”。',
   VOICE_KEY_ORIGIN: '自定义接口的地址已变化。为避免把已保存的密钥发往新地址，请重新填写密钥后再测试或保存。',
   VOICE_PROVIDER_UNSUPPORTED: '所选服务没有接通这项能力。',

@@ -26,7 +26,6 @@ const config = () => ({
     stickers: { enabled: true, chats: {} },
     proactive: { enabled: false, chats: { [group]: true } },
     context: { enabled: true, maxTokens: 100000, chats: { [group]: 0 } },
-    assistant: { fileTransferChats: { [key]: true } },
     dshAccess: {
       chats: {
         [key]: { mode: 'native', preset: 'standard', skills: ['saved'], tools: ['read'], remoteApproval: true },
@@ -229,6 +228,18 @@ test('merged chat rendering is read-only, escaped and retains one settings entry
   assert.equal(JSON.stringify(f.state.draft), before);
   assert(f.requests.every(item => item.body === undefined));
 });
+
+test('the work mode selector shows saved counts and explains an empty assistant filter', async () => {
+  const f = fixture();
+  f.state.chatModeFilter = 'assistant';
+  delete f.state.draft.wechat.workModes[f.state.selectedChat];
+  const html = await f.ui.chatsPage();
+  assert.match(html, /聊天模式 · 2<\/option>/);
+  assert.match(html, /助手模式 · 0<\/option>/);
+  assert.match(html, /显示 0 \/ 2 个聊天/);
+  assert.match(html, /当前范围没有已保存为助手模式的聊天/);
+  assert.doesNotMatch(html, /data-chat-settings=/);
+});
 test('queue previews show text, voice, media and quotes with escaped expandable content', async () => {
   const previews = [
     '待发送的文字 <script>alert(1)</script>',
@@ -378,6 +389,8 @@ test('a reviewed native file replaces its stale recovery link in console history
   const f = fixture({ tab: 'deliveries', deliveries });
   const html = await f.ui.chatsPage();
   assert.match(html, /最近发送记录/);
+  assert.match(html, /class="chat-delivery-section"><h3>最近发送记录<\/h3>/);
+  assert.match(html, /class="chat-delivery-heading"[^]*?<small>/);
   assert.match(html, /送达待核实/);
   assert.doesNotMatch(html, /检查草稿或录音并解除占用/);
   assert.deepEqual(deliveryPages(deliveries.jobs).pending, []);
@@ -476,9 +489,8 @@ test('task controls bind the actual task ID and file scope without running or ca
   );
   f.state.selectedChat = group;
   const social = await f.ui.chatsPage();
-  assert.match(social, /聊天模式不执行助手任务/);
+  assert.match(social, /data-file-confirm="wechat:group:456@chatroom"/);
   assert(!social.includes('data-assistant-cancel='));
-  assert(!social.includes('data-file-confirm='));
 });
 test('settings and network sections render only their own controls while drafts and native grants survive', async () => {
   const f = fixture(),
@@ -560,11 +572,14 @@ test('reader diagnostics show the current per-chat frontier and escaped display 
   const view = createWorkspaceLayout({
     state,
     escapeHtml: value => String(value).replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+    header: (title, _description, right) => `<div class="card-header"><h2>${title}</h2>${right}</div>`,
   });
-  assert.match(view.readerProgress(), /共 2 条/);
+  assert.match(view.readerProgress(), /<h2>读取进度<\/h2><span class="status-tag muted"[^>]*>2 条待确认<\/span>/);
   assert.match(view.readerProgress(), /&lt;Peer&gt;/);
   assert.match(view.readerProgress(), /待补读至/);
   state.status.intakeProgress[0].scannedThrough = 151;
+  state.status.intakeProgress[0].pending = 0;
+  assert.match(view.readerProgress(), /class="status-tag muted"[^>]*>无待确认消息<\/span>/);
   assert.doesNotMatch(view.readerProgress(), /待补读至/);
   state.status.intakeProgress.push({
     key: 'wechat:private:other',
@@ -573,6 +588,9 @@ test('reader diagnostics show the current per-chat frontier and escaped display 
     error: '<invalid>',
   });
   assert.match(view.readerProgress(), /已扫描至[\s\S]+尚未完成首次扫描[\s\S]+&lt;invalid&gt;/);
+  state.status.intakeProgress = [];
+  assert.match(view.readerProgress(), /尚未为当前名单建立读取记录/);
+  assert.doesNotMatch(view.readerProgress(), /status-tag/);
 });
 
 test('queue history pages keep older pending and unresolved work on every page', () => {

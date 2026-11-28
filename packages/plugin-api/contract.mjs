@@ -153,6 +153,13 @@ export function hostCompatibility(item, live) {
   };
 }
 
+export function localSpeechPort(kind, config = {}) {
+  if (!['asr', 'tts'].includes(kind)) throw Error('LOCAL_SPEECH_SERVICE_INVALID');
+  const port = config.port ?? (kind === 'asr' ? 8000 : 9881);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw Error('LOCAL_SPEECH_PORT_INVALID');
+  return port;
+}
+
 // Kept in one place so prepare/build checks cannot omit a new runtime module.
 export const PLUGIN_HOST_FILES = Object.freeze([
   'packages/wechat-identity.mjs',
@@ -168,6 +175,7 @@ export const PLUGIN_HOST_FILES = Object.freeze([
   'packages/plugin-api/model-utility.mjs',
   'packages/plugin-api/audio.mjs',
   'packages/plugin-api/voice-status.mjs',
+  'packages/plugin-api/managed-speech.mjs',
 ]);
 export const VOICE_CODEC_FILES = Object.freeze([
   'scripts/decode-wechat-voice.py',

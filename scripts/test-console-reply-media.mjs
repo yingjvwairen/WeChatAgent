@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { createConsole } from './console-server.mjs';
 import { ReplyMediaCatalog } from './reply-media-catalog.mjs';
-import { replyMediaEdits } from '../public/console/reply-media.js';
+import { createReplyMediaUI, replyMediaEdits } from '../public/console/reply-media.js';
 
 test('console sends only changed catalog metadata, even when the full library exceeds the request budget', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'console-reply-media-'));
@@ -23,10 +23,15 @@ test('console sends only changed catalog metadata, even when the full library ex
     kind: 'image',
     tags: [],
   }));
-  const prior = catalog.importIntoEmpty({ items, enabled: true });
+  const prior = catalog.importIntoEmpty({ items });
   assert.ok(Buffer.byteLength(JSON.stringify(prior.items)) > 128 * 1024);
-  const changes = replyMediaEdits(prior, { ...prior, enabled: false });
-  assert.deepEqual(changes.changes, []);
+  const draft = structuredClone(prior);
+  draft.items[0].name = 'renamed';
+  const changes = replyMediaEdits(prior, draft);
+  assert.deepEqual(changes, {
+    expectedRevision: prior.revision,
+    changes: [{ id: items[0].id, name: 'renamed', tags: [] }],
+  });
   const app = createConsole({ root, port: 0 });
   t.after(() => app.close());
   const url = 'http://127.0.0.1:' + (await app.start()).port;
@@ -37,6 +42,17 @@ test('console sends only changed catalog metadata, even when the full library ex
     body: JSON.stringify(changes),
   });
   assert.equal(response.status, 200);
-  assert.equal((await response.json()).enabled, false);
+  assert.equal((await response.json()).items[0].name, 'renamed');
   assert.equal(catalog.snapshot().items.length, 600);
+});
+
+test('local media management shows an import form and an item count without a library activation step', async () => {
+  const media = createReplyMediaUI({
+    api: async () => ({ items: [], revision: 'fixture' }),
+    escapeHtml: value => value,
+  });
+  const markup = await media.page();
+  assert.match(markup, /本地图片与 GIF.*0 项/);
+  assert.match(markup, /导入素材/);
+  assert.doesNotMatch(markup, /local-media-enabled|允许机器人使用本地素材库/);
 });

@@ -348,7 +348,7 @@ test('a late stop command cannot cancel a newer reply', async t => {
   assert.match(notices[0], /已停止本次回复/);
 });
 
-test('recovered assistant cancellation needs an explicit task to target', async t => {
+test('recovered assistant messages are archived and live control commands remain available', async t => {
   const { buffer } = fixture(t);
   const calls = [];
   const engine = new SocialEngine({
@@ -374,11 +374,16 @@ test('recovered assistant cancellation needs an explicit task to target', async 
   assert.equal(buffer.findIncoming(replay).reply_skip_reason, 'reader_offline_context');
   const taskId = 'T' + 'a'.repeat(16);
   engine.receive({ ...replay, message_id: 'named-cancel', text: '取消任务 ' + taskId });
+  assert.equal(
+    buffer.findIncoming({ ...replay, message_id: 'named-cancel' }).reply_skip_reason,
+    'reader_offline_context',
+  );
+  const queued = { ...replay, message_id: 'legacy-assistant-queued', work_mode: 'assistant' };
+  buffer.append(queued);
+  assert.deepEqual(engine.unreadFor(key), []);
+  assert.equal(buffer.findIncoming(queued).reply_skip_reason, 'reader_offline_context');
   engine.receive({ ...message('live-cancel'), text: '取消任务' });
-  assert.deepEqual(calls, [
-    ['cancel', taskId],
-    ['cancel', undefined],
-  ]);
+  assert.deepEqual(calls, [['cancel', undefined]]);
 });
 
 for (const point of ['reply checkpoint', 'command row', 'no outstanding reply']) {
@@ -771,6 +776,80 @@ test('proactive greetings normalize protocol without changing the existing messa
   assert.equal(calls, 1);
   assert.equal(sent.join('\n\n'), '早\n\n今天好好聊');
   assert(sent.every(text => !hasReplyProtocolControl(text)));
+});
+
+test('assistant proactive chat opts in separately, waits for task activity and uses the tool-free lane', async t => {
+  const f = fixture(t);
+  const chatBuffer = new MessageBuffer(path.join(f.dir, 'assistant-chat.json'));
+  const taskEngine = new SocialEngine({ buffer: f.buffer });
+  const chatEngine = new SocialEngine({ buffer: chatBuffer });
+  t.after(() => {
+    taskEngine.stop();
+    chatEngine.stop();
+  });
+  let now = Date.parse('2026-10-19T02:00:00Z');
+  const settings = {
+    wechat: {
+      whitelist: { private: ['123'], groups: [] },
+      workModes: { [key]: 'assistant' },
+      assistant: { administrators: ['123'] },
+      proactive: {
+        ...PROACTIVE_DEFAULTS,
+        enabled: true,
+        intervalMinutes: 30,
+        jitterMinutes: 0,
+        chats: { [key]: true },
+      },
+    },
+  };
+  const calls = [],
+    sends = [];
+  const proactive = new ProactiveEngine({
+    stateFile: path.join(f.dir, 'assistant-proactive.json'),
+    buffer: chatBuffer,
+    social: chatEngine,
+    taskContext: { buffer: f.buffer, social: taskEngine },
+    settingsFor: () => settings,
+    personaFor: () => ({ persona: 'Fixture', personaName: 'Fixture' }),
+    selfIdFor: () => '99',
+    now: () => now,
+    decide: async (_key, prompt, metadata) => {
+      calls.push({ prompt, metadata });
+      return 'RESPOND: 早上好';
+    },
+    send: async (_target, text) => {
+      sends.push(text);
+      return { delivered: 'database-confirmed' };
+    },
+  });
+  await proactive.tick();
+  assert.equal(proactive.state.chats[key], undefined);
+  settings.wechat.proactive.assistantChats = { [key]: true };
+  await proactive.tick();
+  assert.deepEqual(calls, []);
+  now += 30 * 60000;
+  taskEngine.running.add(key);
+  await proactive.tick();
+  assert.deepEqual(calls, []);
+  taskEngine.running.delete(key);
+  f.buffer.recordReplyPart(
+    key,
+    { deliveryId: 'f'.repeat(64) },
+    {
+      ...message(),
+      text: 'PRIVATE_TASK_CONTEXT',
+      timestamp: now / 1000 - 9000,
+      delivery_status: 'confirmed',
+    },
+  );
+  await proactive.tick();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].metadata.scheduledChat, true);
+  assert.equal(calls[0].metadata.assistantChatOnly, true);
+  assert.equal(calls[0].metadata.searchOptOut, true);
+  assert.doesNotMatch(calls[0].prompt, /PRIVATE_TASK_CONTEXT/);
+  assert.deepEqual(sends, ['早上好']);
+  assert.equal(chatBuffer.recent(key).at(-1)?.text, '早上好');
 });
 
 for (const boundary of ['assistant mode changed during generation', 'a media reply is pending']) {

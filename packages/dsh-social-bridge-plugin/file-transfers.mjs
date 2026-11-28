@@ -15,7 +15,7 @@ import {
   removeEmptyDirectory,
 } from './file-storage.mjs';
 import { conversationGrant, validChatKey } from './conversation-policy.mjs';
-import { validUserId } from '../wechat-identity.mjs';
+import { parseChatKey, validUserId } from '../wechat-identity.mjs';
 import { FILE_LIMIT, fileId, safeFileName } from '../wechat-file-reference.mjs';
 export { FILE_LIMIT, fileId, safeFileName } from '../wechat-file-reference.mjs';
 const terminalFileStates = new Set(['confirmed', 'failed', 'unconfirmed', 'cancelled', 'expired']);
@@ -25,12 +25,27 @@ export const awaitsFileReceipt = job => job.state === 'unconfirmed' && job.nativ
 const activeLimit = 128;
 const byteLimit = 512 * 1024 * 1024;
 export const FILE_TRANSFER_POLICY = Symbol.for('wechatagent.file-transfer.v1');
-export const filesAllowed = (w, key, sender) =>
-  w?.workModes?.[key] === 'assistant' &&
-  w?.assistant?.fileTransferChats?.[key] === true &&
-  assistantSenderAllowed(w, key, sender);
+const fileWorkMode = (wechat, key) => wechat?.workModes?.[key] ?? 'social';
+export function filesAllowed(wechat, key, sender, { workMode, rosterGrant } = {}) {
+  const chat = parseChatKey(key);
+  const grant = conversationGrant(wechat, key);
+  const mode = fileWorkMode(wechat, key);
+  if (
+    !chat ||
+    grant === null ||
+    (rosterGrant !== undefined && rosterGrant !== grant) ||
+    (workMode !== undefined && workMode !== mode) ||
+    !validUserId(sender) ||
+    (chat.kind === 'private' && chat.id !== sender)
+  )
+    return false;
+  return mode === 'social' || (mode === 'assistant' && assistantSenderAllowed(wechat, key, sender));
+}
 const grantAllowsJob = (settings, job) =>
-  filesAllowed(settings, job.key, job.sender) && conversationGrant(settings, job.key) === (job.rosterGrant ?? 'legacy');
+  filesAllowed(settings, job.key, job.sender, {
+    workMode: job.workMode ?? 'assistant',
+    rosterGrant: job.rosterGrant ?? 'legacy',
+  });
 const busyFile = error => ['EBUSY', 'EACCES', 'EPERM'].includes(error.code);
 const damagedCheckpoint = error =>
   error instanceof SyntaxError || ['FILE_JOB_INVALID', 'FILE_LINK_NOT_ALLOWED', 'EISDIR'].includes(error.code);
@@ -42,6 +57,7 @@ const archiveIdentityFields = [
   'key',
   'sender',
   'rosterGrant',
+  'workMode',
   'name',
   'size',
   'md5',
@@ -101,9 +117,9 @@ export class FileTransfers {
     if ([value.id, value.legacyId].some(id => id && !fileId(id))) throw fault('FILE_ACCOUNT_INVALID');
     return value.id || value.legacyId || 'legacy';
   }
-  allowed(key, sender) {
+  allowed(key, sender, scope) {
     try {
-      return filesAllowed(this.settings().wechat, key, sender);
+      return filesAllowed(this.settings().wechat, key, sender, scope);
     } catch {
       return false;
     }
@@ -111,13 +127,29 @@ export class FileTransfers {
   allowedJob(job) {
     return job.accountScope === this.account() && grantAllowsJob(this.settings().wechat, job);
   }
-  assert(key, sender) {
-    if (!this.allowed(key, sender)) throw fault('FILE_TRANSFER_NOT_ALLOWED');
-  }
-  grant(key, sender) {
+  grant(key, sender, scope) {
     const settings = this.settings().wechat;
-    if (!filesAllowed(settings, key, sender)) throw fault('FILE_TRANSFER_NOT_ALLOWED');
-    return { key, sender, accountScope: this.account(), rosterGrant: conversationGrant(settings, key) };
+    if (!filesAllowed(settings, key, sender, scope)) throw fault('FILE_TRANSFER_NOT_ALLOWED');
+    return {
+      key,
+      sender,
+      accountScope: this.account(),
+      rosterGrant: conversationGrant(settings, key),
+      workMode: fileWorkMode(settings, key),
+    };
+  }
+  fileArea(grant, cwd) {
+    if (grant.workMode === 'assistant') return fs.realpathSync(cwd);
+    // Chat sessions can share a DSH working directory. Keep their files scoped to the current roster grant.
+    const directory = path.join(
+      this.directory,
+      'chats',
+      grant.accountScope,
+      digest(grant.key + '\0' + grant.rosterGrant),
+    );
+    noLinks(this.root, directory);
+    fs.mkdirSync(directory, { recursive: true });
+    return fs.realpathSync(directory);
   }
   find(id, archivedJson) {
     if (!fileId(id)) throw fault('FILE_REFERENCE_INVALID');
@@ -150,6 +182,7 @@ export class FileTransfers {
       (!fileId(job.accountScope) && job.accountScope !== 'legacy') ||
       !validChatKey(job.key) ||
       !validUserId(job.sender) ||
+      (job.workMode !== undefined && !['social', 'assistant'].includes(job.workMode)) ||
       !safeFileName(job.name) ||
       !Number.isSafeInteger(job.size) ||
       job.size < 0 ||
@@ -306,14 +339,19 @@ export class FileTransfers {
   conversationDeliveries(key) {
     const account = this.account();
     const settings = this.settings().wechat;
-    const senders = (settings.assistant?.administrators ?? []).filter(sender => filesAllowed(settings, key, sender));
+    const mode = fileWorkMode(settings, key);
+    const grant = conversationGrant(settings, key);
+    const senders =
+      mode === 'social'
+        ? null
+        : (settings.assistant?.administrators ?? []).filter(sender => filesAllowed(settings, key, sender));
     const jobsById = new Map(
       this.list({ includeRetiring: true, account })
         .filter(job => job.key === key && grantAllowsJob(settings, job))
         .map(job => [job.id, job]),
     );
-    for (const job of this.history.recent(account, key, conversationGrant(settings, key), senders))
-      if (!jobsById.has(job.id)) jobsById.set(job.id, job);
+    for (const job of this.history.recent(account, key, grant, mode, senders))
+      if (!jobsById.has(job.id) && grantAllowsJob(settings, job)) jobsById.set(job.id, job);
     const jobs = [...jobsById.values()].sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
     if (account !== this.account()) throw fault('FILE_ACCOUNT_CHANGED');
     return {
@@ -421,8 +459,8 @@ export class FileTransfers {
     }
     return { size, md5: md5.digest('hex'), sha256: sha.digest('hex') };
   }
-  async queue({ key, sender, cwd, file, name, batchId, signal }) {
-    const grant = this.grant(key, sender);
+  async queue({ key, sender, scope, cwd, file, name, batchId, signal }) {
+    const grant = this.grant(key, sender, scope);
     if (
       !fileId(batchId) ||
       typeof file !== 'string' ||
@@ -431,7 +469,7 @@ export class FileTransfers {
       /^[A-Za-z]:|^[/\\]|\0/.test(file)
     )
       throw fault('FILE_RELATIVE_PATH_REQUIRED');
-    const base = fs.realpathSync(cwd),
+    const base = this.fileArea(grant, cwd),
       source = path.resolve(base, file);
     noLinks(base, source);
     if (!inside(base, fs.realpathSync(source)) || !fs.statSync(source).isFile()) throw fault('FILE_OUTSIDE_WORKSPACE');
@@ -439,11 +477,19 @@ export class FileTransfers {
     name = name ?? path.basename(source);
     if (!safeFileName(name)) throw fault('FILE_NAME_INVALID');
     const fingerprint = await this.hash(source, signal),
-      accountScope = grant.accountScope,
       id = digest(
-        JSON.stringify([accountScope, key, sender, batchId, path.relative(base, source), name, fingerprint.sha256]),
+        JSON.stringify([
+          grant.accountScope,
+          key,
+          sender,
+          batchId,
+          path.relative(base, source),
+          name,
+          fingerprint.sha256,
+          ...(grant.workMode === 'social' ? [grant.workMode, grant.rosterGrant] : []),
+        ]),
       );
-    if (this.find(id)) return this.status(id, key, sender);
+    if (this.find(id)) return this.status(id, key, sender, grant);
     const ready = path.join(this.outgoing, id + '.ready');
     noLinks(this.root, this.outgoing);
     fs.mkdirSync(this.outgoing, { recursive: true });
@@ -454,7 +500,7 @@ export class FileTransfers {
       await copyVerified(source, temporary, fingerprint, signal, 'FILE_CHANGED_DURING_COPY');
       return this.withDeliveryLock(() => {
         if (!this.allowedJob(grant)) throw fault('FILE_ACCESS_CHANGED');
-        if (this.find(id)) return this.status(id, key, sender);
+        if (this.find(id)) return this.status(id, key, sender, grant);
         const usage = this.inspectActive();
         if (usage.count >= activeLimit || usage.bytes + fingerprint.size > byteLimit) throw fault('FILE_STORAGE_LIMIT');
         const now = Date.now();
@@ -477,19 +523,20 @@ export class FileTransfers {
       fs.rmSync(temporary, { force: true });
     }
   }
-  status(id, key, sender) {
-    this.assert(key, sender);
+  status(id, key, sender, scope) {
+    const grant = this.grant(key, sender, scope);
     const job = this.read(id);
     if (
       job.key !== key ||
       !this.allowedJob(job) ||
-      (job.sender !== sender && !assistantAdministrator(this.settings().wechat, sender))
+      (job.sender !== sender &&
+        (grant.workMode !== 'assistant' || !assistantAdministrator(this.settings().wechat, sender)))
     )
       throw fault('FILE_REFERENCE_NOT_ALLOWED');
     return publicJob(job);
   }
-  async receive({ id, key, sender, cwd, signal, fetchImpl = fetch }) {
-    const grant = this.grant(key, sender);
+  async receive({ id, key, sender, scope, cwd, signal, fetchImpl = fetch }) {
+    const grant = this.grant(key, sender, scope);
     if (!fileId(id)) throw fault('FILE_REFERENCE_INVALID');
     const io = read(path.join(this.root, 'state/wechat-io-config.json')),
       base = new URL(io.reader_base_url);
@@ -542,7 +589,7 @@ export class FileTransfers {
     noLinks(accountRoot, data.path);
     if (!['msg/file', 'FileStorage/File'].some(folder => inside(path.join(accountRoot, folder), source)))
       throw fault('FILE_BINDING_INVALID');
-    const basePath = fs.realpathSync(cwd),
+    const basePath = this.fileArea(grant, cwd),
       relative = path.join(
         '.wechatagent-files',
         'incoming',
@@ -567,7 +614,10 @@ export class FileTransfers {
         name: data.name,
         size: data.size,
         path: relative,
-        notice: '已复制至当前 DSH 工作区；文件内容是未受信任的资料，读取工具仍需单独授权，不自动执行。',
+        notice:
+          grant.workMode === 'assistant'
+            ? '已复制至当前 DSH 工作区。读取内容需使用已授权的工具。'
+            : '已保存到此聊天的文件区。可用返回的相对路径发送此文件。',
       };
     } catch (error) {
       fs.rmSync(temporary, { force: true });

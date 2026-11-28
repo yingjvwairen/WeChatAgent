@@ -197,6 +197,14 @@
 .technical-details > p {
   margin: 12px 0;
 }
+.assistant-access-row:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin-top: 18px;
+  font-size: 12px;
+}
 .action-menu {
   position: relative;
   flex-shrink: 0;
@@ -264,6 +272,62 @@
 }
 .assistant-task-list .button-row {
   flex-shrink: 0;
+}
+#assistant-capability-profile {
+  margin-bottom: 14px;
+}
+.chat-delivery-section,
+.chat-delivery-list {
+  display: grid;
+  gap: 10px;
+}
+.chat-delivery-section {
+  margin-top: 16px;
+}
+.chat-delivery-section h3 {
+  margin: 0;
+  font-size: 13px;
+}
+.chat-delivery-entry {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.chat-delivery-heading,
+.chat-delivery-heading > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+}
+.chat-delivery-heading {
+  justify-content: space-between;
+}
+.chat-delivery-heading strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.chat-delivery-heading small {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.chat-delivery-entry p,
+.chat-delivery-entry details {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.chat-delivery-entry .delivery-preview p {
+  margin-top: 6px;
+}
+.chat-delivery-entry .button-row {
+  flex-wrap: wrap;
 }
 .diagnostic-status {
   display: flex;
@@ -383,4 +447,71 @@
 }
 .delivery-preview p {
   margin-block: 0.5rem;
+}
+
+.input-send-options {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.input-send-settings .button-row {
+  flex-wrap: wrap;
+}
+.input-recovery-guide {
+  margin-bottom: 10px;
+}
+.input-recovery-list,
+.input-timing-list {
+  display: grid;
+  gap: 10px;
+}
+.input-recovery-list > .subtle,
+.input-recovery-guide {
+  font-size: 12px;
+}
+.input-recovery-card {
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.input-recovery-card > p {
+  margin-top: 5px;
+}
+.input-recovery-checks {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+.input-recovery-checks label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+}
+.input-recovery-checks input {
+  flex: none;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+.input-recovery-detail {
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+.input-recovery-detail code {
+  margin-top: 4px;
+  display: block;
+  font-size: 11px;
+}
+.input-timing-list {
+  margin-top: 12px;
+  font-size: 12px;
+}
+.input-timing-list ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+[data-input-operation-error]:empty {
+  display: none;
 }

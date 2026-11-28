@@ -83,7 +83,7 @@ export function taskFailureMessage(output, code, { inline = false } = {}) {
   if (/DSH_NOT_CONFIGURED/.test(output))
     return '请先在“首次配置”点击“下载安装 DSH”，安装后选择 DSH 程序位置并保存设置。';
   if (/DSH_PLUGIN_NOT_READY/.test(output))
-    return 'DSH 插件尚未就绪，请在 DSH 添加并启用本机插件，再从托盘完整退出并重新打开 DSH。';
+    return 'DSH 桥接尚未启动。请在 DSH 核对此安装的插件目录并启用本机插件，再从托盘完整退出并重开 DSH。';
   const port = /\bport=(\d{1,5})\b/.exec(output)?.[1],
     portLabel = port ? '端口 ' + port : '配置端口';
   if (/ADAPTER_PORT_IN_USE|SERVICE_PORT_IN_USE|SERVICE_PORT_OWNER_MISMATCH/.test(output))

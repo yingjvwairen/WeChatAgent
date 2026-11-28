@@ -15,7 +15,7 @@ const builtin = {
   name: 'DSH 内置能力',
   kind: 'builtin',
   enabled: true,
-  description: 'DSH 提供的文件、终端等内置工具。展开后可分别授权。',
+  description: 'DSH 提供的文件、终端等内置工具。',
 };
 const isCore = source => source?.kind === 'builtin' || source?.packageName === '@deepseek-ai/dsh-base';
 
@@ -46,9 +46,11 @@ export function catalogGroups(catalog, selected, original) {
   };
 }
 
-export function renderCatalogOptions(catalog, selected, original, esc) {
-  const row = (item, kind, source = '') =>
-    `<label class="extension-option dsh-option" data-capability-row data-search="${esc([source, item.name, item.description].join(' ').toLowerCase())}"><input type="checkbox" data-dsh-kind="${kind}" value="${esc(item.name)}" ${selected[kind].includes(item.name) ? 'checked' : ''}><span class="capability-copy"><strong>${esc(item.name)} ${item.loaded === false ? '<span class="status-tag warn">未加载</span>' : ''}</strong><small>${esc(item.description ?? '')}</small></span></label>`;
+export function renderCatalogOptions(catalog, selected, original, esc, { inherited = false } = {}) {
+  const checked = (item, kind) => (inherited ? item.loaded === true : selected[kind].includes(item.name));
+  const row = (item, kind, source = '') => {
+    return `<label class="extension-option dsh-option" data-capability-row data-search="${esc([source, item.name, item.description].join(' ').toLowerCase())}"><input type="checkbox" data-dsh-kind="${kind}" value="${esc(item.name)}" ${checked(item, kind) ? 'checked' : ''} ${inherited ? 'disabled' : ''}><span class="capability-copy"><strong>${esc(item.name)} ${item.loaded === false ? '<span class="status-tag warn">未加载</span>' : ''}</strong><small>${esc(item.description ?? '')}</small></span></label>`;
+  };
   const skills = new Map((catalog?.skills ?? []).map(item => [item.name, { ...item, loaded: true }]));
   for (const name of new Set([...(original.skills ?? []), ...selected.skills]))
     if (!skills.has(name))
@@ -66,7 +68,9 @@ export function renderCatalogOptions(catalog, selected, original, esc) {
   const informational = view.informational.length
     ? `<details class="capability-inventory" data-capability-info><summary>其他已安装的 DSH 插件（${view.informational.length}）</summary><p class="card-description">以下插件在当前会话没有已确认归属的可授权工具。界面类插件继续在 DSH 使用；工具来源未确认时会单独列出。</p>${view.informational.map(plugin => `<article class="capability-plugin-info" data-plugin-info data-search="${esc([plugin.name, plugin.packageName, plugin.description].join(' ').toLowerCase())}"><div><strong>${esc(plugin.name)}</strong><span class="status-tag ${plugin.enabled ? '' : 'warn'}">${plugin.enabled ? 'DSH 已启用' : 'DSH 未启用'}</span></div><small class="mono">${esc(plugin.packageName ?? '')}${plugin.version ? ' · ' + esc(plugin.version) : ''}</small>${plugin.packageName === 'dsh-meme' ? '<p class="card-description">表情库由 WeChatAgent 的 dsh-meme 扩展接入，请在扩展页面按聊天配置。</p>' : ''}</article>`).join('')}</details>`
     : '';
-  return `<fieldset class="extension-fieldset capability-list" data-capability-group><legend>技能 <span data-kind-count="skills">${selected.skills.length}</span></legend>${[...skills.values()].map(skill => row(skill, 'skills', '技能')).join('') || '<p class="card-description" data-no-capabilities>尚无可选技能。</p>'}</fieldset><div class="capability-section-heading"><h3>可调用工具</h3><span>已选 <span data-kind-count="tools">${selected.tools.length}</span> 项</span></div><p class="card-description">按来源插件分组；勾选具体工具才会授权。工具 ID 用于保存权限，不是插件名称。</p>${groups}${!view.groups.length ? '<p class="card-description" data-no-capabilities>当前模式尚无可分配工具。助手模式保存并初始化后可刷新清单。</p>' : ''}${informational}`;
+  const enabledSkills = [...skills.values()].filter(item => checked(item, 'skills')).length;
+  const enabledTools = view.groups.flatMap(group => group.tools).filter(item => checked(item, 'tools')).length;
+  return `<fieldset class="extension-fieldset capability-list" data-capability-group><legend>技能 <span data-kind-count="skills">${enabledSkills}</span></legend>${[...skills.values()].map(skill => row(skill, 'skills', '技能')).join('') || '<p class="card-description" data-no-capabilities>尚无可选技能。</p>'}</fieldset><div class="capability-section-heading"><h3>工具</h3><span>已选 <span data-kind-count="tools">${enabledTools}</span> 项</span></div>${groups}${!view.groups.length ? '<p class="card-description" data-no-capabilities>暂时没有可显示的工具。</p>' : ''}${informational}`;
 }
 
 export function filterCatalogOptions(form) {

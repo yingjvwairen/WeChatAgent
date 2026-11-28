@@ -42,7 +42,7 @@ function fixture(t) {
     wechat: {
       whitelist: { groups: ['123@chatroom'], private: [] },
       workModes: { [key]: 'assistant' },
-      assistant: { administrators: [sender], fileTransferChats: { [key]: true } },
+      assistant: { administrators: [sender] },
     },
   };
   const save = () => fs.writeFileSync(path.join(root, 'config/wechatagent.json'), JSON.stringify(config));
@@ -57,12 +57,21 @@ function fixture(t) {
     queue: extra => store.queue({ key, sender, cwd, file: '报告.txt', batchId, signal: signal(), ...extra }),
   };
 }
-test('file authorization defaults off, is per-chat and obeys administrator restrictions', t => {
+test('file transfers are available in both modes under the current conversation and sender grant', t => {
   const f = fixture(t);
-  assert(filesAllowed(f.config.wechat, key, sender));
-  assert(!filesAllowed(f.config.wechat, key, 'wxid_other'));
-  delete f.config.wechat.assistant.fileTransferChats;
-  assert(!filesAllowed(f.config.wechat, key, sender));
+  const w = f.config.wechat;
+  w.assistant.fileTransferChats = { [key]: false };
+  assert(filesAllowed(w, key, sender));
+  assert(!filesAllowed(w, key, 'wxid_other'));
+  w.workModes[key] = 'social';
+  assert(filesAllowed(w, key, 'wxid_other'));
+  assert(!filesAllowed(w, key, ''));
+  assert(!filesAllowed(w, 'wechat:group:999@chatroom', sender));
+  w.whitelist.private = [sender];
+  assert(filesAllowed(w, 'wechat:private:' + sender, sender));
+  assert(!filesAllowed(w, 'wechat:private:' + sender, 'wxid_other'));
+  assert(!filesAllowed(w, key, sender, { workMode: 'assistant' }));
+  assert(!filesAllowed(w, key, sender, { rosterGrant: 'old-grant' }));
 });
 test('queue controls survive restarts and require the current account, grant, state and revision', async t => {
   const f = fixture(t),
@@ -184,15 +193,17 @@ test('operator pause wins during async preparation, but cannot undo a submitted 
   assert.equal(harness.submissions, 1);
   assert.equal(f.store.read(id).state, 'confirmed');
 });
-test('file checkbox persists without creating a phantom dirty draft or granting another chat', () => {
+test('legacy per-mode file settings are ignored when saving and switching modes', () => {
   const config = { persona: { default: 'test' }, wechat: { whitelist: { groups: ['123@chatroom'], private: [] } } },
     old = structuredClone(config),
     s = chatSettingsSnapshot(config, key);
-  assert.equal(s.settings.fileTransfer, false);
+  assert(!Object.hasOwn(s.settings, 'fileTransfer'));
   s.settings.workMode = 'assistant';
   s.settings.fileTransfer = true;
   applyChatSettings(config, key, s.settings, s.access);
-  assert.equal(config.wechat.assistant.fileTransferChats[key], true);
+  assert(!Object.hasOwn(config.wechat.assistant, 'fileTransferChats'));
+  config.wechat.modeSettings[key].social.settings.fileTransfer = false;
+  assert(!Object.hasOwn(chatSettingsSnapshot(config, key, 'social').settings, 'fileTransfer'));
   assert.deepEqual(mergeConversationSave(old, old, config, key), config);
 });
 test('staging is durable and replaying the same batch cannot create a second send', async t => {
@@ -637,6 +648,48 @@ test('received files are bound to the sender and copied as verified bytes, never
   await assert.rejects(request({ senderWxid: 'wxid_other' }), /FILE_BINDING/);
   await assert.rejects(request({ sha256: 'f'.repeat(64) }), /FILE_INTEGRITY/);
   fs.unlinkSync(path.join(f.cwd, result.path));
+
+  const oldJob = f.store.read((await f.queue()).id);
+  f.config.wechat.workModes[key] = 'social';
+  f.save();
+  assert(!f.store.allowedJob(oldJob));
+  const chatFile = await request();
+  const fileArea = f.store.fileArea(f.store.grant(key, sender), f.cwd);
+  assert.deepEqual(fs.readFileSync(path.join(fileArea, chatFile.path)), bytes);
+  assert(!fs.existsSync(path.join(f.cwd, chatFile.path)));
+  await assert.rejects(f.queue(), { code: 'ENOENT' });
+  await assert.rejects(
+    f.queue({ file: path.relative(fileArea, path.join(f.cwd, '报告.txt')) }),
+    /FILE_OUTSIDE_WORKSPACE/,
+  );
+  const returned = await f.queue({ file: chatFile.path });
+  const a = adapterFor(f);
+  a.adapter.messages = async () =>
+    a.submissions
+      ? [
+          {
+            localId: 9,
+            serverId: '901',
+            createTime: Math.floor(Date.now() / 1000),
+            isSend: true,
+            localType: 25769803825,
+            fileName: data.name,
+            fileSize: data.size,
+            fileMd5: data.md5,
+          },
+        ]
+      : [];
+  await new FileDeliveryWorker(a.adapter, { pollMs: 1 }).run(f.store.read(returned.id));
+  assert.equal(f.store.status(returned.id, key, sender).state, 'confirmed');
+  assert.throws(() => f.store.status(returned.id, key, 'wxid_other'), /FILE_REFERENCE_NOT_ALLOWED/);
+  assert.deepEqual(
+    f.store.conversationDeliveries(key).jobs.map(job => job.id),
+    [returned.id],
+  );
+  f.config.wechat.workModes[key] = 'assistant';
+  f.save();
+  assert(!f.store.allowedJob(f.store.read(returned.id)));
+
   await assert.rejects(
     request({}, async () => {
       f.config.wechat.rosterGrants = { [key]: crypto.randomUUID() };
@@ -1072,7 +1125,7 @@ for (const exit of ['before input', 'uncertain input', 'account changed']) {
     const a = adapterFor(f, { noReceipt: true });
     await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
     assert.equal(f.store.read(id).state, 'unconfirmed');
-    f.config.wechat.assistant.fileTransferChats[key] = false;
+    f.config.wechat.assistant.administrators = [];
     f.save();
 
     let lookups = 0;
@@ -1113,7 +1166,7 @@ test('revoking file access before submission cancels only that file job', async 
   const f = fixture(t),
     created = await f.queue(),
     a = adapterFor(f);
-  f.config.wechat.assistant.fileTransferChats[key] = false;
+  f.config.wechat.assistant.administrators = [];
   f.save();
   await new FileDeliveryWorker(a.adapter).run(f.store.read(created.id));
   assert.equal(a.submissions, 0);
@@ -1443,7 +1496,7 @@ test('revoking a grant after admission leaves the last observed checkpoint uncon
     };
   };
   await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
-  f.config.wechat.assistant.fileTransferChats[key] = false;
+  f.config.wechat.assistant.administrators = [];
   f.save();
   await new FileDeliveryWorker(a.adapter).run(f.store.read(id));
   assert.equal(f.store.read(id).state, 'unconfirmed');
@@ -1467,42 +1520,54 @@ test('file tools enforce current-turn references and hide when revoked', async t
   assert(agentCtx[FILE_TRANSFER_POLICY].names().has('wechat_file_send'));
   const result = JSON.parse((await tools.get('wechat_file_receive').execute({ id: 'a'.repeat(64) })).content);
   assert.equal(result.code, 'FILE_NOT_IN_CURRENT_TURN');
-  f.config.wechat.assistant.fileTransferChats[key] = false;
+  f.config.wechat.assistant.administrators = [];
   f.save();
   assert.equal(agentCtx[FILE_TRANSFER_POLICY].names().size, 0);
 });
-test('files survive the OneBot/buffer path and do not become chat-mode tasks', async t => {
-  const f = fixture(t),
-    event = {
-      message_type: 'group',
-      self_id: 'wxid_self',
-      group_id: '123@chatroom',
-      user_id: '99',
-      message_id: 'file-one',
-      message: [
-        { type: 'text', data: { text: '[文件] 报告.txt' } },
-        { type: 'file', data: { id: 'a'.repeat(64), name: '报告.txt', size: 10 } },
-      ],
-    },
-    message = normalizeOneBotEvent('wechat', 'wechat-onebot', event),
-    buffer = new MessageBuffer(path.join(f.root, 'buffer.json'));
-  buffer.append(message);
-  assert.equal(new MessageBuffer(buffer.file).recent(key, 1)[0].files[0].name, '报告.txt');
-  const other = new MessageBuffer(path.join(f.root, 'other.json'));
-  let calls = 0;
-  const engine = new SocialEngine({
-    buffer: other,
-    decide: async () => {
-      calls++;
-    },
-    send: async () => {},
-  });
-  t.after(() => engine.stop());
-  engine.receive(message);
-  await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(calls, 0);
-  assert.equal(other.keys().length, 0);
-});
+test(
+  'chat-mode file messages reach the model with authenticated references and stay in chat mode',
+  { timeout: 3000 },
+  async t => {
+    const f = fixture(t),
+      event = {
+        message_type: 'group',
+        self_id: 'wxid_self',
+        group_id: '123@chatroom',
+        user_id: sender,
+        message_id: 'file-one',
+        wechatagent: { senderWxid: sender },
+        message: [
+          { type: 'text', data: { text: '[文件] 报告.txt' } },
+          { type: 'file', data: { id: 'a'.repeat(64), name: '报告.txt', size: 10 } },
+        ],
+      },
+      message = normalizeOneBotEvent('wechat', 'wechat-onebot', event),
+      buffer = new MessageBuffer(path.join(f.root, 'buffer.json'));
+    buffer.append(message);
+    assert.equal(new MessageBuffer(buffer.file).recent(key, 1)[0].files[0].name, '报告.txt');
+    const other = new MessageBuffer(path.join(f.root, 'other.json'));
+    const decision = Promise.withResolvers();
+    const engine = new SocialEngine({
+      buffer: other,
+      batchMs: 1,
+      decide: async (...args) => {
+        decision.resolve(args);
+        return 'SKIP';
+      },
+      send: async () => {},
+    });
+    t.after(() => engine.stop());
+    engine.receive({ ...message, readerGrant: 'legacy' });
+    const [chat, prompt, metadata] = await decision.promise;
+    assert.equal(chat, key);
+    assert.equal(metadata.workMode, 'social');
+    assert.equal(metadata.fileSender, sender);
+    assert.equal(metadata.rosterGrant, 'legacy');
+    assert.deepEqual(metadata.files, message.files);
+    assert.match(prompt, /微信文件引用/);
+    assert(!metadata.assistantSender);
+  },
+);
 test('DSH native search uses a unique tool name and returns real provider sources without tool-name collisions', async t => {
   const f = fixture(t);
   f.config.wechat.search = { enabled: true, maxSearchesPerTurn: 1 };

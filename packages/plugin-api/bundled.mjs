@@ -35,7 +35,6 @@ export const BUNDLED_PLUGINS = Object.freeze([
   Object.freeze({
     id: 'speech-recognition',
     version: '1.7.2',
-    builtin: true,
     source: 'optional-extensions/speech-recognition',
     zip: 'optional-extensions/packages/speech-recognition-1.7.2.zip',
     files: [
@@ -56,10 +55,10 @@ export const BUNDLED_PLUGINS = Object.freeze([
   }),
   Object.freeze({
     id: 'speech-synthesis',
-    version: '1.8.2',
+    version: '1.8.3',
     builtin: true,
     source: 'optional-extensions/speech-synthesis',
-    zip: 'optional-extensions/packages/speech-synthesis-1.8.2.zip',
+    zip: 'optional-extensions/packages/speech-synthesis-1.8.3.zip',
     files: [
       'README.md',
       'assets/sample.wav',

@@ -15,8 +15,12 @@ const fault = code => new Error(code);
 
 // A provider needs its credential; a custom API whose saved key belongs to
 // other addresses must not run without it.
-export function ready(settings, capability) {
+export function ready(settings, capability, { validateOnly = false } = {}) {
   const service = resolveService(settings, capability);
+  if (service.definition.managed) {
+    if (!validateOnly && !service.key) throw fault('VOICE_MANAGED_SPEECH_NOT_READY');
+    return service;
+  }
   if (service.kind === 'gpt-sovits') {
     validateLocalVoice(service.profile);
     return service;
@@ -90,6 +94,7 @@ export async function transcribeVoice(
 // Model (and voice) lists for the settings page, where the service offers them.
 export async function listFor(settings, capability, options = {}) {
   const service = resolveService(settings, capability);
+  if (service.definition.managed && !service.key) throw fault('VOICE_MANAGED_SPEECH_NOT_READY');
   if (service.entry !== 'custom' && !service.key) throw fault('VOICE_PROVIDER_CREDENTIAL');
   if (['openai-speech', 'openai-transcriptions', 'openai-transcription', 'realtime-speak'].includes(service.kind))
     return speechModels(service, options);

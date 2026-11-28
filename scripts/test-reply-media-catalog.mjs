@@ -21,7 +21,7 @@ const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 
 test('a killed catalog writer releases its lease and preserves the last committed revision', async t => {
   const f = fixture(t);
-  const previous = f.catalog.replace({ expectedRevision: f.catalog.snapshot().revision, items: [], enabled: true });
+  const previous = f.catalog.replace({ expectedRevision: f.catalog.snapshot().revision, items: [] });
   const module = new URL('./reply-media-catalog.mjs', import.meta.url).href;
   const child = spawn(
     process.execPath,
@@ -36,7 +36,7 @@ test('a killed catalog writer releases its lease and preserves the last committe
       process.stdout.write('locked');
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
     };
-    catalog.replace({expectedRevision:catalog.snapshot().revision,items:[],enabled:false});
+    catalog.replace({expectedRevision:catalog.snapshot().revision,items:[]});
   `,
       f.root,
     ],
@@ -55,7 +55,7 @@ test('a killed catalog writer releases its lease and preserves the last committe
   }
   const reopened = new ReplyMediaCatalog({ root: f.root });
   assert.equal(reopened.snapshot().revision, previous.revision);
-  assert.equal(reopened.replace({ expectedRevision: previous.revision, items: [], enabled: false }).enabled, false);
+  assert.deepEqual(reopened.replace({ expectedRevision: previous.revision, items: [] }).items, []);
 });
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reply-media-catalog-')),
@@ -218,7 +218,7 @@ test('linked input directories and linked catalog ancestors are refused', t => {
   });
 });
 
-test('explicit import preserves source bytes, metadata and disabled state while ordinary reads stay read-only', t => {
+test('explicit v1 import preserves source bytes and metadata and makes imported items available', t => {
   for (const enabled of [true, false, undefined]) {
     const f = fixture(t),
       item = f.item(),
@@ -235,19 +235,27 @@ test('explicit import preserves source bytes, metadata and disabled state while 
     const migrated = importReplyMedia(source, f.root);
     assert.throws(() => importReplyMedia(source, f.root), /REPLY_MEDIA_REVISION_CONFLICT/);
     assert.equal(migrated.version, 2);
-    assert.equal(migrated.enabled, enabled !== false);
+    assert.equal(migrated.enabled, undefined);
+    assert.equal(JSON.parse(fs.readFileSync(file)).enabled, true);
     assert.deepEqual(fs.readFileSync(source), old);
     assert.equal(f.catalog.snapshot().revision, migrated.revision);
     assert.deepEqual(migrated.items, [item]);
-    if (enabled === false) {
-      assert.deepEqual(f.catalog.list(), []);
-      assert.throws(() => f.catalog.resolve(item.id), { code: 'REPLY_MEDIA_DISABLED' });
-      const saved = f.catalog.replace({ expectedRevision: migrated.revision, items: migrated.items });
-      assert.equal(saved.enabled, false);
-      f.catalog.replace({ expectedRevision: saved.revision, items: saved.items, enabled: true });
-    }
     assert.equal(f.catalog.list().length, 1);
   }
+});
+
+test('a v2 catalog with the retired disabled flag offers imported items without rewriting the manifest on read', t => {
+  const f = fixture(t),
+    item = f.item(),
+    previous = Buffer.from(JSON.stringify({ version: 2, enabled: false, items: [item] }));
+  fs.mkdirSync(path.dirname(f.catalog.file), { recursive: true });
+  fs.writeFileSync(f.catalog.file, previous);
+  assert.equal(f.catalog.list()[0].id, item.id);
+  assert.equal(f.catalog.resolve(item.id).name, item.name);
+  assert.deepEqual(fs.readFileSync(f.catalog.file), previous);
+  f.catalog.update({ expectedRevision: f.catalog.snapshot().revision, changes: [{ id: item.id, remove: true }] });
+  assert.deepEqual(f.catalog.list(), []);
+  assert.throws(() => f.catalog.resolve(item.id), { code: 'REPLY_MEDIA_NOT_FOUND' });
 });
 
 test('migration preserves missing assets and refuses unknown schema without changing original data', t => {
@@ -273,11 +281,10 @@ test('large UTF-8 catalogs remain readable and metadata edits never require an u
     path: path.join(f.directory, '库'.repeat(65), '图'.repeat(115) + i + '.png'),
     tags: Array.from({ length: 6 }, (_, j) => '标'.repeat(15) + j),
   }));
-  const before = f.catalog.importIntoEmpty({ items, enabled: true });
+  const before = f.catalog.importIntoEmpty({ items });
   assert.ok(fs.statSync(f.catalog.file).size > 1024 * 1024);
   const saved = f.catalog.update({
     expectedRevision: before.revision,
-    enabled: false,
     changes: [
       { id: items[0].id, remove: true },
       { id: items[1].id, name: '保留', tags: [] },
@@ -285,8 +292,7 @@ test('large UTF-8 catalogs remain readable and metadata edits never require an u
   });
   assert.equal(saved.items.length, 999);
   assert.equal(saved.items[0].name, '保留');
-  assert.equal(f.catalog.snapshot().enabled, false);
-  assert.throws(() => f.catalog.update({ expectedRevision: before.revision, enabled: true }), /REVISION_CONFLICT/);
+  assert.throws(() => f.catalog.update({ expectedRevision: before.revision, changes: [] }), /REVISION_CONFLICT/);
   assert.throws(
     () => f.catalog.update({ expectedRevision: saved.revision, changes: [{ id: items[1].id, path: 'elsewhere' }] }),
     /INVALID/,

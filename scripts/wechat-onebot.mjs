@@ -8,6 +8,7 @@ import { ReplyMediaCatalog, replyMediaScore } from './reply-media-catalog.mjs';
 import { createDesktopControlHandler, executeDesktopControl } from './desktop-control.mjs';
 import { desktopMediaAllowed } from './desktop-media-permission.mjs';
 import { AdapterError, deliverDesktopMessage } from './desktop-message-delivery.mjs';
+import { assistantChatBufferFile } from './reader-account-state.mjs';
 import {
   activeReaderAccount,
   deliveryScopeAllowed,
@@ -498,17 +499,13 @@ export class WechatOneBot {
     wechat = read(path.join(this.directory, 'config/wechatagent.json')).wechat,
   ) {
     const conversation = 'wechat:' + kind + ':' + target,
-      policy = proactivePolicy(wechat, conversation);
-    if (
-      !policy.enabled ||
-      conversationWorkMode(wechat, conversation) === 'assistant' ||
-      Date.now() >= proactive.expiresAt ||
-      !withinProactiveWindow(Date.now(), policy)
-    )
+      assistant = conversationWorkMode(wechat, conversation) === 'assistant',
+      policy = proactivePolicy(wechat, conversation, assistant);
+    if (!policy.enabled || Date.now() >= proactive.expiresAt || !withinProactiveWindow(Date.now(), policy))
       fail('PROACTIVE_NOT_ALLOWED');
-    const saved = fs.existsSync(path.join(this.directory, 'state/social-messages.json'))
-      ? read(path.join(this.directory, 'state/social-messages.json'))
-      : { chats: {} };
+    const readBuffer = file => (fs.existsSync(file) ? read(file) : { chats: {} });
+    const primary = readBuffer(path.join(this.directory, 'state/social-messages.json'));
+    const saved = assistant ? readBuffer(assistantChatBufferFile(this.directory, { id: this.accountRef })) : primary;
     let preceding;
     if (proactive.precedingDeliveryId) {
       preceding = this.textDeliveries.get(this.textDeliveries.key(kind, target, proactive.precedingDeliveryId, ''));
@@ -521,11 +518,16 @@ export class WechatOneBot {
         fail('INVALID_PROACTIVE_CONTEXT');
     }
     const rows = saved.chats?.[conversation] ?? [];
+    const taskRows = assistant ? (primary.chats?.[conversation] ?? []) : undefined;
+    const pending = buffer =>
+      buffer.pendingReplies?.[conversation] ||
+      buffer.pendingRequests?.[conversation] ||
+      Object.values(buffer.mediaReplies ?? {}).some(item => item.key === conversation && item.observeOnly !== true);
     if (
-      saved.pendingReplies?.[conversation] ||
-      Object.values(saved.mediaReplies ?? {}).some(item => item.key === conversation && item.observeOnly !== true) ||
+      pending(saved) ||
+      (assistant && (pending(primary) || declinedProactive(taskRows))) ||
       declinedProactive(rows) ||
-      conversationSnapshot(rows) !== proactive.contextId ||
+      conversationSnapshot(rows, taskRows) !== proactive.contextId ||
       currentRows.some(
         row =>
           Number(row.createTime) * 1000 > Date.now() - policy.idleMinutes * 60000 &&

@@ -41,6 +41,27 @@ class Library:
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_discovery_adds_running_and_saved_accounts_without_widening_explicit_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            running, saved, missing = (root / name for name in ('running', 'saved', 'missing'))
+            for account in (running, saved):
+                for relative in ('message/message_0.db', 'contact/contact.db'):
+                    database = account / 'db_storage' / relative
+                    database.parent.mkdir(parents=True)
+                    database.touch()
+            accounts = setup.discover_accounts(running_directories=[running, missing], saved_directory=saved)
+            found = {
+                account['myWxid']: account for account in accounts if account['dbPath'] in map(str, (running, saved))
+            }
+            self.assertEqual(set(found), {'running', 'saved'})
+            self.assertTrue(found['running']['active'] and found['running']['ready'])
+            self.assertFalse(found['saved']['active'])
+            explicit = setup.discover_accounts(
+                saved / 'db_storage', running_directories=[running], saved_directory=saved
+            )
+            self.assertEqual(explicit, [found['saved']])
+
     def capture(self, library, processes=None, verify=None, timeout=1, *, capture=None, connection=None):
         elapsed = [0]
         self.elapsed = elapsed

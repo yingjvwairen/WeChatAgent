@@ -246,7 +246,7 @@ async function verify() {
     config.wechat.whitelist = { private: [target], groups: [] };
     if (Object.hasOwn(receiptTypes, mode)) {
       config.wechat.workModes = { [key]: 'assistant' };
-      config.wechat.assistant = { administrators: ['filehelper'], fileTransferChats: { [key]: true } };
+      config.wechat.assistant = { administrators: ['filehelper'] };
     }
     write(path.join(instance, 'config/wechatagent.json'), config);
     if (values['control-mode'] === 'ocr') {

@@ -25,6 +25,7 @@ Var WcaMigrate
   ${If} $1 != ""
     StrCpy $WcaDataHome $1
   ${EndIf}
+  StrCpy $WcaMigrate "0"
   StrCpy $WcaMigrationSource $WcaDataHome
   ${If} $WcaMigrationSource == ""
     StrCpy $WcaMigrationSource "$APPDATA\${PRODUCT_NAME}"
@@ -36,12 +37,16 @@ Var WcaMigrate
     ${EndIf}
     ${If} $1 != ""
       StrCpy $WcaMigrationSource $1
+      ${If} $1 != "$APPDATA\${PRODUCT_NAME}"
+        StrCpy $WcaMigrate "1"
+      ${EndIf}
     ${Else}
       StrCpy $WcaMigrationSource "$APPDATA\${PRODUCT_NAME}"
     ${EndIf}
   ${EndIf}
   # Refuse a legacy layout whose own uninstaller would delete the source.
   ${If} ${FileExists} "$WcaMigrationSource\workspace\config\wechatagent.json"
+    StrCpy $WcaMigrate "1"
     ReadRegStr $0 HKCU "${INSTALL_REGISTRY_KEY}" "InstallLocation"
     ${If} $0 != ""
       StrCpy $0 "$0\"
@@ -54,7 +59,6 @@ Var WcaMigrate
       ${EndIf}
     ${EndIf}
   ${EndIf}
-  StrCpy $WcaMigrate "1"
   StrCpy $WcaRememberedDataHome $WcaDataHome
   # The only directory page edits WcaRoot, never the app directory.
   StrCpy $WcaRoot $INSTDIR

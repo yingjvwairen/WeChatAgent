@@ -39,9 +39,15 @@ export function resolveService(settings, capability) {
     active = activeOf(services, capability);
   if (!active.entry)
     throw fault(capability === 'tts' ? 'VOICE_TTS_NOT_CONFIGURED' : 'VOICE_RECOGNITION_NOT_CONFIGURED');
-  const { entry, method, definition, profile } = active,
+  const { entry, method, definition } = active,
     item = entryById(entry);
-  if (entry === 'custom') {
+  let profile = active.profile;
+  const hosted = definition.managed ? settings.managedSpeech?.[capability] : null;
+  if (definition.managed) {
+    if (!/^http:\/\/127\.0\.0\.1:[0-9]{4,5}\/v1$/.test(hosted?.endpoint ?? ''))
+      throw fault('VOICE_MANAGED_SPEECH_DISABLED');
+    profile = { ...definition.defaults, endpoint: hosted.endpoint };
+  } else if (entry === 'custom') {
     const auth = profile.auth ?? 'bearer';
     if (!Object.hasOwn(AUTH_MODES, auth)) throw fault('VOICE_TTS_CONFIG');
     if (
@@ -54,7 +60,9 @@ export function resolveService(settings, capability) {
     for (const address of addressesOf(capability, active))
       if (!providerHostAllowed(item, address)) throw fault('VOICE_PROVIDER_HOST');
   }
-  const { key, from } = credentialOf(settings, capability, services);
+  const { key, from } = hosted
+    ? { key: hosted.key ?? '', from: 'managed' }
+    : credentialOf(settings, capability, services);
   const ordinaryTts = capability === 'tts' && definition.kind !== 'realtime-speak',
     maximum = ordinaryTts ? 600000 : 25000;
   const defaultTimeout = ordinaryTts ? (settings.ttsTimeoutMs ?? settings.timeoutMs) : settings.timeoutMs;

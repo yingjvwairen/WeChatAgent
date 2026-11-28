@@ -7,7 +7,7 @@ export function replyMediaEdits(saved, draft) {
     else if (item.name !== original.name || JSON.stringify(item.tags) !== JSON.stringify(original.tags))
       changes.push({ id: item.id, name: item.name, tags: item.tags });
   }
-  return { expectedRevision: saved.revision, enabled: draft.enabled, changes };
+  return { expectedRevision: saved.revision, changes };
 }
 
 export function createReplyMediaUI({
@@ -32,10 +32,8 @@ export function createReplyMediaUI({
       <button class="button" type="button" id="local-media-browse">选择文件夹</button>
       <label class="field"><span class="field-label">素材用途</span><select id="local-media-kind"><option value="image" ${kind === 'image' ? 'selected' : ''}>图片</option><option value="sticker" ${kind === 'sticker' ? 'selected' : ''}>表情配图</option></select></label>
       <button class="button" type="button" id="local-media-import">导入素材</button>
-    </div><p class="subtle">支持 PNG、JPEG 和 GIF，最多 20 MiB / 200 帧，总解码最多 8000 万像素。静态图片按图片发送，GIF 保留动画。导入后请保留原文件。</p>
-    <label class="toggle-row"><span>允许机器人使用本地素材库</span><input type="checkbox" id="local-media-enabled" ${value.enabled ? 'checked' : ''}></label>
-    <p class="subtle">共 ${value.items.length} 张素材${value.enabled ? '' : '；当前已停用，保留素材但不供机器人选用'}。</p>
-    <div class="local-media-items">${value.items
+    </div><p class="card-description">支持 PNG、JPEG 和 GIF，每张最多 20 MiB。导入后请保留原文件。</p>
+    <div class="local-media-items" ${value.items.length ? '' : 'hidden'}>${value.items
       .map(
         item => `<div class="local-media-row">
       <label class="field"><span class="field-label">${item.kind === 'sticker' ? '表情配图' : '图片'}名称</span><input data-local-media-name="${esc(item.id)}" value="${esc(item.name)}" maxlength="120"></label>
@@ -44,10 +42,10 @@ export function createReplyMediaUI({
     </div>`,
       )
       .join('')}</div>
-    <div class="button-row space-top"><button class="button primary" type="button" id="local-media-save">保存素材设置</button><span class="subtle" id="local-media-status" role="status">${draft ? '有未保存的修改' : '已保存'}</span></div>`
+    <div class="button-row space-top" ${value.items.length || draft ? '' : 'hidden'}><button class="button" type="button" id="local-media-save" ${draft ? '' : 'disabled'}>保存素材修改</button><span class="card-description" id="local-media-status" role="status">${draft ? '有未保存的修改' : ''}</span></div>`
       : '';
-    return `<section class="card" id="local-media-card" ${loading ? 'inert' : ''}>
-      <div class="sticker-toolbar"><div><h2>本地图片与 GIF</h2><p class="card-description">项目独立素材库，无需配置微信账号或启动读取服务。供机器人在已授权聊天中按名称和标签选择。</p></div><button class="button" type="button" id="local-media-reload">${draft ? '放弃修改并重新载入' : '刷新本地素材'}</button></div>
+    return `<section class="card sticker-library" id="local-media-card" ${loading ? 'inert' : ''}>
+      <div class="sticker-toolbar"><div><h2>本地图片与 GIF${value ? ` <span class="status-tag">${value.items.length} 项</span>` : ''}</h2><p class="card-description">导入后，已允许表情发送的聊天可按名称和标签选用素材。</p></div><button class="button" type="button" id="local-media-reload">${draft ? '放弃修改并重新载入' : '刷新本地素材'}</button></div>
       ${error ? `<p class="inline-error" role="alert">${esc(error)}</p>` : ''}${controls}
     </section>`;
   }
@@ -73,6 +71,8 @@ export function createReplyMediaUI({
   }
   function edit() {
     draft ??= structuredClone(saved);
+    const save = query('#local-media-save');
+    if (save) save.disabled = false;
     const status = query('#local-media-status');
     if (status) status.textContent = '有未保存的修改';
     return draft;
@@ -110,10 +110,6 @@ export function createReplyMediaUI({
         return;
       }
       if (!saved) return;
-      if (field.id === 'local-media-enabled') {
-        edit().enabled = field.checked;
-        return;
-      }
       const id = field.dataset.localMediaName ?? field.dataset.localMediaTags;
       if (!id) return;
       const item = edit().items.find(row => row.id === id);

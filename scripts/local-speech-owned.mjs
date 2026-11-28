@@ -2,19 +2,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { localSpeechPort } from '../packages/plugin-api/contract.mjs';
+
+export { localSpeechPort };
 
 function localPath(root, value) {
   if (typeof value !== 'string' || !value.trim() || /[\x00\r\n"]/.test(value) || /^[\\/]{2}/.test(value)) {
     throw Error('LOCAL_SPEECH_PATH_INVALID');
   }
   return path.resolve(root, value);
-}
-
-export function localSpeechPort(kind, config = {}) {
-  if (!['asr', 'tts'].includes(kind)) throw Error('LOCAL_SPEECH_SERVICE_INVALID');
-  const port = config.port ?? (kind === 'asr' ? 8000 : 9881);
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw Error('LOCAL_SPEECH_PORT_INVALID');
-  return port;
 }
 
 export const defaultProfilesPath = (root, kind) => path.join(root, 'state/local-speech', kind + '.profiles.json');

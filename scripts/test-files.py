@@ -97,7 +97,7 @@ class Files(unittest.TestCase):
         for key, sender in [(KEY, 'wxid_other'), ('wechat:group:124@chatroom', SENDER)]:
             with self.assertRaises(PermissionError):
                 self.catalog.resolve(ref, key, sender)
-        self.config['wechat']['assistant']['fileTransferChats'][KEY] = False
+        self.config['wechat']['assistant']['administrators'] = []
         self.save()
         with self.assertRaises(PermissionError):
             self.catalog.resolve(ref, KEY, SENDER)
@@ -185,6 +185,17 @@ class Files(unittest.TestCase):
         self.assertFalse(file_policy(self.config, KEY, 'wxid_other'))
         self.assertFalse(file_policy(self.config, 'wechat:private:123', 'wxid_other'))
         self.assertFalse(file_policy(self.config, 'wechat:group:999@chatroom', SENDER))
+
+    def test_chat_mode_resolves_an_attachment_with_the_same_sender_binding(self):
+        w = self.config['wechat']
+        w['workModes'][KEY] = 'social'
+        w['assistant'] = {'fileTransferChats': {KEY: False}}
+        self.save()
+        self.assertTrue(file_policy(self.config, KEY, 'wxid_other'))
+        ref = self.remember()['id']
+        self.assertEqual(self.catalog.resolve(ref, KEY, SENDER)['status'], 'not_downloaded')
+        with self.assertRaises(PermissionError):
+            self.catalog.resolve(ref, KEY, 'wxid_other')
 
     def test_account_change_and_cache_junctions_fail_closed(self):
         ref = self.remember()['id']

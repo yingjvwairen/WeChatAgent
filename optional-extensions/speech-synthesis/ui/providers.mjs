@@ -82,6 +82,34 @@ const TENCENT_REALTIME_ENGINES = ['16k_zh', '16k_zh_en', '16k_zh-TW', '16k_en', 
 // method is picked first. hosts: where the provider's credential may be sent.
 export const PROVIDERS = Object.freeze([
   {
+    id: 'wechatagent-local',
+    name: 'WeChatAgent 托管服务',
+    region: '本机',
+    keyKind: 'none',
+    hosts: [],
+    tip: '在“能力 → 语音服务”启用本机服务。地址、密钥和当前使用方案由应用提供。',
+    tts: {
+      speech: {
+        label: '本机语音合成',
+        kind: 'openai-speech',
+        status: 'pending',
+        managed: true,
+        fields: [],
+        defaults: { model: 'default', voice: 'default', speed: 1 },
+      },
+    },
+    fileAsr: {
+      transcriptions: {
+        label: '本机语音识别',
+        kind: 'openai-transcriptions',
+        status: 'pending',
+        managed: true,
+        fields: [],
+        defaults: { model: 'default' },
+      },
+    },
+  },
+  {
     id: 'gpt-sovits',
     name: 'GPT-SoVITS',
     region: '本机',

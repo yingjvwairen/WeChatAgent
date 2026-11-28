@@ -15,7 +15,7 @@
   "sourcePluginPackages": [
     "optional-extensions/packages/fish-notebook-1.1.1.zip",
     "optional-extensions/packages/speech-recognition-1.7.2.zip",
-    "optional-extensions/packages/speech-synthesis-1.8.2.zip"
+    "optional-extensions/packages/speech-synthesis-1.8.3.zip"
   ],
   "status": "development",
   "publication": "not-published",

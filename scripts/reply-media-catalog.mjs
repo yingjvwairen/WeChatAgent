@@ -94,7 +94,7 @@ export class ReplyMediaCatalog {
   #read() {
     noLinks(this.file);
     const stat = fs.statSync(this.file, { throwIfNoEntry: false });
-    if (!stat) return { version: 2, enabled: true, items: [], revision: hash('missing') };
+    if (!stat) return { version: 2, items: [], revision: hash('missing') };
     if (!stat.isFile() || stat.size > MAX_CATALOG_BYTES) throw fault('REPLY_MEDIA_CONFIG_INVALID');
     const bytes = fs.readFileSync(this.file);
     let value;
@@ -114,20 +114,20 @@ export class ReplyMediaCatalog {
       throw fault('REPLY_MEDIA_CONFIG_INVALID');
     const items = value.items.map(item => normalizeItem(item));
     if (new Set(items.map(item => item.id)).size !== items.length) throw fault('REPLY_MEDIA_CONFIG_INVALID');
-    return { version: 2, enabled: value.enabled, items, revision: hash(bytes) };
+    return { version: 2, items, revision: hash(bytes) };
   }
-  importIntoEmpty({ items, enabled }) {
-    return this.#write({ revision: hash('missing'), enabled: true }, { items, enabled }, false);
+  importIntoEmpty({ items }) {
+    return this.#write({ revision: hash('missing') }, items, false);
   }
   snapshot() {
     return structuredClone(this.#read());
   }
-  #write(previous, { items, enabled = previous.enabled }, verifyFiles = true) {
-    if (typeof enabled !== 'boolean' || !Array.isArray(items) || items.length > 1000)
-      throw fault('REPLY_MEDIA_CONFIG_INVALID');
+  #write(previous, items, verifyFiles = true) {
+    if (!Array.isArray(items) || items.length > 1000) throw fault('REPLY_MEDIA_CONFIG_INVALID');
     const normalized = items.map(item => normalizeItem(item, { verify: verifyFiles }));
     if (new Set(normalized.map(item => item.id)).size !== normalized.length) throw fault('REPLY_MEDIA_CONFIG_INVALID');
-    const bytes = Buffer.from(JSON.stringify({ version: 2, enabled, items: normalized }) + '\n');
+    // Retain a valid v2 manifest for older builds. Availability now follows the imported entries.
+    const bytes = Buffer.from(JSON.stringify({ version: 2, enabled: true, items: normalized }) + '\n');
     if (bytes.length > MAX_CATALOG_BYTES) throw fault('REPLY_MEDIA_CONFIG_LIMIT');
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     const lock = this.file + '.lock.sqlite';
@@ -155,15 +155,15 @@ export class ReplyMediaCatalog {
       }
     }
   }
-  replace({ expectedRevision, items, enabled } = {}) {
+  replace({ expectedRevision, items } = {}) {
     const previous = this.#read();
     if (expectedRevision !== previous.revision) throw fault('REPLY_MEDIA_REVISION_CONFLICT');
-    return this.#write(previous, { items, enabled });
+    return this.#write(previous, items);
   }
   update(body) {
-    if (!object(body) || Object.keys(body).some(key => !['expectedRevision', 'enabled', 'changes'].includes(key)))
+    if (!object(body) || Object.keys(body).some(key => !['expectedRevision', 'changes'].includes(key)))
       throw fault('REPLY_MEDIA_ITEM_INVALID');
-    const { expectedRevision, enabled, changes = [] } = body;
+    const { expectedRevision, changes = [] } = body;
     const previous = this.#read();
     if (previous.revision !== expectedRevision) throw fault('REPLY_MEDIA_REVISION_CONFLICT');
     if (!Array.isArray(changes) || changes.length > 1000) throw fault('REPLY_MEDIA_ITEM_INVALID');
@@ -180,7 +180,7 @@ export class ReplyMediaCatalog {
         items.set(item.id, { ...item, ...change });
       }
     }
-    return this.#write(previous, { items: [...items.values()], enabled }, false);
+    return this.#write(previous, [...items.values()], false);
   }
   list({ query = '', limit = 20, includeGif = false } = {}) {
     if (
@@ -193,7 +193,6 @@ export class ReplyMediaCatalog {
     )
       throw fault('REPLY_MEDIA_QUERY_INVALID');
     const snapshot = this.#read();
-    if (!snapshot.enabled) return [];
     const score = item => replyMediaScore(query, item.name, item.tags);
     const ordered = [...snapshot.items].sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name));
     const results = [];
@@ -220,7 +219,6 @@ export class ReplyMediaCatalog {
   resolve(id) {
     if (!digest(id)) throw fault('REPLY_MEDIA_ID_INVALID');
     const snapshot = this.#read();
-    if (!snapshot.enabled) throw fault('REPLY_MEDIA_DISABLED');
     const item = snapshot.items.find(row => row.id === id);
     if (!item) throw fault('REPLY_MEDIA_NOT_FOUND');
     const asset = imageFile(item.path);
@@ -271,7 +269,7 @@ export class ReplyMediaCatalog {
       known.add(asset.sha256);
       added++;
     }
-    const snapshot = added ? this.#write(previous, { items }, false) : previous;
+    const snapshot = added ? this.#write(previous, items, false) : previous;
     return { ...structuredClone(snapshot), added, skipped, skippedUnsupportedGif };
   }
 }

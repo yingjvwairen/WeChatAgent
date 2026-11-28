@@ -73,6 +73,7 @@ test('Reader and bridge use the same account scope for a Unicode database path',
 
 test('switching A to B isolates chats and pending state, then switching back restores A', t => {
   const { root, a, b, config } = fixture(t);
+  config.wechat.proactive.assistantChats = { 'wechat:private:123': true };
   config.wechat.rosterGrants = { 'wechat:private:123': 'd8b51595-8c32-4378-9e83-7ee7eccbe836' };
   config.wechat.history.chats = { 'wechat:private:123': false };
   write(path.join(root, 'state/social-messages.json'), { from: 'a' });
@@ -88,6 +89,7 @@ test('switching A to B isolates chats and pending state, then switching back res
     groups: [],
   });
   const switched = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json')));
+  assert.deepEqual(switched.wechat.proactive.assistantChats, {});
   assert.deepEqual(switched.wechat.chatModes, {});
   assert.deepEqual(switched.wechat.history.chats, {});
   assert.deepEqual(switched.wechat.dshAccess, { chats: {} });
@@ -101,6 +103,7 @@ test('switching A to B isolates chats and pending state, then switching back res
   const second = applyReaderAccount(root, first.reader, { ...first.reader, ...a }, bConfig);
   assert.equal(second.reader.imageAesKey, a.imageAesKey);
   const restored = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json')));
+  assert.deepEqual(restored.wechat.proactive.assistantChats, config.wechat.proactive.assistantChats);
   assert.deepEqual(restored.wechat.rosterGrants, config.wechat.rosterGrants);
   assert.deepEqual(restored.wechat.whitelist, config.wechat.whitelist);
   assert.deepEqual(restored.persona.chats, config.persona.chats);

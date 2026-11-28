@@ -22,71 +22,115 @@ export function timingMarkup(measurements, esc) {
 }
 
 export function recoveryMarkup(items, esc) {
-  if (!items?.length) return '<p class="subtle">没有需要人工处理的草稿或录音占用。</p>';
+  if (!items?.length) return '<p class="subtle">暂无待处理操作。</p>';
   return items
-    .map(
-      item =>
-        `<article class="notice plain" data-input-recovery="${esc(item.id)}"><div><strong>${item.focusRecoveryRequired ? '窗口焦点待恢复' : item.kind === 'recording' ? '录音占用待核对' : '草稿待核对'}</strong><p>${esc(item.message ?? item.reason ?? '请检查微信中的残留输入及对应消息结果。')}</p>${item.canRecover ? `<label class="toggle-row"><span>${item.focusRecoveryRequired ? '我已确认微信窗口及键盘焦点正常。' : item.kind === 'recording' ? '我已确认录音结束，录音界面已关闭。' : '我已处理对应聊天输入框中的草稿和引用。'}</span><input type="checkbox" data-operation-ack="${item.kind === 'recording' ? 'recording' : 'draft'}"></label><label class="toggle-row"><span>我已核对对应聊天的消息结果。</span><input type="checkbox" data-operation-ack="outcome"></label><button class="button" data-operation-recover="${esc(item.id)}">解除这次占用</button>` : '<p>停止后台发送服务并检查微信后，刷新这里继续处理。</p>'}</div></article>`,
-    )
+    .map(item => {
+      const recording = item.kind === 'recording';
+      const title = item.focusRecoveryRequired ? '窗口焦点待恢复' : recording ? '录音待核对' : '草稿待核对';
+      const checked = item.focusRecoveryRequired
+        ? '微信窗口及键盘焦点正常'
+        : recording
+          ? '录音已结束，录音界面已关闭'
+          : '已处理聊天输入框里的草稿和引用';
+      const context = item.message ? `<p class="subtle">${esc(item.message)}</p>` : '';
+      return `<article class="input-recovery-card" data-input-recovery="${esc(item.id)}">
+        <h3>${title}</h3>
+        ${context}
+        ${
+          item.canRecover
+            ? `<div class="input-recovery-checks">
+            <label><input type="checkbox" data-operation-ack="${recording ? 'recording' : 'draft'}">${checked}</label>
+            <label><input type="checkbox" data-operation-ack="outcome">已核对该聊天的消息结果</label>
+          </div><div class="button-row"><button class="button" data-operation-recover="${esc(item.id)}" disabled>解除占用</button></div>`
+            : '<p class="subtle">停止后台发送服务后刷新记录。</p>'
+        }
+        ${item.reason ? `<details class="input-recovery-detail"><summary>错误详情</summary><code>${esc(item.reason)}</code></details>` : ''}
+      </article>`;
+    })
     .join('');
 }
 
 export function createInputOperationsUI({
   api,
   escapeHtml: esc,
+  header,
   toast,
   query = selector => document.querySelector(selector),
 }) {
   let state,
-    loading = false,
+    loading,
     recovering = false,
-    signature;
+    recoverySignature,
+    timingSignature;
   const placeholder = () =>
-    `<section class="card" id="input-operations"><div class="card-heading"><h2>前台占用与操作恢复</h2><button class="button" data-input-operations-refresh>刷新记录</button></div><p class="subtle">按每一次连续借用前台分别计时，包含联系人切换；恢复只解除已核对的占用，不启动服务，也不重发或确认旧消息。</p><p data-input-configuration role="status"></p><button class="button" data-input-configuration-apply hidden>重新应用已保存的电脑设置</button><h3>最近一次连续前台占用</h3><div data-input-timing role="status">正在读取…</div><h3>需要人工处理</h3><div data-input-recoveries role="status">正在读取…</div><p data-input-operation-error class="inline-error" role="alert"></p></section>`;
+    `<section class="card" id="input-operations">
+      ${header('发送操作恢复', '', '<button class="button" data-input-operations-refresh>刷新记录</button>', 'tool')}
+      <div class="notice" data-input-configuration-panel hidden><span data-input-configuration role="status"></span><button class="button" data-input-configuration-apply hidden>重新应用</button></div>
+      <p class="subtle input-recovery-guide" data-input-recovery-guide hidden>请先停止服务，再到微信核对。</p>
+      <div class="input-recovery-list" data-input-recoveries>正在读取…</div>
+      <details class="advanced"><summary>最近的前台占用记录</summary><div class="input-timing-list" data-input-timing>正在读取…</div></details>
+      <p data-input-operation-error class="inline-error" role="alert"></p>
+    </section>`;
   function paint(host, data) {
     state = data;
-    host.querySelector('[data-input-timing]').innerHTML = timingMarkup(data.measurements, esc);
+    const timing = JSON.stringify(data.measurements ?? []);
+    if (timing !== timingSignature) {
+      host.querySelector('[data-input-timing]').innerHTML = timingMarkup(data.measurements, esc);
+      timingSignature = timing;
+    }
     const configuration = data.configuration;
+    host.querySelector('[data-input-configuration-panel]').hidden = !configuration?.error && !configuration?.pending;
     host.querySelector('[data-input-configuration]').textContent = configuration?.error
-      ? '电脑设置尚未应用，请处理当前输入后重试。'
-      : configuration?.pending
-        ? '电脑设置已保存，正在等待当前输入结束；暂停中的任务可在聊天发送队列继续。'
-        : configuration?.available
-          ? '当前电脑设置已应用。'
-          : '';
+      ? '发送设置尚未应用。'
+      : '已保存的发送设置将在当前输入结束后应用。';
     host.querySelector('[data-input-configuration-apply]').hidden = !configuration?.error;
-    const current = JSON.stringify([data.account, data.recoveries]);
-    if (current !== signature) {
+    const recovery = JSON.stringify([data.account, data.recoveries]);
+    if (recovery !== recoverySignature) {
       host.querySelector('[data-input-recoveries]').innerHTML = recoveryMarkup(data.recoveries, esc);
-      signature = current;
+      host.querySelector('[data-input-recovery-guide]').hidden = !data.recoveries?.some(item => item.canRecover);
+      recoverySignature = recovery;
     }
     host.querySelector('[data-input-operation-error]').textContent = '';
   }
   async function refresh() {
     const host = query('#input-operations');
-    if (!host || loading || recovering) return;
-    loading = true;
+    if (!host || loading?.host === host || recovering) return;
+    const pending = { host };
+    loading = pending;
     try {
       const data = await api('/api/input-operations');
-      if (host.isConnected) paint(host, data);
+      if (loading === pending && host.isConnected) paint(host, data);
     } catch (error) {
-      if (host.isConnected) host.querySelector('[data-input-operation-error]').textContent = error.message;
+      if (loading === pending && host.isConnected)
+        host.querySelector('[data-input-operation-error]').textContent = error.message;
     } finally {
-      loading = false;
+      if (loading === pending) loading = undefined;
     }
   }
   function mount() {
     const host = query('#input-operations');
     if (!host) return;
-    signature = undefined;
+    recoverySignature = timingSignature = undefined;
+    const ready = row =>
+      row.querySelector('[data-operation-ack="outcome"]').checked &&
+      row.querySelector('[data-operation-ack]:not([data-operation-ack="outcome"])').checked;
+    host.addEventListener('change', event => {
+      if (!event.target.matches('[data-operation-ack]')) return;
+      const row = event.target.closest('[data-input-recovery]');
+      row.querySelector('[data-operation-recover]').disabled = !ready(row);
+    });
     host.addEventListener('click', async event => {
       if (event.target.closest('[data-input-operations-refresh]')) return refresh();
-      if (event.target.closest('[data-input-configuration-apply]')) {
+      const apply = event.target.closest('[data-input-configuration-apply]');
+      if (apply) {
+        apply.disabled = true;
         try {
           await api('/api/desktop/apply', {});
           await refresh();
         } catch (error) {
           toast(error.message);
+        } finally {
+          apply.disabled = false;
         }
         return;
       }
@@ -95,10 +139,9 @@ export function createInputOperationsUI({
       const item = state?.recoveries?.find(row => row.id === button.dataset.operationRecover);
       if (!item?.canRecover) return;
       const row = button.closest('[data-input-recovery]');
-      const acknowledged = name => row.querySelector(`[data-operation-ack="${name}"]`)?.checked === true;
-      if (!acknowledged(item.kind === 'recording' ? 'recording' : 'draft') || !acknowledged('outcome'))
-        return toast('请先完成检查并勾选确认。');
+      if (!ready(row)) return;
       recovering = true;
+      loading = undefined;
       button.disabled = true;
       try {
         const data = await api('/api/input-operations/recover', {
@@ -109,13 +152,13 @@ export function createInputOperationsUI({
           acknowledgeRecordingEnded: item.kind === 'recording',
           acknowledgeOutcomeReviewed: true,
         });
-        if (host.isConnected) paint(host, data);
-        toast('本次占用已解除；原消息不会自动重发。');
+        if (host.isConnected) paint(host, { ...data, configuration: state.configuration });
+        toast('本次操作占用已解除。');
       } catch (error) {
         if (host.isConnected) host.querySelector('[data-input-operation-error]').textContent = error.message;
       } finally {
         recovering = false;
-        if (button.isConnected) button.disabled = false;
+        if (button.isConnected) button.disabled = !ready(row);
       }
     });
     void refresh();

@@ -1,7 +1,7 @@
 import { createInputOperationsUI } from './input-operations.js';
 import { createReplyMediaUI } from './reply-media.js';
 import { createChatTargetsUI } from './chat-targets.js';
-import { localModelSettings, bindLocalModelSettings } from './local-model-settings.mjs';
+import { bindLocalModelSettings } from './local-model-settings.mjs';
 import { createLocalModelDrafts } from './local-model-schema.mjs';
 import { sessionUsage } from './session-usage.js';
 import { consoleRoute, routeKey, SETTINGS_SECTIONS, requiresRestart, withoutLiveSettings } from './layout-model.mjs';
@@ -19,7 +19,12 @@ import { installExternalLinks } from './external-links.js';
 import { startUpdateUI } from './updates.js';
 import { createExtensionUI } from './extensions.js';
 import { createStickerManagerUI } from './sticker-manager.js';
-import { mergeConversationSave } from './conversation-settings.mjs';
+import {
+  activeChatWorkMode,
+  mergeConversationSave,
+  proactiveChatField,
+  rebaseConfigDraft,
+} from './conversation-settings.mjs';
 import { openProcessRecovery, needsWeChatRestart } from './process-recovery.js';
 const $ = selector => document.querySelector(selector);
 const escapeHtml = value =>
@@ -88,7 +93,7 @@ const extensionUI = createExtensionUI({
   },
   onProjectSave: syncExtensionProject,
 });
-const inputOperationsUI = createInputOperationsUI({ api, escapeHtml, toast });
+const inputOperationsUI = createInputOperationsUI({ api, escapeHtml, header, toast });
 const replyMediaUI = createReplyMediaUI({ api, escapeHtml, toast });
 const chatTargetsUI = createChatTargetsUI({
   api,
@@ -124,12 +129,7 @@ const workspaceLayout = createWorkspaceLayout({
     try {
       return local + (await stickerManagerUI.page());
     } catch (error) {
-      return (
-        local +
-        '<section class="card"><h2>账号共享表情池</h2><p class="subtle">' +
-        escapeHtml(error.message) +
-        '</p><p>上方的项目本地素材库不依赖微信账号或读取服务。</p></section>'
-      );
+      return local + `<section class="card">${header('账号共享表情池', escapeHtml(error.message))}</section>`;
     }
   },
 });
@@ -174,8 +174,8 @@ const actions = {
   'dsh-open': ['打开 DSH', '打开模型程序，在 DSH 中登录并启用本项目插件。'],
   'reader-check': ['检查读取配置', '只读检查当前数据库与凭据是否有效。'],
   'reader-connect': ['连接并验证微信', '正在获取并验证所选账号的读取凭据。请在微信中完成登录。'],
-  'desktop-check': ['检查当前发送方式', '只读校验发送组件、微信账号和当前窗口布局。'],
-  'desktop-setup': ['检查模拟输入依赖', '检查安装包内置运行环境。源码运行时会准备本地独立环境。'],
+  'desktop-check': ['检查微信发送', '检查发送组件、微信账号和窗口布局。'],
+  'desktop-setup': ['检查发送组件', '检查内置运行环境。源码运行时会准备独立环境。'],
   'sessions-configure': ['同步会话名称', '按聊天名称和当前人格更新 DSH 会话名称。'],
   'sessions-compact': ['压缩上下文', '在同一 DSH 会话内生成摘要，这会调用模型。'],
 };
@@ -216,11 +216,8 @@ const getPath = (object, path) => {
   if (path === 'wechat.replyLayout.maxMessages') return 2;
   if (path === 'wechat.stickers.candidateLimit') return 8;
   if (path === 'input.wechatExecutable') return '';
-  if (path === 'input.python') return '';
-  if (path === 'input.operationTimeoutMs') return 20000;
   if (path === 'input.idleMs') return 2000;
   if (path === 'input.sendKey') return 'enter';
-  if (path === 'input.paused') return false;
   if (path === 'input.controlMode') return 'ocr';
   if (path === 'input.typeText') return false;
   if (path === 'wechat.webReader.enabled') return true;
@@ -272,13 +269,24 @@ function inputModeControls() {
   const uia = getPath(state.draft, 'input.controlMode') === 'uia';
   const typed = getPath(state.draft, 'input.typeText') === true;
   const offscreen = getPath(state.draft, 'input.offscreen') === true;
-  return `<div class="switch-row"><div><label for="switch-input-uia">UIA 快速模式${restartTag('input.controlMode')}</label><p>开启使用 UIA 控件定位，关闭使用 OCR；两者均使用快速发送链路。发送方式统一使用界面操作。</p></div><label class="switch-control"><input type="checkbox" role="switch" id="switch-input-uia" ${uia ? 'checked' : ''} ${active ? '' : 'disabled'} aria-label="UIA 快速模式"><span class="switch-track"></span></label></div><div class="switch-row"><div><label for="switch-input-typeText">文字逐字输入${restartTag('input.typeText')}</label><p id="input-typeText-help">${uia ? 'UIA 始终快速粘贴；保留此处的 OCR 偏好，切回 OCR 后恢复。' : 'OCR 正文按字输入，支持换行、emoji 和组合字符。搜索词和含制表符的正文使用粘贴。'}</p></div><label class="switch-control"><input type="checkbox" role="switch" id="switch-input-typeText" data-path="input.typeText" ${typed ? 'checked' : ''} ${active && !uia ? '' : 'disabled'} aria-label="文字逐字输入" aria-describedby="input-typeText-help"><span class="switch-track"></span></label></div><div class="switch-row"><div><label for="switch-input-offscreen">微信离屏</label><p>仅 UIA 使用。开启后移出显示器，关闭或切回 OCR 时恢复原位。</p></div><label class="switch-control"><input type="checkbox" role="switch" id="switch-input-offscreen" data-path="input.offscreen" ${offscreen ? 'checked' : ''} ${active && uia ? '' : 'disabled'} aria-label="微信离屏"><span class="switch-track"></span></label></div><div class="button-row"><button class="button" data-action="restore-wechat">恢复微信窗口</button><small>服务停止或窗口异常时，可将微信找回屏幕。</small></div><p class="subtle">UIA 无障碍兼容入口由现有独立组件提供，需要时修改匹配微信进程内的一字节无障碍标志（0→1）。语音、引用等流程仍可能识图，发送时仍会短暂借用前台。</p>`;
+  return `<div class="switch-row">
+    <div><label for="switch-input-uia">使用控件定位（UIA）${restartTag('input.controlMode')}</label><p>关闭后使用屏幕识别（OCR）。</p></div>
+    <label class="switch-control"><input type="checkbox" role="switch" id="switch-input-uia" ${uia ? 'checked' : ''} ${active ? '' : 'disabled'} aria-label="使用控件定位（UIA）" aria-controls="input-mode-ocr input-mode-uia"><span class="switch-track"></span></label>
+  </div><div class="switch-row" id="input-mode-ocr" ${uia ? 'hidden' : ''}>
+    <div><label for="switch-input-typeText">文字逐字输入${restartTag('input.typeText')}</label><p id="input-typeText-help">使用屏幕识别时，逐字输入消息正文。</p></div>
+    <label class="switch-control"><input type="checkbox" role="switch" id="switch-input-typeText" data-path="input.typeText" ${typed ? 'checked' : ''} ${active && !uia ? '' : 'disabled'} aria-label="文字逐字输入" aria-describedby="input-typeText-help"><span class="switch-track"></span></label>
+  </div><div class="switch-row" id="input-mode-uia" ${uia ? '' : 'hidden'}>
+    <div><label for="switch-input-offscreen">微信离屏</label><p>使用控件定位时，将微信窗口移出屏幕。</p></div>
+    <label class="switch-control"><input type="checkbox" role="switch" id="switch-input-offscreen" data-path="input.offscreen" ${offscreen ? 'checked' : ''} ${active && uia ? '' : 'disabled'} aria-label="微信离屏"><span class="switch-track"></span></label>
+  </div>`;
 }
 function syncInputModeControls() {
   const active = state.draft.runtime?.sender === 'wechat-ui';
   const uia = getPath(state.draft, 'input.controlMode') === 'uia';
   const mode = $('#switch-input-uia'),
-    typed = $('#switch-input-typeText');
+    typed = $('#switch-input-typeText'),
+    typingOption = $('#input-mode-ocr'),
+    offscreenOption = $('#input-mode-uia');
   if (mode) {
     mode.checked = uia;
     mode.disabled = !active;
@@ -287,16 +295,13 @@ function syncInputModeControls() {
     typed.checked = getPath(state.draft, 'input.typeText') === true;
     typed.disabled = !active || uia;
   }
+  if (typingOption) typingOption.hidden = uia;
+  if (offscreenOption) offscreenOption.hidden = !uia;
   const offscreen = $('#switch-input-offscreen');
   if (offscreen) {
     offscreen.checked = getPath(state.draft, 'input.offscreen') === true;
     offscreen.disabled = !active || !uia;
   }
-  const help = $('#input-typeText-help');
-  if (help)
-    help.textContent = uia
-      ? 'UIA 始终快速粘贴；保留此处的 OCR 偏好，切回 OCR 后恢复。'
-      : 'OCR 正文按字输入，支持换行、emoji 和组合字符。搜索词和含制表符的正文使用粘贴。';
 }
 const configDirty = () => state.config && JSON.stringify(state.config) !== JSON.stringify(state.draft);
 const readerDirty = () =>
@@ -336,6 +341,15 @@ function updateDraftUI() {
   if ($('#wechat-client-version'))
     $('#wechat-client-version').value =
       state.draft?.input?.expectedVersion ?? state.config?.input?.expectedVersion ?? '';
+  const pauseNotice = $('#input-send-paused');
+  if (pauseNotice) {
+    const resumeStaged = state.draft?.input?.paused !== true;
+    pauseNotice.hidden = state.config?.input?.paused !== true;
+    $('#resume-input-sending').disabled = resumeStaged;
+    $('#input-send-pause-message').textContent = resumeStaged
+      ? '保存后，队列中的消息可能继续发送。'
+      : '自动发送已暂停。';
+  }
   $('#save-bar').hidden = !hasDraft();
   document.body.classList.toggle('has-draft', hasDraft());
   // 说明本次改动何时生效：只改了即时生效的配置时，不再笼统提示"其他设置需重启"
@@ -390,7 +404,11 @@ async function api(route, body, retry = true, options = {}) {
     state.token = info.token;
     return api(route, body, false, options);
   }
-  if (!response.ok) throw Object.assign(new Error(result.error ?? '操作失败，请重试。'), { status: response.status });
+  if (!response.ok)
+    throw Object.assign(new Error(result.error ?? '操作失败，请重试。'), {
+      status: response.status,
+      code: result.code,
+    });
   return result;
 }
 let modalLifecycle = {};
@@ -403,12 +421,13 @@ function modal(title, content, options = {}) {
   if (!$('#modal').open) $('#modal').showModal();
 }
 function closeModal(options = {}) {
-  if (options.force !== true && modalLifecycle.beforeClose?.() === false) return;
+  if (options.force !== true && modalLifecycle.beforeClose?.() === false) return false;
   const cleanup = modalLifecycle.onClose;
   modalLifecycle = {};
   cleanup?.();
   $('#modal').close();
   $('#modal').className = '';
+  return true;
 }
 function confirmAction(title, description, label, callback) {
   modal(
@@ -658,7 +677,7 @@ function conversationSummary(key) {
   const c = state.draft,
     a = c.wechat.dshAccess?.chats?.[key] ?? {},
     role = c.persona.chats?.[key] ?? c.persona.default;
-  const workMode = c.wechat.workModes?.[key] ?? 'social',
+  const workMode = activeChatWorkMode(c, key),
     mode = c.wechat.chatModes?.[key] ?? (workMode === 'assistant' ? 'mention' : c.wechat.wake_mode);
   return (
     '<p class="conversation-summary">' +
@@ -897,7 +916,7 @@ function contextSettingsCard() {
 function settingsCards() {
   return {
     participation: `<section class="card">${header('群聊参与', '默认方式，可在允许的聊天为每个群单独选择。', '', 'chat')}<div id="behavior-mode">${modeSelector()}</div><div class="form-grid space-top">${field('唤醒词', 'wechat.wake_words', { transform: 'lines', help: '每行一个。群里识别这些文字后进入回复判断。', placeholder: '小助手' })}${field('账号昵称提示', 'account.nicknames', { transform: 'lines', help: '每行一个。填写账号在聊天中使用的昵称。' })}</div><div class="notice plain">${icon('info')}<span>“自然参与”也会判断普通群消息，选择沉默时仍可能调用模型。拍一拍回应继续使用原有规则。</span></div></section>`,
-    admins: `<section class="card">${header('助手模式管理员', '名单属于当前微信账号；仅用于助手模式，聊天模式保持原规则。', '', 'person')}${field('管理员真实微信 ID', 'wechat.assistant.administrators', { transform: 'lines', help: '每行一位，最多 50 位。建议从微信好友中选择；昵称及“我是管理员”等聊天文字不能授予权限。保存后生效，名单为空时群友仍可聊天，但无人能执行任务；私聊助手仍仅允许管理员。', placeholder: 'wxid_xxxxxxxxxxxxxx' })} ${toggle('补读停机期间最后一条符合条件的助手消息', 'wechat.assistant.replayOffline', '恢复后重新检查原聊天和发送者权限。管理员可交办任务，普通群成员只进入聊天。默认仅保存历史。')}<div class="button-row"><button class="button" id="choose-assistant-admin">${icon('plus')}从微信好友选择</button></div><p class="subtle space-top">群聊助手向所有群友开放聊天，工具、技能、文件、联网与任务控制仅允许指定管理员。普通聊天与管理员任务使用独立上下文；原生权限和审批仍然生效。</p></section>`,
+    admins: `<section class="card">${header('助手模式管理员', '指定当前微信账号下可以执行助手任务的人员。', '', 'person')}${field('管理员真实微信 ID', 'wechat.assistant.administrators', { transform: 'lines', help: '每行一个微信 ID，最多 50 位。私聊助手需要管理员身份。', placeholder: 'wxid_xxxxxxxxxxxxxx' })}<div class="button-row"><button class="button" id="choose-assistant-admin">${icon('plus')}从微信好友选择</button></div></section>`,
     rhythm: `<section class="card">${header('回复节奏', '控制消息合并、发送间隔与群聊频率。', '', 'sliders')}<div class="form-grid">${field('消息合并等待 / 秒', 'social.batch_ms', { type: 'number', transform: 'seconds', min: 0, max: 60, step: 0.1, help: '把短时间内收到的消息合并到同一轮判断。' })}${field('私聊回复最小间隔 / 秒', 'social.private_min_interval_ms', { type: 'number', transform: 'seconds', min: 0, max: 3600, step: 0.1 })}${field('群聊回复最小间隔 / 秒', 'social.min_interval_ms', { type: 'number', transform: 'seconds', min: 0, max: 3600, step: 1 })}${field('每分钟群回复上限 / 条', 'social.max_per_minute', { type: 'number', min: 1, max: 1000, step: 1 })}${field('每十分钟群回复上限 / 条', 'social.max_per_ten_minutes', { type: 'number', min: 1, max: 10000, step: 1 })}</div></section>`,
     proactive: `<section class="card">${header('按人格主动聊天', '让当前人格自然找话题或问候，不强迫每次开口。', '', 'chat')}${toggle('启用定时主动聊天', 'wechat.proactive.enabled', '总开关。还需在允许的聊天中逐个开启好友或群聊，默认不向任何聊天主动发送。')}${toggle('允许使用热点与新梗资料', 'wechat.proactive.useSearch', '仅在联网搜索对该聊天也开启时生效。资料不适合人格或无法取得时，改为问候或沉默。')}<div class="form-grid space-top"><div class="field full"><label for="field-proactive-mode">主动内容方向</label><select id="field-proactive-mode" data-path="wechat.proactive.mode">${[
       ['mixed', '问候、热点、新梗轮换'],
@@ -991,12 +1010,15 @@ function readerConfigurationCard() {
   const r = state.reader;
   state.readerDraft ??= { dbPath: r?.dbPath ?? '', myWxid: r?.myWxid ?? '', decryptKey: '' };
   const draft = state.readerDraft;
-  const accounts = state.readerAccounts ?? [];
+  const accountPath = state.readerSuggestion?.dbPath ?? draft.dbPath;
+  const accounts = [...(state.readerAccounts ?? [])];
+  if (draft.myWxid && !accounts.some(account => account.dbPath === draft.dbPath))
+    accounts.unshift({ dbPath: draft.dbPath, myWxid: draft.myWxid, ready: !readerDirty() && r?.verified });
   const verified = r?.verified && !readerDirty();
   return `<section class="card reader-setup">${header('连接自己的微信', '打开匹配微信后，选择账号目录，程序会获取密钥并验证数据库。', '<span class="status-tag ' + (verified ? 'ok' : 'warn') + '">' + (verified ? '已验证' : '待连接') + '</span>', 'folder')}
-    <div class="reader-steps"><span>1. 打开微信</span><span>2. 查找账号目录</span><span>3. 连接并验证</span></div>
-    <div class="form-grid"><div class="field full"><label for="reader-path">微信账号目录</label><div class="input-with-button"><input id="reader-path" data-reader="dbPath" value="${escapeHtml(draft.dbPath)}" placeholder="可选择 xwechat_files、账号文件夹或 db_storage"><button class="button" data-browse="folder" data-target="reader-path">${icon('folder')}选择文件夹</button></div><small>不知道目录在哪时，先点击“自动查找账号”。选择文件夹后会自动识别账号。</small></div>
-    <div class="field full"><label for="reader-account">当前账号</label><select id="reader-account" data-reader="myWxid"><option value="">${accounts.length > 1 ? '找到多个账号，请选择当前登录的账号' : '等待识别账号目录'}</option>${accounts.length ? accounts.map(a => `<option value="${escapeHtml(a.dbPath)}" ${draft.dbPath === a.dbPath ? 'selected' : ''}>${escapeHtml(a.myWxid)}${a.ready ? '' : '（等待微信同步）'}</option>`).join('') : draft.myWxid ? `<option value="${escapeHtml(draft.myWxid)}" selected>${escapeHtml(draft.myWxid)}</option>` : ''}</select></div></div>
+    <div class="reader-steps"><span>1. 选择匹配微信</span><span>2. 选择当前账号</span><span>3. 连接并验证</span></div>
+    <div class="form-grid"><div class="field full"><label for="reader-path">微信账号目录</label><div class="input-with-button"><input id="reader-path" data-reader="dbPath" value="${escapeHtml(accountPath)}" placeholder="可选择 xwechat_files、账号文件夹或 db_storage"><button class="button" data-browse="folder" data-target="reader-path">${icon('folder')}选择文件夹</button></div><small>不知道目录在哪时，先点击“自动查找账号”。选择文件夹后会自动识别账号。</small></div>
+    <div class="field full"><label for="reader-account">当前账号</label><select id="reader-account" data-reader="myWxid"><option value="">${accounts.length > 1 ? '找到多个账号，请选择当前登录的账号' : '等待识别账号目录'}</option>${accounts.length ? accounts.map(a => `<option value="${escapeHtml(a.dbPath)}" ${accountPath === a.dbPath ? 'selected' : ''}>${escapeHtml(a.myWxid)}${a.ready ? (a.active ? '（当前登录）' : '') : '（等待微信同步）'}</option>`).join('') : draft.myWxid ? `<option value="${escapeHtml(draft.myWxid)}" selected>${escapeHtml(draft.myWxid)}</option>` : ''}</select></div></div>
     <div class="button-row space-top"><button class="button" id="detect-reader">${icon('search')}自动查找账号</button><button class="button" id="scan-reader">识别此目录</button><button class="button primary" data-action="reader-connect">${icon('plug')}一键连接并验证</button></div>
     <p class="reader-progress" id="reader-progress" role="status" aria-live="polite"></p><p id="reader-save-error" class="inline-error" role="alert">${escapeHtml(state.readerError)}</p>
     <details class="advanced"><summary>高级选项：手动填写读取密钥</summary><div class="form-grid"><div class="field full"><label for="reader-key">数据库密钥</label><input id="reader-key" data-reader="decryptKey" value="${escapeHtml(draft.decryptKey)}" type="password" autocomplete="new-password" placeholder="${r?.hasKey ? '已有凭据；留空先验证原值' : '通常无需填写，一键连接会自动获取'}"><small>密钥会在当前电脑安全保存。只在你已经取得有效密钥时填写。</small></div></div><div class="button-row space-top"><button class="button" id="save-reader">验证并保存手动设置</button><button class="button" data-action="reader-check">检查已保存的读取设置</button></div></details>
@@ -1046,19 +1068,19 @@ function connectionsPage() {
   state.readerDraft ??= { dbPath: r?.dbPath ?? '', myWxid: r?.myWxid ?? '', decryptKey: '' };
   return `<div class="section-stack"><section class="card">${header('模型连接', '使用你已在 DSH 中配置的模型。', '', 'plug')}<div class="form-grid">${field('DSH 程序位置', 'runtime.dshDesktop', { full: true, browse: 'exe', placeholder: '选择 DeepSeek Harness.exe', help: '启动时若 DSH 尚未打开，会尝试打开这个程序。' })}${field('模型提供方标识', 'dsh.provider', { help: '与 DSH 中的 provider 标识一致。' })}${field('模型标识', 'dsh.model', { help: '图片理解需要当前模型支持图片输入。' })}</div>${pluginPathField()}<div class="notice plain">${icon('info')}<span>修改模型后：保存设置 → 在诊断页准备配置 → 从托盘完全退出并重新打开 DSH → 重启服务。</span></div></section>
     <section class="card">${header('微信与读取程序', '选择本机已准备的程序。', '', 'chat')}<div class="form-grid">${field('匹配微信程序位置', 'input.wechatExecutable', { full: true, browse: 'exe', help: '选择时自动核验版本和发送组件；手动填写路径会在保存时核验。' })}<div class="field"><label for="wechat-client-version">匹配微信版本</label><input id="wechat-client-version" value="${escapeHtml(state.draft?.input?.expectedVersion ?? state.config?.input?.expectedVersion ?? '')}" readonly><small>版本由所选程序自动识别，保存后与程序路径一并生效。</small></div>${field('Python 程序位置', 'runtime.python', { full: true, browse: 'exe', help: '选择已有环境的 python.exe，也可填写可用的 Python 命令。' })}</div></section>
-    ${localModelSettings({ field, toggle })}
-    <section class="card">${header('微信发送方式', '发送时会短暂借用微信窗口的焦点。可设置键鼠空闲多久后开始发送。', '', 'chat')}<div class="form-grid">${field('模拟输入 Python 程序（可选）', 'input.python', { full: true, browse: 'exe', help: '留空使用安装包内置运行环境。源码运行时使用项目独立环境。' })}${field(
-      '发送按键',
-      'input.sendKey',
-      {
-        type: 'select',
-        options: [
-          ['enter', 'Enter 发送'],
-          ['ctrl-enter', 'Ctrl+Enter 发送'],
-        ],
-        help: '需与微信“设置 → 快捷键 → 发送消息”一致。',
-      },
-    )}${field('单次桌面操作超时 / 秒', 'input.operationTimeoutMs', { type: 'number', transform: 'seconds', min: 5, max: 30 })}${field('你在用电脑时延后发送 / 秒', 'input.idleMs', { type: 'number', transform: 'seconds', min: 0, max: 30, help: '这段时间内有键鼠操作就稍后再发；0 表示不等待。' })}${inputModeControls()}${toggle('暂停模拟输入自动发送', 'input.paused', '保存后立即暂停新的桌面发送操作。')}${toggle('原生语音发送', 'input.voiceSend', '需要 VB-CABLE。支持已授权语音合成的好友和群聊，沿用自适应布局；录制在后台进行，具体焦点占用取决于 OCR 或 UIA 链路。')}</div><p class="subtle">UIA 与 OCR 均使用快速发送流程，结合控件或界面状态与键鼠活动监控推进；最终以数据库回执确认送达。联系人按唯一微信号、备注或昵称定位，群聊按唯一群名定位。发送结果需要核对时，请查看对应聊天的发送队列。支持文字、普通文件以及匹配版本的图片和 GIF。UIA、OCR 与逐字输入的选择保存后用于后续操作。</p><div class="button-row"><button class="button" data-action="desktop-setup">检查模拟输入依赖</button><button class="button" data-action="desktop-check">检查当前发送方式</button><button class="button" id="configure-voice-cable">VB-CABLE 线路${state.draft.input?.voiceCable ? '（已固定）' : ''}</button></div></section>
+    <section class="card input-send-settings">${header('微信发送方式', '发送消息时，微信可能短暂切到前台。', '', 'chat')}
+    <div class="notice" id="input-send-paused" hidden><span id="input-send-pause-message"></span><button class="button" id="resume-input-sending">恢复自动发送</button></div>
+    <div class="form-grid">${field('发送按键', 'input.sendKey', {
+      type: 'select',
+      options: [
+        ['enter', 'Enter 发送'],
+        ['ctrl-enter', 'Ctrl+Enter 发送'],
+      ],
+      help: '需与微信“设置 → 快捷键 → 发送消息”一致。',
+    })}${field('等待键鼠空闲 / 秒', 'input.idleMs', { type: 'number', transform: 'seconds', min: 0, max: 30, help: '键鼠空闲达到此时长后再发送。设为 0 则无需等待。' })}</div>
+    <div class="input-send-options">${inputModeControls()}${toggle('原生语音发送', 'input.voiceSend', '使用 VB-CABLE 向已授权的聊天发送微信语音。')}</div>
+    <div class="button-row"><button class="button" data-action="restore-wechat">恢复微信窗口</button><button class="button" id="configure-voice-cable">VB-CABLE 线路${state.draft.input?.voiceCable ? '（已固定）' : ''}</button><button class="button" data-action="desktop-check">检查微信发送</button></div>
+    </section>
     ${inputOperationsUI.placeholder()}
     ${readerConfigurationCard()}
     <section class="card">${header('高级连接选项', '通常无需修改。端口需要互不重复。', '', 'sliders')}<details><summary>展开端口与发送超时设置</summary><div class="form-grid">${field('读取服务端口', 'ports.weflow', { type: 'number', min: 1024, max: 65535 })}${field('消息桥接端口', 'ports.onebot', { type: 'number', min: 1024, max: 65535 })}${field('适配器状态端口', 'ports.adapter', { type: 'number', min: 1024, max: 65535 })}${field('DSH 插件端口', 'ports.dshPlugin', { type: 'number', min: 1024, max: 65535 })}${field('回执等待超时 / 秒', 'input.receiptTimeoutMs', { type: 'number', transform: 'seconds', min: 1, max: 18, step: 0.1 })}</div></details></section></div>`;
@@ -1069,11 +1091,15 @@ function toolsPage() {
   return `<div class="tool-grid"><section class="card">${header('依赖维护', '通常只供开发环境使用。', '', 'tool')}${row('安装项目依赖', '使用原安装脚本检查或安装依赖。', 'setup', '安装')}</section></div>`;
 }
 function setupPage() {
+  const client = state.readerCandidate;
+  const selected = state.config?.input?.wechatExecutable;
+  const loggedIn =
+    !!selected && (state.readerAccounts ?? []).filter(account => account.active && account.ready).length === 1;
+  const status = loggedIn ? '已检测到登录' : selected ? '已选择客户端' : '待选择';
   return `<div class="section-stack"><div class="notice plain">${icon('shield')}<span>此安装包使用独立的本机数据目录。账号、读取凭据和允许的聊天需要由你配置，初始允许的聊天为空。</span></div><p class="subtle"><a class="text-link" href="https://github.com/sourcepro5/WeChatAgent" target="_blank" rel="noopener noreferrer">觉得好用去GitHub上点个star吧 ${icon('arrow')}</a></p><div class="tool-grid setup-grid">
     <section class="card">${header('检查运行环境', 'Node.js、Python 和读取依赖均已内置。', '', 'check')}<p class="modal-description">不需要安装开发工具或系统 Python。可先检查安装文件是否完整。</p><button class="button" data-action="setup">验证内置环境</button></section>
-    <section class="card">${header('登录匹配微信', '使用连接设置中选择的匹配客户端。', '', 'chat')}<p class="modal-description">打开微信并登录自己的账号，等待消息同步。当前支持的微信版本为 ${escapeHtml(state.wechatVersion ?? '')}；如果微信要求升级，请保留提示并检查兼容性。</p><button class="button" data-action="wechat-open">打开微信</button> <button class="button" data-restart-wechat>修复微信连接…</button></section>
-    ${dshInstallCard({ header, field, pluginPathField })}
-    </div>${readerConfigurationCard()}<section class="card">${header('启动并选择允许的聊天', '数据库显示“已验证”并完成模型连接后，启动服务。', '', 'power')}<p class="modal-description">可以先在“允许的聊天”搜索好友或群聊，保存名单后启动服务。服务运行中修改名单会立即生效。</p><div class="button-row"><button class="button primary" data-action="start">启动服务</button><a class="button" href="#chats">选择允许的聊天</a><a class="button" href="#overview">查看连接状态</a></div></section></div>`;
+    <section class="card">${header('匹配微信', '连接这台电脑上已登录的微信。', `<span class="status-tag ${loggedIn ? 'ok' : 'warn'}">${status}</span>`, 'chat')}<p class="modal-description">${selected ? escapeHtml(selected) : client ? '已找到匹配客户端 ' + escapeHtml(client.path) : '支持微信 ' + escapeHtml(state.wechatVersion ?? '') + '。可检查正在运行的客户端，或手动选择程序。'}</p><div class="button-row">${!selected && client ? '<button class="button primary" id="use-reader-client">使用检测到的微信</button>' : ''}${selected ? '<button class="button" data-action="wechat-open">打开微信</button> <button class="button" data-restart-wechat>修复微信连接…</button>' : '<button class="button" id="check-setup-wechat">检查当前微信</button> <a class="button" href="#settings/connections">手动选择程序</a>'}</div></section>
+    </div>${readerConfigurationCard()}${dshInstallCard({ header, field, pluginPathField })}<section class="card">${header('启动并选择允许的聊天', '数据库显示“已验证”并完成模型连接后，启动服务。', '', 'power')}<p class="modal-description">可以先在“允许的聊天”搜索好友或群聊，保存名单后启动服务。服务运行中修改名单会立即生效。</p><div class="button-row"><button class="button primary" data-action="start">启动服务</button><a class="button" href="#chats">选择允许的聊天</a><a class="button" href="#overview">查看连接状态</a></div></section></div>`;
 }
 async function logsPage() {
   state.logs = await api('/api/logs' + (state.logs?.file ? '?file=' + encodeURIComponent(state.logs.file) : ''));
@@ -1129,6 +1155,10 @@ async function renderPage() {
   paintStatus();
   paintReaderSetup();
   if (page === 'plugin') extensionUI.mountPluginPage();
+  if (page === 'setup' && !state.setupDiscoveryStarted && !readerDirty() && state.job?.state !== 'running') {
+    state.setupDiscoveryStarted = true;
+    void discoverReader(true, { focus: false });
+  }
   if (page === 'memory') memoryUI.mount();
   inputOperationsUI.mount();
   bindLocalModelSettings({
@@ -1209,6 +1239,38 @@ async function refreshStatus() {
     }
   }
 }
+async function saveConfigDraft() {
+  const previous = state.config,
+    draft = structuredClone(state.draft),
+    revision = state.revision,
+    account = state.configAccount;
+  const save = async (config, currentRevision) => {
+    const result = await api('/api/config', { config, revision: currentRevision, account });
+    if (result.account !== undefined && result.account !== account)
+      throw Error('微信账号已变化，请为当前账号重新选择设置。');
+    return result;
+  };
+  try {
+    return await save(draft, revision);
+  } catch (error) {
+    if (error.code !== 'CONFIG_REVISION_CHANGED') throw error;
+  }
+  const latest = await api('/api/config');
+  if (!account || latest.account !== account || state.configAccount !== account)
+    throw Error('微信账号已变化，请为当前账号重新选择设置。');
+  if (state.revision !== revision || JSON.stringify(state.draft) !== JSON.stringify(draft))
+    throw Error('保存过程中草稿有新的修改，请再次保存。');
+  const { config, conflicts } = rebaseConfigDraft(previous, draft, latest.config);
+  if (conflicts.length)
+    throw Error(
+      conflicts.some(field => field === 'wechat.assistant' || field === 'wechat.assistant.administrators')
+        ? '管理员名单已在另一处修改。请先放弃草稿并刷新，再重新确认名单。'
+        : '同一项设置已在另一处修改。请先放弃草稿并刷新，再重新确认该项。',
+    );
+  const result =
+    JSON.stringify(config) === JSON.stringify(latest.config) ? latest : await save(config, latest.revision);
+  return { ...result, rebased: true };
+}
 async function saveAll() {
   if (state.savingAll || roleSaves.size) return;
   const invalid = [...document.querySelectorAll('[data-path], [data-context-key]')].find(
@@ -1223,18 +1285,20 @@ async function saveAll() {
   updateDraftUI();
   try {
     state.desktopApply = undefined;
+    let rebased = false;
     for (const name of [...state.roleDrafts.keys()]) await persistRole(name);
     await replyMediaUI.save();
     if (configDirty()) {
-      const result = await api('/api/config', { config: state.draft, revision: state.revision });
+      const result = await saveConfigDraft();
       state.config = result.config;
       state.draft = structuredClone(result.config);
       state.revision = result.revision;
       state.desktopApply = result.desktopApply;
+      rebased = result.rebased === true;
       syncInputModeControls();
     }
     if (readerDirty()) await persistReader();
-    if (await localModelDrafts.save(api)) await renderPage();
+    if ((await localModelDrafts.save(api)) || rebased) await renderPage();
     updateDraftUI();
     await refreshStatus();
     toast(
@@ -1263,7 +1327,9 @@ function paintJob() {
   $('#job-description').textContent =
     job.state === 'failed'
       ? job.message || '检查下方详细信息，修正配置或完成准备后重试。'
-      : (actions[job.action]?.[1] ?? '');
+      : job.action === 'wechat-open' && job.output?.includes('WECHAT_TRAY_OPEN_REQUIRED')
+        ? '微信已运行。请从 Windows 托盘打开微信窗口。'
+        : (actions[job.action]?.[1] ?? '');
   const output = $('#job-output');
   const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 50;
   output.textContent = job.output || '操作已开始，等待结果…';
@@ -1319,7 +1385,10 @@ async function pollJob() {
           state.config = updated.config;
           state.draft = structuredClone(updated.config);
           state.revision = updated.revision;
+          state.configAccount = updated.account;
           state.names.clear();
+          const names = await api('/api/chats').catch(() => null);
+          for (const chat of names?.chats ?? []) state.names.set(chat.key, chat.name);
           toast('账号已切换。请完整重开 DSH 后启动服务；新账号需要选择自己的允许的聊天。');
         }
         if (state.deployment) {
@@ -1331,7 +1400,14 @@ async function pollJob() {
         await renderPage();
     }
     await refreshStatus();
-    if (state.job?.state === 'succeeded' && !$('#job-panel').hidden) scheduleJobAutoHide();
+    if (state.job?.action === 'wechat-open' && state.job.state === 'succeeded' && state.page === 'setup')
+      await discoverReader(true, { focus: false });
+    if (
+      state.job?.state === 'succeeded' &&
+      !$('#job-panel').hidden &&
+      !state.job.output?.includes('WECHAT_TRAY_OPEN_REQUIRED')
+    )
+      scheduleJobAutoHide();
     if ($('#job-panel').hidden && state.job && !state.job.accountSwitched)
       toast(
         (actions[state.job.action]?.[0] ?? '操作') +
@@ -1357,9 +1433,18 @@ async function runAction(action, conversationKey, revision) {
   }
   if (action === 'reader-connect') return saveReader(true);
   if (action === 'reader-check' && readerDirty()) return saveReader(false);
-  if (hasDraft() && !['reader-check', 'desktop-check'].includes(action)) {
+  const clientChanged = state.draft?.input?.wechatExecutable !== state.config?.input?.wechatExecutable;
+  if (
+    (action === 'wechat-open' && clientChanged) ||
+    (action !== 'wechat-open' && hasDraft() && !['reader-check', 'desktop-check'].includes(action))
+  ) {
     toast('请先保存或放弃草稿，再执行操作。');
     return;
+  }
+  if (action === 'wechat-open' && !state.config?.input?.wechatExecutable) {
+    location.hash = '#setup';
+    if (state.page === 'setup') await discoverReader(true, { focus: false });
+    return toast('请先选用检测到的微信，或手动选择匹配的客户端。');
   }
   const run = async () => {
     try {
@@ -1407,37 +1492,73 @@ async function browse(button) {
     button.disabled = false;
   }
 }
-async function discoverReader(automatic) {
+async function discoverReader(automatic, { focus = true } = {}) {
   if (state.readerScanning || state.readerConnecting || state.job?.state === 'running') return;
+  state.readerDraft ??= { dbPath: state.reader?.dbPath ?? '', myWxid: state.reader?.myWxid ?? '', decryptKey: '' };
+  const query = automatic ? '' : (state.readerSuggestion?.dbPath ?? state.readerDraft.dbPath);
   state.readerScanning = true;
   state.readerError = '';
   paintReaderSetup();
   try {
-    const { accounts } = await api('/api/reader-accounts', { dbPath: automatic ? '' : state.readerDraft.dbPath });
+    const { accounts, candidate } = await api('/api/reader-accounts', { dbPath: query });
+    if (automatic) state.readerCandidate = candidate ?? null;
     state.readerAccounts = accounts;
-    if (accounts.length === 1)
-      Object.assign(state.readerDraft, { dbPath: accounts[0].dbPath, myWxid: accounts[0].myWxid, decryptKey: '' });
-    else {
-      state.readerDraft.myWxid = '';
-      if (accounts.length > 1) state.readerDraft.dbPath = '';
-      else
-        state.readerError =
-          '未找到微信账号目录。请在微信登录并等待同步，再选择文件夹；可在微信“设置 → 存储空间”查看文件保存位置。';
-    }
+    const active = accounts.filter(account => account.active && account.ready);
+    const current = accounts.find(account => account.dbPath === state.readerDraft.dbPath);
+    state.readerSuggestion =
+      (automatic && state.readerDraft.dbPath) || current?.myWxid === state.readerDraft.myWxid
+        ? null
+        : (current ?? (active.length === 1 ? active[0] : accounts.length === 1 ? accounts[0] : null));
+    if (!accounts.length)
+      state.readerError =
+        '未找到微信账号目录。请在微信登录并等待同步，再选择文件夹。可在微信“设置 → 存储空间”查看文件保存位置。';
   } catch (error) {
     state.readerError = error.message;
   } finally {
     state.readerScanning = false;
     await renderPage();
-    $('#reader-account')?.focus();
+    if (focus) $('#reader-account')?.focus();
+  }
+}
+async function useReaderClient() {
+  if (!state.readerCandidate || state.config.input.wechatExecutable || state.savingAll || state.readerScanning) return;
+  const path = state.readerCandidate.path;
+  if (state.draft.input.wechatExecutable !== state.config.input.wechatExecutable)
+    return toast('请先处理手动选择的微信程序，再使用检测结果。');
+  state.savingAll = true;
+  try {
+    const config = structuredClone(state.config);
+    config.input.wechatExecutable = path;
+    const saved = await api('/api/config', { config, revision: state.revision, account: state.configAccount });
+    state.config = saved.config;
+    state.revision = saved.revision;
+    Object.assign(state.draft.input, {
+      wechatExecutable: saved.config.input.wechatExecutable,
+      expectedVersion: saved.config.input.expectedVersion,
+    });
+    state.readerCandidate = null;
+    await renderPage();
+    toast('已选择匹配微信，可以连接当前账号。');
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    state.savingAll = false;
+    updateDraftUI();
   }
 }
 async function saveReader(autoKey = false) {
+  if (!state.config.input.wechatExecutable) return toast('请先使用检测到的微信，或在连接设置中选择并保存微信程序。');
   if (configDirty() || state.roleDrafts.size) {
     toast('请先保存其他设置，再连接微信。');
     return;
   }
   try {
+    if (state.readerSuggestion) {
+      const { dbPath, myWxid } = state.readerSuggestion;
+      Object.assign(state.readerDraft, { dbPath, myWxid });
+      state.readerSuggestion = null;
+    }
+    if (!state.readerDraft?.dbPath || !state.readerDraft.myWxid) throw new Error('请先选择当前登录的微信账号。');
     await persistReader(autoKey);
     updateDraftUI();
     toast('正在连接并验证所选账号，请查看操作记录。');
@@ -1477,7 +1598,7 @@ async function load() {
   const [config, roles, chats, deployment] = await Promise.all([
     api('/api/config'),
     api('/api/roles'),
-    api('/api/chats'),
+    api('/api/chats').catch(() => ({ chats: [] })),
     api('/api/deployment').catch(() => ({ installed: false })),
   ]);
   state.deployment = deployment;
@@ -1486,6 +1607,7 @@ async function load() {
   state.config = config.config;
   state.draft = structuredClone(config.config);
   state.revision = config.revision;
+  state.configAccount = config.account;
   state.roles = roles.roles;
   personaCategoryUI.setData(roles.categories);
   for (const chat of chats.chats) state.names.set(chat.key, chat.name);
@@ -1506,25 +1628,23 @@ async function load() {
     startUpdateUI({ api, toast });
   }
 }
-// 聊天筛选：输入关键词或切换模式时就地筛选已渲染的列表，不重新请求、不丢失输入焦点
-const syncChatFilter = () => {
+// 输入关键词时保留焦点，切换模式时一并刷新所选聊天的详情。
+const syncChatQuery = () => {
   state.chatQuery = $('#chat-search-query')?.value ?? '';
-  state.chatModeFilter = $('#chat-mode-filter')?.value ?? 'all';
   workspaceLayout.applyChatFilter();
 };
 document.addEventListener('submit', event => {
   if (event.target.id === 'chat-filter-form') {
     event.preventDefault();
-    syncChatFilter();
+    syncChatQuery();
   }
 });
 document.addEventListener('input', event => {
-  if (event.target.id === 'chat-search-query' || event.target.id === 'chat-mode-filter') syncChatFilter();
+  if (event.target.id === 'chat-search-query') syncChatQuery();
 });
 document.addEventListener('change', event => {
   if (event.target.id === 'chat-mode-filter') {
     state.chatModeFilter = event.target.value;
-    state.chatQuery = $('#chat-search-query').value;
     renderPage();
   }
 });
@@ -1566,12 +1686,16 @@ document.addEventListener('input', event => {
   if (input.dataset.reader) {
     if (input.id === 'reader-account' && state.readerAccounts?.length) {
       const account = state.readerAccounts.find(a => a.dbPath === input.value);
+      if (state.readerDraft.dbPath !== account?.dbPath) state.readerDraft.decryptKey = '';
+      state.readerSuggestion = null;
       state.readerDraft.myWxid = account?.myWxid || '';
       state.readerDraft.dbPath = account?.dbPath || '';
       if ($('#reader-path')) $('#reader-path').value = state.readerDraft.dbPath;
     } else state.readerDraft[input.dataset.reader] = input.value;
     if (input.id === 'reader-path') {
+      state.readerSuggestion = null;
       state.readerDraft.myWxid = '';
+      state.readerDraft.decryptKey = '';
       state.readerAccounts = [];
       if ($('#reader-account')) $('#reader-account').innerHTML = '<option value="">点击“识别此目录”识别账号</option>';
     }
@@ -1589,6 +1713,7 @@ document.addEventListener('input', event => {
       .filter(Boolean);
   if (input.dataset.transform === 'seconds') value = Math.round(Number(input.value) * 1000);
   if (input.dataset.transform === 'number') value = Number(input.value);
+  if (input.dataset.transform === 'optional-number' && input.value === '') value = undefined;
   setPath(state.draft, input.dataset.path, value);
   if (input.dataset.path === 'runtime.sender') prepareFastInputDraft(state.draft);
   if (input.dataset.path === 'runtime.sender' || input.dataset.path === 'input.typeText') syncInputModeControls();
@@ -1623,9 +1748,8 @@ document.addEventListener('change', event => {
   }
   if (event.target.dataset.proactiveKey) {
     const key = event.target.dataset.proactiveKey;
-    state.draft.wechat.proactive ??= {};
-    state.draft.wechat.proactive.chats ??= {};
-    state.draft.wechat.proactive.chats[key] = event.target.value === 'on';
+    const policy = (state.draft.wechat.proactive ??= {});
+    (policy[proactiveChatField(activeChatWorkMode(state.draft, key))] ??= {})[key] = event.target.value === 'on';
     updateDraftUI();
     return;
   }
@@ -1637,14 +1761,19 @@ document.addEventListener('change', event => {
     updateDraftUI();
   }
 });
-document.addEventListener('click', event => {
+document.addEventListener('click', async event => {
   const button = event.target.closest('button');
   if (!button) return;
   if (
     button.hasAttribute('data-restart-wechat') ||
     (button.id === 'job-recovery' && button.dataset.purpose === 'wechat-restart')
   ) {
-    if (hasDraft()) return toast('请先保存或放弃草稿，再修复微信连接。');
+    if (state.config?.input?.wechatExecutable !== state.draft?.input?.wechatExecutable)
+      return toast('请先保存微信程序路径，再修复微信连接。');
+    if (!state.config?.input?.wechatExecutable) {
+      await discoverReader(true, { focus: false });
+      return toast('请先选择匹配微信，再检查需要重开的进程。');
+    }
     return openProcessRecovery({
       api,
       modal,
@@ -1663,6 +1792,11 @@ document.addEventListener('click', event => {
   if (button.matches('[data-process-recovery]') || button.id === 'job-recovery')
     return openProcessRecovery({ api, modal, refreshStatus, toast });
   if (button.hasAttribute('data-close')) return closeModal();
+  if (button.id === 'resume-input-sending') {
+    setPath(state.draft, 'input.paused', false);
+    updateDraftUI();
+    return;
+  }
   if (button.id === 'configure-voice-cable') return openVoiceCableSettings();
   if (button.dataset.action) return runAction(button.dataset.action, button.dataset.key);
   if (button.dataset.browse) return browse(button);
@@ -1742,6 +1876,8 @@ document.addEventListener('click', event => {
   }
   if (button.id === 'save-reader') return saveReader();
   if (button.id === 'detect-reader') return discoverReader(true);
+  if (button.id === 'check-setup-wechat') return discoverReader(true, { focus: false });
+  if (button.id === 'use-reader-client') return useReaderClient();
   if (button.id === 'scan-reader') return discoverReader(false);
   if (button.id === 'copy-plugin-path') return copyPluginPath(button);
   if (button.id === 'open-plugin-folder') {
@@ -1973,6 +2109,7 @@ $('#refresh-button').addEventListener('click', async () => {
     state.config = config.config;
     state.draft = structuredClone(config.config);
     state.revision = config.revision;
+    state.configAccount = config.account;
     state.roles = roles.roles;
     personaCategoryUI.setData(roles.categories);
     state.reader = null;

@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import { conversationWorkMode } from '../../../../packages/dsh-social-bridge-plugin/conversation-policy.mjs';
 import { replyDeliveryStatus, replySentAt } from '../../../../packages/delivery-contract.mjs';
 import { boundedTask } from '../../../../packages/dsh-social-bridge-plugin/deadline.mjs';
 import { conversationGrant } from '../../../../packages/wechat-identity.mjs';
@@ -97,6 +96,7 @@ export class ProactiveEngine {
     stateFile,
     buffer,
     social,
+    taskContext,
     settingsFor,
     personaFor,
     decide,
@@ -112,6 +112,7 @@ export class ProactiveEngine {
       stateFile,
       buffer,
       social,
+      taskContext,
       settingsFor,
       personaFor,
       decide,
@@ -177,25 +178,37 @@ export class ProactiveEngine {
     fs.renameSync(temp, this.stateFile);
   }
   eligible(key, policy, now) {
-    const rows = this.buffer.recent(key, this.buffer.maxPerChat);
-    const last = rows.at(-1)?.timestamp * 1000 || 0;
     return (
       policy.enabled &&
       withinProactiveWindow(now, policy) &&
       this.social.deliveryControls?.scope(key) !== null &&
-      !this.social.unreadFor(key, 1).length &&
-      !this.buffer.pendingReplies.has(key) &&
-      ![...this.buffer.mediaReplies.values()].some(item => item.key === key && item.observeOnly !== true) &&
-      now - last >= policy.idleMinutes * 60000 &&
-      !declinedProactive(rows) &&
-      rows.at(-1)?.delivery_status !== 'unconfirmed'
+      !this.taskContext?.social.running.has(key) &&
+      [this, this.taskContext].every(context => {
+        if (!context) return true;
+        const { buffer, social } = context;
+        const rows = buffer.recent(key, buffer.maxPerChat);
+        const last = rows.at(-1)?.timestamp * 1000 || 0;
+        return (
+          !social.unreadFor(key, 1).length &&
+          !buffer.pendingReplies.has(key) &&
+          !buffer.pendingRequests?.has(key) &&
+          ![...buffer.mediaReplies.values()].some(item => item.key === key && item.observeOnly !== true) &&
+          now - last >= policy.idleMinutes * 60000 &&
+          !declinedProactive(rows) &&
+          rows.at(-1)?.delivery_status !== 'unconfirmed'
+        );
+      })
     );
+  }
+  #snapshot(key, rows = this.buffer.recent(key, this.buffer.maxPerChat)) {
+    const tasks = this.taskContext?.buffer;
+    return conversationSnapshot(rows, tasks?.recent(key, tasks.maxPerChat));
   }
   #sameContext(key, item, policy, now) {
     return (
       proactivePolicyKey(policy) === item.signature &&
       this.eligible(key, policy, now) &&
-      conversationSnapshot(this.buffer.recent(key, this.buffer.maxPerChat)) === item.job.snapshot
+      this.#snapshot(key) === item.job.snapshot
     );
   }
   #retire(key, item) {
@@ -267,13 +280,13 @@ export class ProactiveEngine {
       );
       for (const [key, item] of Object.entries(this.state.chats)) if (item.job?.dispatching) keys.add(key);
       for (const key of keys) {
-        const policy = proactivePolicy(wechat, key);
+        const policy = proactivePolicy(wechat, key, !!this.taskContext);
         let item = this.state.chats[key];
         const now = this.now(),
           signature = proactivePolicyKey(policy);
         if (this.finishRecorded(key, item)) continue;
         const rosterGrant = conversationGrant(wechat, key);
-        const maySchedule = rosterGrant !== null && conversationWorkMode(wechat, key) !== 'assistant';
+        const maySchedule = rosterGrant !== null;
         const job = item?.job;
         const expired = job && now >= job.expiresAt;
         if (
@@ -369,6 +382,7 @@ export class ProactiveEngine {
       self_id: String(this.selfIdFor() || rows.at(-1)?.self_id || ''),
       sender_id: 'local-scheduler',
       sender_name: '本机主动发言',
+      ...(this.taskContext ? { work_mode: 'assistant', assistant_chat_only: true } : {}),
     };
     if (!message.self_id) return;
     let job = item.job;
@@ -376,11 +390,11 @@ export class ProactiveEngine {
       const mode = policy.mode === 'mixed' ? ['greeting', 'news', 'meme'][item.cycles % 3] : policy.mode;
       const createdAt = this.now();
       job = item.job = {
-        id: hash(key + '\0' + item.nextAt + '\0' + item.cycles),
+        id: hash(key + (this.taskContext ? ':assistant-chat' : '') + '\0' + item.nextAt + '\0' + item.cycles),
         mode,
         createdAt,
         expiresAt: createdAt + draftLifetimeMs,
-        snapshot: conversationSnapshot(rows),
+        snapshot: this.#snapshot(key, rows),
         personaDigest: hash(JSON.stringify([persona.personaName, persona.persona])),
         evaluating: true,
       };
@@ -404,6 +418,9 @@ export class ProactiveEngine {
         images: [],
         batchId: job.id,
         ...connection?.metadata(),
+        ...(this.taskContext
+          ? { workMode: 'assistant', assistantChatOnly: true, scheduledChat: true, rosterGrant }
+          : {}),
         searchOptOut: mode === 'greeting' || !policy.useSearch || search?.status === 'unavailable',
       };
       if (search?.status === 'ready') {
@@ -477,12 +494,11 @@ export class ProactiveEngine {
     }
     const fresh = await this.settingsFor(),
       wechat = fresh.wechat ?? fresh,
-      current = proactivePolicy(wechat, key),
+      current = proactivePolicy(wechat, key, !!this.taskContext),
       livePersona = await this.personaFor(key);
     if (
       signal?.aborted ||
       conversationGrant(wechat, key) !== job.message.readerGrant ||
-      conversationWorkMode(wechat, key) === 'assistant' ||
       this.now() >= job.expiresAt ||
       !this.#sameContext(key, item, current, this.now()) ||
       hash(JSON.stringify([livePersona.personaName, livePersona.persona])) !== job.personaDigest

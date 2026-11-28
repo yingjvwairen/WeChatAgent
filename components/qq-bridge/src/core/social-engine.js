@@ -650,6 +650,7 @@ export class SocialEngine {
     if (this.deliveryControls || mode === 'assistant') {
       const retired = this.buffer.retireInputs(key, row => {
         if (this.deliveryControls && (row.readerGrant ?? 'legacy') !== grant) return 'conversation_grant_changed';
+        if (row.work_mode === 'assistant' && row.readerReplay === 'reply') return 'reader_offline_context';
         if (mode === 'assistant' && row.work_mode === 'assistant' && !this.assistantAllowed(key, row))
           return 'assistant_access_changed';
       });
@@ -675,8 +676,7 @@ export class SocialEngine {
       if (!grant || (message.readerGrant !== undefined && message.readerGrant !== grant)) return;
       if (message.readerGrant === undefined) message = { ...message, readerGrant: grant };
     }
-    if (message.files?.length && (this.workModeFor(key) !== 'assistant' || this.assistantChatOnly)) {
-      if (!this.assistantChatOnly && message.quoteKind !== 'file') return;
+    if (message.files?.length && this.assistantChatOnly) {
       message = { ...message, message_type: 'text', files: [] };
     }
     if (this.buffer.findIncoming(message)) {
@@ -706,9 +706,7 @@ export class SocialEngine {
       );
     if (
       message.readerReplay === 'context' ||
-      (message.readerReplay === 'reply' &&
-        this.workModeFor(key) === 'assistant' &&
-        !['assistant-admin', 'assistant-member'].includes(message.readerRole))
+      (message.readerReplay === 'reply' && this.workModeFor(key) === 'assistant')
     ) {
       archiveReplay();
       return;
@@ -792,10 +790,6 @@ export class SocialEngine {
         ? parseAssistantCommand(message.text, this.wakeWords)
         : null;
     if (command && direct && this.assistantControl && !['new', 'continue'].includes(command.action)) {
-      if (message.readerReplay === 'reply' && command.action === 'cancel' && !command.taskId) {
-        archiveReplay();
-        return;
-      }
       append({ ...message, work_mode: 'assistant', direct_mention: true }, { processed: true });
       const deliveryId = crypto
         .createHash('sha256')
@@ -957,6 +951,7 @@ export class SocialEngine {
       const rows = [];
       let imageCount = 0;
       let promptSize = 0;
+      let hasFiles = false;
       for (const row of savedRequest ? unread.filter(row => savedRequest.rowIds.includes(row.id)) : unread) {
         if (
           workMode === 'assistant' &&
@@ -966,10 +961,18 @@ export class SocialEngine {
             ['new', 'continue'].includes(parseAssistantCommand(row.text, this.wakeWords)?.action))
         )
           break;
+        if (
+          workMode === 'social' &&
+          rows.length &&
+          (hasFiles || row.files?.length) &&
+          verifiedAssistantSender(row) !== verifiedAssistantSender(rows[0])
+        )
+          break;
         if (imageCount + (row.images?.length ?? 0) > 4) break;
         const size = chatLine(row, message.kind === 'group').length + 1;
         if (rows.length && promptSize + size > 12000) break;
         rows.push(row);
+        hasFiles ||= !!row.files?.length;
         imageCount += row.images?.length ?? 0;
         promptSize += size;
       }
@@ -1118,8 +1121,14 @@ export class SocialEngine {
                 lastReplyAt: this.lastReplyAt.get(key),
                 previousReply,
               });
-      const files =
-        workMode === 'assistant' && !this.assistantChatOnly ? contextAttachments(contextRows, 'files', 3) : [];
+      const fileSender = workMode === 'social' ? verifiedAssistantSender(message) : '';
+      const fileRows = fileSender
+        ? contextRows.filter(row => verifiedAssistantSender(row) === fileSender)
+        : workMode === 'assistant' && !this.assistantChatOnly
+          ? contextRows
+          : [];
+      const files = contextAttachments(fileRows, 'files', 3);
+      if (workMode === 'social' && files.length) prompt += '\n[微信文件引用：' + quote(JSON.stringify(files)) + ']';
       prompt += backgroundPrompt(background, imageRefs, files, known);
       const contextNotice = this.buffer.contextNotices.get(key);
       const allowQuote = message.platform === 'wechat';
@@ -1224,7 +1233,9 @@ export class SocialEngine {
                 : {}),
               files,
             }
-          : {}),
+          : fileSender
+            ? { fileSender, rosterGrant: message.readerGrant, files }
+            : {}),
         persona: role,
         personaName: this.personaNameFor(key),
         workMode,

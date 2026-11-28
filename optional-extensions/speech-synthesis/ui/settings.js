@@ -659,13 +659,16 @@ function renderEditor(capability) {
     el('div', { className: 'segmented', role: 'tablist' }, tab('provider', '模型提供商'), tab('custom', '自定义 API')),
     el('small', {
       className: 'hint',
-      textContent: source === 'provider' ? '选择提供商后可设置模型和音色。' : '接入本机服务、自建网关或其他兼容接口。',
+      textContent:
+        source === 'provider' ? '选择本机托管服务或云端提供商。' : '接入已独立运行的本机服务、自建网关或其他兼容接口。',
     }),
   ];
   const basic = [],
     more = [];
   if (source === 'provider') {
-    const available = providersFor(capability);
+    const available = providersFor(capability).filter(
+      item => item.id !== 'wechatagent-local' || info.managedSpeech === true,
+    );
     const select = el(
       'select',
       { id: 'f-service' },
@@ -706,6 +709,18 @@ function renderEditor(capability) {
       if (select.value) chooseMethod(capability, 'custom', select.value);
     });
     basic.push(row('method', '接口协议', select));
+    if (capability === 'fileAsr' && !shown) {
+      const local = el('button', { type: 'button', className: 'link', textContent: '填写本机 Whisper 地址' });
+      local.addEventListener('click', () =>
+        chooseMethod(capability, 'custom', 'transcriptions', {
+          name: '本机 Whisper',
+          endpoint: 'http://127.0.0.1:8000/v1',
+          auth: 'none',
+          model: 'default',
+        }),
+      );
+      basic.push(local);
+    }
   }
   if (entry && !shown)
     basic.push(
@@ -974,7 +989,7 @@ function renderEditor(capability) {
       nodes.push(details);
     }
     if (capability === 'tts') nodes.push($('voice-clone'));
-    const listable = LISTABLE_KINDS.has(definition.kind) || LISTABLE_ENTRIES.has(entry);
+    const listable = !definition.managed && (LISTABLE_KINDS.has(definition.kind) || LISTABLE_ENTRIES.has(entry));
     const test = el('button', {
       type: 'button',
       className: 'primary',

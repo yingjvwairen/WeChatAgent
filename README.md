@@ -118,12 +118,12 @@ Windows 安装包已包含 Node.js、Python、OCR 运行环境和桌面发送组
 
 ## 语音设置
 
-桌面安装器内置“语音识别 API”和“语音对话 API”，两者默认关闭。在“能力 → 能力目录”选择需要的插件，配置服务并授权聊天。
+在“能力 → 语音服务”打开“配置语音与聊天授权”。语音能力默认关闭，设置服务后可用内置样本测试，再授权需要的聊天。
 
-- 使用**语音转文字**时，在语音识别 API 填写服务地址、密钥和模型，允许插件运行后用内置短句测试，再为目标聊天授权语音读取。[识别配置](docs/VOICE_INPUT.md)
-- 使用**语音回复**时，在语音对话 API 配置合成服务，选专用 TTS 或 Realtime 朗读，再试听模型与音色。使用 DSH 回复模式时，由当前聊天模型逐轮选择输出形式。需要转写时，可在插件中选择实时识别或单条识别。同一聊天只授权一个转写插件。[对话、提供商和音色设置](docs/VOICE_OUTPUT.md)
+- **语音转文字**可以使用单条识别或实时识别。已有识别插件设置和特殊请求协议可在同页的兼容入口管理。同一聊天只授权一个转写插件。[识别配置](docs/VOICE_INPUT.md)
+- **语音回复**支持专用 TTS 和 Realtime 朗读。使用 DSH 回复模式时，由当前聊天模型选择每轮回复的形式。[对话、提供商和音色设置](docs/VOICE_OUTPUT.md)
 
-本地转写可使用 Whisper，语音合成可使用 GPT-SoVITS。在连接设置中打开“本地语音服务与模型方案”，保存解释器和模型位置，选择方案并点击“保存并使用”。[配置 Whisper](docs/LOCAL_WHISPER.md) · [配置 GPT-SoVITS](docs/LOCAL_GPT_SOVITS.md)
+在“语音服务”启用本机 Whisper 或 GPT-SoVITS、保存模型路径，然后在语音配置里选择“WeChatAgent 托管服务”。[配置 Whisper](docs/LOCAL_WHISPER.md) · [配置 GPT-SoVITS](docs/LOCAL_GPT_SOVITS.md)
 
 ## 插件安装
 
@@ -134,8 +134,8 @@ Windows 安装包已包含 Node.js、Python、OCR 运行环境和桌面发送组
 
 | 插件 | 下载 ZIP | 使用说明 |
 | --- | --- | --- |
-| 语音对话 API | [speech-synthesis-1.8.2.zip](optional-extensions/packages/speech-synthesis-1.8.2.zip) | [语音合成、实时和单条转写](docs/VOICE_OUTPUT.md) |
-| 语音识别 API | [speech-recognition-1.7.2.zip](optional-extensions/packages/speech-recognition-1.7.2.zip) | [API 配置与语音转写](docs/VOICE_INPUT.md) |
+| 语音对话 API | [speech-synthesis-1.8.3.zip](optional-extensions/packages/speech-synthesis-1.8.3.zip) | [语音合成、实时和单条转写](docs/VOICE_OUTPUT.md) |
+| 语音识别 API（兼容） | [speech-recognition-1.7.2.zip](optional-extensions/packages/speech-recognition-1.7.2.zip) | [自定义请求和现有转写配置](optional-extensions/speech-recognition/README.md) |
 | 鱼的记事本 | [fish-notebook-1.1.1.zip](optional-extensions/packages/fish-notebook-1.1.1.zip) | [记事本插件说明](docs/FISH_NOTEBOOK.md) |
 
 每个 ZIP 都附有同名的 `.sha256` 校验文件，位于同一目录。安装时直接导入 ZIP，无需解压。

@@ -123,16 +123,16 @@ export class FileReceiptHistory {
       throw error;
     }
   }
-  recent(account, key, grant, senders) {
-    if (!senders.length) return [];
-    const scope = 'account=? AND chat=? AND grant_id=? AND sender IN (SELECT value FROM json_each(?))';
+  recent(account, key, grant, mode, senders) {
+    if (grant === null || senders?.length === 0) return [];
+    const scope = `account=? AND chat=? AND grant_id=? AND COALESCE(json_extract(metadata, '$.workMode'), 'assistant')=?${senders ? ' AND sender IN (SELECT value FROM json_each(?))' : ''}`;
     const sql = `SELECT metadata FROM receipts WHERE ${scope} AND (${pendingFile})
       UNION ALL
       SELECT metadata FROM (
         SELECT metadata FROM receipts WHERE ${scope} AND NOT (${pendingFile})
         ORDER BY created DESC,id LIMIT 128
       )`;
-    const bindings = [account, key, grant, JSON.stringify(senders)];
+    const bindings = [account, key, grant, mode, ...(senders ? [JSON.stringify(senders)] : [])];
     const rows = this.access(db => db.prepare(sql).all(...bindings, ...bindings));
     return (rows ?? []).map(row => JSON.parse(row.metadata));
   }

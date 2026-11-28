@@ -491,6 +491,68 @@ test('assistant native tool messages expose only explicit public AI feedback and
   }
 });
 
+test('scheduled assistant chat requires its own opt-in and cannot use the task session', async t => {
+  const f = await fixture(t);
+  const file = path.join(f.dir, 'config/wechatagent.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const peer = 'wxid_fixture',
+    chat = 'wechat:private:' + peer;
+  const wechat = {
+    whitelist: { private: [peer], groups: [] },
+    workModes: { [chat]: 'assistant' },
+    assistant: { administrators: [peer] },
+    dshAccess: { chats: { [chat]: { mode: 'native', skills: [], tools: [] } } },
+    proactive: { enabled: true, chats: { [chat]: true } },
+  };
+  const write = () => fs.writeFileSync(file, JSON.stringify({ wechat }));
+  write();
+  const r = await f.start({ requestSeed: { tools: [{ name: 'pwsh', parameters: {} }] } });
+  const base = { ...info, conversationKey: chat, workMode: 'assistant' };
+  const task = await r.request('/followup', { ...base, assistantSender: peer, message: 'PRIVATE_TASK_CONTEXT' });
+  const scheduled = { ...base, scheduledChat: true, message: '本机定时问候', batchId: '1'.repeat(64) };
+  await r.request('/assistant-chat', scheduled, 403);
+  wechat.proactive.assistantChats = { [chat]: true };
+  write();
+  await r.request('/followup', { ...scheduled, assistantSender: peer }, 403);
+  const reply = await r.request('/assistant-chat', scheduled);
+  assert.notEqual(reply.sessionId, task.sessionId);
+  assert.equal(r.calls.requests.at(-1).tools.length, 0);
+  assert.doesNotMatch(r.calls.model.at(-1), /PRIVATE_TASK_CONTEXT/);
+  wechat.assistant.administrators = [];
+  write();
+  await r.request('/assistant-chat', { ...scheduled, batchId: '2'.repeat(64) }, 403);
+  assert.equal(r.calls.model.length, 2);
+});
+
+test('chat sessions expose WeChat file tools only for the current sender and roster grant', async t => {
+  const f = await fixture(t),
+    sender = 'wxid_fixture',
+    key = 'wechat:private:' + sender,
+    file = path.join(f.dir, 'config/wechatagent.json'),
+    grant = crypto.randomUUID();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      wechat: {
+        whitelist: { private: [sender], groups: [] },
+        rosterGrants: { [key]: grant },
+      },
+    }),
+  );
+  const visibleFileTools = [];
+  const runtime = await f.start({
+    beforeAssistant: agent => visibleFileTools.push(...agent.ctx[Symbol.for('wechatagent.file-transfer.v1')].names()),
+  });
+  const body = { ...info, conversationKey: key, workMode: 'social', fileSender: sender, message: '请回传附件' };
+  await runtime.request('/followup', { ...body, rosterGrant: grant });
+  assert.deepEqual(visibleFileTools, ['wechat_file_receive', 'wechat_file_send', 'wechat_file_status']);
+  visibleFileTools.length = 0;
+  await runtime.request('/followup', { ...body, rosterGrant: 'legacy' });
+  await runtime.request('/followup', { ...body, rosterGrant: grant, fileSender: 'wxid_other' });
+  assert.deepEqual(visibleFileTools, []);
+});
+
 test('group members chat in an isolated tool-free session while admin task sessions remain unchanged', async t => {
   const f = await fixture(t),
     group = 'wechat:group:456@chatroom',

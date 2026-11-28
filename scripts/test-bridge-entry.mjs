@@ -9,7 +9,6 @@ import { fork } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ReplyDeliveryControls } from '../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
-import { reconcileAssistantReplay } from '../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import { HistoryStore } from '../packages/dsh-social-bridge-plugin/history-store.mjs';
 import { readVoiceAttempt } from '../packages/plugin-api/voice-status.mjs';
 
@@ -423,13 +422,19 @@ if (process.argv[2] === '--bridge-entry-fixture') {
         target = admin,
         adminKey = 'wechat:private:' + target;
       const beforeAuthorization = Math.floor(Date.now() / 1000) - 180;
-      const previous = structuredClone(wechat);
       wechat.whitelist.private.push(String(target));
       wechat.workModes = { [adminKey]: 'assistant' };
-      wechat.assistant = { administrators: [admin], replayOffline: true };
-      reconcileAssistantReplay(previous, wechat, beforeAuthorization * 1000);
+      wechat.assistant = {
+        administrators: [admin],
+        replayOffline: true,
+        replayAuthorization: {
+          since: beforeAuthorization + 1,
+          administrators: [admin],
+          chats: { [adminKey]: 'legacy' },
+        },
+      };
       await save();
-      const emitAssistant = (digit, readerRole, timestamp = beforeAuthorization + 60) => {
+      const emitAssistant = (digit, readerRole, { timestamp = beforeAuthorization + 60, live = false } = {}) => {
         const id = digit.repeat(64);
         ws.send(
           JSON.stringify({
@@ -449,7 +454,7 @@ if (process.argv[2] === '--bridge-entry-fixture') {
                 token: 'a'.repeat(64),
                 account: fixturePluginAccount,
                 grant: 'legacy',
-                offlineReplay: 'reply',
+                ...(live ? {} : { offlineReplay: 'reply' }),
                 readerRole,
               },
             },
@@ -459,15 +464,22 @@ if (process.argv[2] === '--bridge-entry-fixture') {
       };
       const before = turns().length;
       await emitAssistant('a', 'assistant-member');
-      await emitAssistant('d', 'assistant-admin', beforeAuthorization);
-      assert.equal(turns().length, before);
+      await emitAssistant('d', 'assistant-admin', { timestamp: beforeAuthorization });
       await emitAssistant('b', 'assistant-admin');
-      await until(() => turns().length === before + 1, 'authorized recovered assistant request');
+      assert.equal(turns().length, before);
+      const assistantHistory = JSON.parse(fs.readFileSync(path.join(root, 'state/messages.json'), 'utf8')).chats[
+        adminKey
+      ];
+      assert.deepEqual(
+        assistantHistory.map(row => [row.readerReplay, row.reply_skip_reason]),
+        [
+          ['context', 'reader_offline_context'],
+          ['context', 'reader_offline_context'],
+        ],
+      );
+      await emitAssistant('c', null, { timestamp: Math.floor(Date.now() / 1000), live: true });
+      await until(() => turns().length === before + 1, 'new assistant request');
       assert.equal(turns().at(-1).body.assistantSender, admin);
-      wechat.assistant.replayOffline = false;
-      await save();
-      await emitAssistant('c', 'assistant-admin');
-      assert.equal(turns().length, before + 1);
 
       const groupTarget = '789@chatroom';
       const groupKey = 'wechat:group:' + groupTarget;

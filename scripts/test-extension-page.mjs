@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import { createExtensionUI } from '../public/console/extensions.js';
-import { builtinCatalog } from './extension-status.mjs';
+import { allowedKeys, builtinCatalog } from './extension-status.mjs';
 
 function fixture(
   t,
@@ -16,13 +16,13 @@ function fixture(
   });
   const config = {
     wechat: {
-      whitelist: { private: ['123'], groups: ['456@chatroom'] },
+      whitelist: { private: ['123', '789'], groups: ['456@chatroom'] },
       search: { enabled: true },
       memeLibrary: { enabled: true },
     },
   };
   const original = JSON.stringify(config),
-    catalog = builtinCatalog(config, 'fixture-revision', true),
+    catalog = { ...builtinCatalog(config, 'fixture-revision', true), allowedChatKeys: allowedKeys(config) },
     requests = [];
   const ui = createExtensionUI({
     api: async route => {
@@ -54,10 +54,11 @@ function assertCards(html, catalog) {
   assert(!html.includes('[object Promise]'), 'the page must contain rendered markup');
   assert.match(html, /href="#extensions\/network"/);
   assert(!html.includes('开关与聊天范围'));
-  assert.equal([...html.matchAll(/extension-card-action /g)].length, catalog.extensions.length);
-  assert.equal([...html.matchAll(/data-extension-card="/g)].length, catalog.extensions.length);
+  assert.equal([...html.matchAll(/class="button extension-card-action/g)].length, catalog.extensions.length + 1);
+  assert.equal([...html.matchAll(/data-extension-card="/g)].length, catalog.extensions.length + 1);
   for (const item of catalog.extensions)
     assert(html.includes('data-extension-card="' + item.id + '"'), 'missing card: ' + item.id);
+  assert(html.includes('data-extension-card="voice-services"'));
   assert.match(html, /id="extension-search"/);
   assert.match(html, /id="extension-status-filter"/);
 }
@@ -99,4 +100,33 @@ test('reopening the extension page still renders the complete catalog', async t 
   const f = fixture(t);
   assertCards(await f.ui.page(), f.catalog);
   assertCards(await f.ui.page(), f.catalog);
+});
+
+test('voice cards point to one settings route even when both speech plugins are installed', async t => {
+  const f = fixture(t);
+  f.catalog.plugins = [
+    { id: 'speech-recognition', enabled: true },
+    { id: 'speech-synthesis', enabled: false },
+  ];
+  const html = await f.ui.page();
+  assert.equal([...html.matchAll(/class="button extension-card-action" href="#extensions\/voice"/g)].length, 1);
+  assert.doesNotMatch(html, /data-plugin-card="speech-(synthesis|recognition)"/);
+});
+
+test('voice card counts each currently allowed chat once across the enabled speech plugins', async t => {
+  const f = fixture(t);
+  const privateKey = 'wechat:private:123';
+  const groupKey = 'wechat:group:456@chatroom';
+  const readCard = async () =>
+    (await f.ui.page()).match(/data-extension-card="voice-services"[\s\S]*?<\/article>/u)?.[0];
+  f.catalog.plugins = [
+    { id: 'speech-synthesis', enabled: true, chats: [privateKey, 'wechat:private:999'] },
+    { id: 'speech-recognition', enabled: true, chats: [privateKey, groupKey] },
+  ];
+  assert.match(await readCard(), /2 \/ 3 个聊天开启/);
+  f.catalog.plugins[1].chats = null;
+  assert.match(await readCard(), /3 \/ 3 个聊天开启/);
+  f.catalog.plugins[0].enabled = false;
+  f.catalog.plugins[1].invalid = true;
+  assert.match(await readCard(), /0 \/ 3 个聊天开启/);
 });

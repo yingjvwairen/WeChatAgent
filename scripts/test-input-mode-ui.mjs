@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import { requiresRestart } from '../public/console/layout-model.mjs';
 import { bindLocalModelSettings } from '../public/console/local-model-settings.mjs';
 import { createLocalModelDrafts } from '../public/console/local-model-schema.mjs';
+import { rebaseConfigDraft } from '../public/console/conversation-settings.mjs';
 
 const source = fs.readFileSync(new URL('../public/console/console.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const named = name => {
@@ -29,10 +30,9 @@ function fixture(input = { controlMode: 'ocr', typeText: false }, sender = 'wech
     status: {},
   };
   const elements = new Map(
-    ['switch-input-uia', 'switch-input-typeText', 'input-typeText-help', 'switch-input-offscreen'].map(id => [
-      id,
-      { id, checked: false, disabled: false, textContent: '', hidden: false },
-    ]),
+    ['switch-input-uia', 'switch-input-typeText', 'input-mode-ocr', 'input-mode-uia', 'switch-input-offscreen'].map(
+      id => [id, { id, checked: false, disabled: false, textContent: '', hidden: false }],
+    ),
   );
   const calls = [],
     errors = [],
@@ -50,10 +50,12 @@ function fixture(input = { controlMode: 'ocr', typeText: false }, sender = 'wech
     roleSaves: new Map(),
     document: { addEventListener: (kind, handler) => listeners.push(handler), querySelectorAll: () => [] },
     updateDraftUI() {},
+    renderPage: async () => {},
     refreshStatus: async () => {},
     toast() {},
     showError: message => errors.push(message),
     localModelDrafts: createLocalModelDrafts(),
+    rebaseConfigDraft,
     replyMediaUI: { save: async () => {} },
     readerDirty: () => false,
     persistReader: async () => {},
@@ -72,6 +74,7 @@ function fixture(input = { controlMode: 'ocr', typeText: false }, sender = 'wech
       named('inputModeControls'),
       named('syncInputModeControls'),
       'const configDirty=()=>JSON.stringify(state.config)!==JSON.stringify(state.draft);',
+      named('saveConfigDraft'),
       named('saveAll'),
       source.slice(start, end),
       'globalThis.ui={render:inputModeControls,sync:syncInputModeControls,save:saveAll};',
@@ -91,10 +94,14 @@ test('one strategy switch selects UIA or OCR without a legacy sender or fast set
   assert.equal(f.state.draft.runtime.sender, 'wechat-ui');
   assert.equal(f.elements.get('switch-input-typeText').disabled, true);
   assert.equal(f.elements.get('switch-input-typeText').checked, true);
+  assert.equal(f.elements.get('input-mode-ocr').hidden, true);
+  assert.equal(f.elements.get('input-mode-uia').hidden, false);
   f.input({ id: 'switch-input-uia', checked: false, dataset: {} });
   assert.equal(f.state.draft.input.controlMode, 'ocr');
   assert.equal(Object.hasOwn(f.state.draft.input, 'fast'), false);
   assert.equal(f.elements.get('switch-input-typeText').disabled, false);
+  assert.equal(f.elements.get('input-mode-ocr').hidden, false);
+  assert.equal(f.elements.get('input-mode-uia').hidden, true);
   assert.equal(f.state.draft.input.typeText, true);
 });
 
@@ -120,8 +127,8 @@ test('offscreen is only selectable with UIA and returning to OCR restores visibl
   assert.equal(f.state.draft.input.typeText, true);
 });
 
-test('save and reload preserve the string mode and disabled typing preference', async () => {
-  const f = fixture({ typeText: true });
+test('save and reload preserve the typing preference and legacy sender overrides', async () => {
+  const f = fixture({ typeText: true, paused: true });
   f.input({ id: 'switch-input-uia', checked: true, dataset: {} });
   await f.ui.save();
   assert.equal(f.errors.length, 0);
@@ -132,6 +139,8 @@ test('save and reload preserve the string mode and disabled typing preference', 
   assert.equal(saved.input.controlMode, 'uia');
   assert.equal(Object.hasOwn(saved.input, 'fast'), false);
   assert.equal(saved.input.typeText, true);
+  assert.equal(saved.input.paused, true);
+  assert.equal(saved.input.python, 'D:/fixture/python.exe');
   const reloaded = fixture(saved.input, saved.runtime.sender);
   assert.equal(reloaded.elements.get('switch-input-uia').checked, true);
   assert.equal(reloaded.elements.get('switch-input-typeText').disabled, true);
@@ -151,17 +160,57 @@ test('a failed save leaves mode changes and the saved typing preference availabl
   assert.deepEqual(f.errors, ['fixture conflict']);
 });
 
-test('rendering describes mixed UIA operation and example defaults select OCR fast without offering removed backends', () => {
+for (const change of ['same grant', 'unrelated field', 'same field', 'account']) {
+  test('a stale administrator save uses the current revision only for compatible changes: ' + change, async () => {
+    const f = fixture();
+    f.state.configAccount = 'fixture-account';
+    f.state.config.wechat = { assistant: { administrators: [] } };
+    f.state.draft.wechat = { assistant: { administrators: ['wxid_selected'] } };
+    const latest = structuredClone(f.state.config);
+    latest.input.sendKey = 'ctrl-enter';
+    if (change === 'same grant') latest.wechat.assistant.administrators = ['wxid_selected'];
+    if (change === 'same field') latest.wechat.assistant.administrators = ['wxid_other'];
+    const writes = [];
+    f.context.api = async (_route, body) => {
+      if (!body)
+        return { account: change === 'account' ? 'new-account' : 'fixture-account', revision: 'r2', config: latest };
+      writes.push(structuredClone(body));
+      if (writes.length === 1)
+        throw Object.assign(Error('fixture stale revision'), { code: 'CONFIG_REVISION_CHANGED' });
+      return { account: 'fixture-account', revision: 'r3', config: body.config };
+    };
+    await f.ui.save();
+    assert.equal(writes[0].account, 'fixture-account');
+    if (change === 'same field' || change === 'account') {
+      assert.equal(writes.length, 1);
+      assert.match(f.errors[0], change === 'same field' ? /管理员名单/ : /微信账号/);
+      assert.deepEqual(f.state.draft.wechat.assistant.administrators, ['wxid_selected']);
+      assert.equal(f.state.revision, 'r1');
+    } else {
+      assert.deepEqual(f.errors, []);
+      assert.equal(writes.length, change === 'same grant' ? 1 : 2);
+      if (writes[1]) assert.equal(writes[1].revision, 'r2');
+      assert.equal(f.state.config.input.sendKey, 'ctrl-enter');
+      assert.deepEqual(f.state.config.wechat.assistant.administrators, ['wxid_selected']);
+    }
+  });
+}
+
+test('sending preferences explain the user-facing choices and default to OCR', () => {
   const f = fixture(),
     before = JSON.stringify(f.state.draft),
     html = f.ui.render();
   assert.equal(JSON.stringify(f.state.draft), before);
-  assert.match(html, /UIA 快速模式/);
-  assert.match(html, /现有独立组件/);
-  assert.match(html, /语音、引用等流程仍可能识图/);
-  assert.match(html, /仍会短暂借用前台/);
+  assert.match(html, /使用控件定位（UIA）/);
+  assert.match(html, /关闭后使用屏幕识别（OCR）。/);
+  assert.match(html, /文字逐字输入/);
+  assert.match(html, /微信离屏/);
+  assert.match(html, /aria-controls="input-mode-ocr input-mode-uia"/);
+  assert.match(html, /id="input-mode-ocr"\s*>/);
+  assert.match(html, /id="input-mode-uia" hidden>/);
+  assert.match(fixture({ controlMode: 'uia' }).ui.render(), /id="input-mode-ocr" hidden>/);
   assert.doesNotMatch(html, /需重启/);
-  assert.match(html, /微信进程内的一字节无障碍标志（0→1）/);
+  assert.doesNotMatch(html, /进程内|0→1|操作结果|快速发送链路/);
   assert.doesNotMatch(html, /data-path="input.fast"/);
   assert.doesNotMatch(source, /wechat-hook|wechat-helper|helperVoice|hook\.wechatExecutable|data-path="input\.fast"/);
   const example = JSON.parse(fs.readFileSync(new URL('../config/wechatagent.example.json', import.meta.url), 'utf8'));

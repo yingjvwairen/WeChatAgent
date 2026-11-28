@@ -1,4 +1,6 @@
 import { pluginCard } from './plugins.js';
+import { LEGACY_RECOGNIZER, VOICE_PLUGIN } from './local-model-settings.mjs';
+const VOICE_CATALOG_ID = 'voice-services';
 export function createExtensionMarket({ api, modal, toast, escapeHtml: esc, icon }) {
   let query = '',
     category = 'all',
@@ -24,7 +26,8 @@ export function createExtensionMarket({ api, modal, toast, escapeHtml: esc, icon
         : ['native-search', 'native-web-reader'].includes(item.id)
           ? 'network'
           : 'chat';
-  const installed = item => !item.requiresInstall || memeStatus.available === true;
+  const installed = item =>
+    item.id === VOICE_CATALOG_ID ? item.installed : !item.requiresInstall || memeStatus.available === true;
   const shown = () =>
     items.filter(
       item =>
@@ -32,7 +35,9 @@ export function createExtensionMarket({ api, modal, toast, escapeHtml: esc, icon
         (filter === 'all' ||
           (filter === 'installed' && installed(item)) ||
           (filter === 'enabled' &&
-            (item.management === 'wechatagent' ? item.enabled : item.featureState?.effectiveCount > 0)) ||
+            (item.management === 'wechatagent' && !item.featureState
+              ? item.enabled
+              : item.featureState?.effectiveCount > 0)) ||
           (filter === 'disabled' && !item.enabled)) &&
         [item.name, item.description, item.author, item.id]
           .join(' ')
@@ -40,7 +45,8 @@ export function createExtensionMarket({ api, modal, toast, escapeHtml: esc, icon
           .includes(query.toLowerCase().trim()),
     );
   function card(item) {
-    if (item.management === 'wechatagent') return pluginCard(item, esc, icon);
+    const voice = item.id === VOICE_CATALOG_ID;
+    if (item.management === 'wechatagent' && !voice) return pluginCard(item, esc, icon);
     const ready = installed(item),
       effective = item.featureState?.effectiveCount ?? 0,
       total = item.featureState?.totalCount ?? 0;
@@ -54,7 +60,14 @@ export function createExtensionMarket({ api, modal, toast, escapeHtml: esc, icon
         : item.statusLabel;
     const tone = item.requiresInstall && !ready ? 'warn' : item.statusTone;
     const repository = item.repository ?? 'https://github.com/sourcepro5/WeChatAgent';
-    return `<article class="extension-tile" data-extension-card="${esc(item.id)}"><div class="extension-tile-top"><div class="extension-tile-heading"><h2><button class="extension-title" data-extension="${esc(item.id)}">${esc(item.name)}</button></h2><a class="extension-source-link" href="${esc(repository)}" target="_blank" rel="noopener noreferrer" aria-label="查看 ${esc(item.name)} 项目">${icon('arrow')}</a></div><button class="button extension-card-action ${item.requiresInstall && !ready ? 'primary' : ''}" ${item.requiresInstall && !ready ? 'data-meme-guide' : `data-extension="${esc(item.id)}"`}>${item.requiresInstall && !ready ? '安装教程' : '配置'}</button></div><p class="extension-byline">${icon(item.requiresInstall ? 'plug' : 'shield')}<span>${esc(item.author ?? 'WeChatAgent')} · ${item.requiresInstall ? 'DSH 原版插件' : '内置能力'}</span></p><p class="extension-card-state"><span class="status-tag ${esc(tone ?? '')}">${esc(label ?? '已关闭')}</span><span>${effective} / ${total} 个聊天${item.requiresInstall && !ready ? '已配置' : '开启'}</span></p><p class="extension-card-description">${esc(item.description)}</p><div class="extension-card-tags"><span>${groups.find(([id]) => id === group(item))?.[1] ?? '功能'}</span><span>${item.requiresInstall ? '需在 DSH 安装' : '项目内置'}</span></div>${item.requiresInstall ? '<footer class="extension-card-footer"><button class="text-link" data-meme-guide>安装说明</button></footer>' : ''}</article>`;
+    const title = voice
+      ? `<a class="extension-title" href="#extensions/voice">${esc(item.name)}</a>`
+      : `<button class="extension-title" data-extension="${esc(item.id)}">${esc(item.name)}</button>`;
+    const action = voice
+      ? '<a class="button extension-card-action" href="#extensions/voice">配置</a>'
+      : `<button class="button extension-card-action ${item.requiresInstall && !ready ? 'primary' : ''}" ${item.requiresInstall && !ready ? 'data-meme-guide' : `data-extension="${esc(item.id)}"`}>${item.requiresInstall && !ready ? '安装教程' : '配置'}</button>`;
+    const scope = `${effective} / ${total} 个聊天${item.requiresInstall && !ready ? '已配置' : '开启'}`;
+    return `<article class="extension-tile" data-extension-card="${esc(item.id)}"><div class="extension-tile-top"><div class="extension-tile-heading"><h2>${title}</h2><a class="extension-source-link" href="${esc(repository)}" target="_blank" rel="noopener noreferrer" aria-label="查看 ${esc(item.name)} 项目">${icon('arrow')}</a></div>${action}</div><p class="extension-byline">${icon(item.requiresInstall ? 'plug' : 'shield')}<span>${esc(item.author ?? 'WeChatAgent')} · ${item.requiresInstall ? 'DSH 原版插件' : '内置能力'}</span></p><p class="extension-card-state"><span class="status-tag ${esc(tone ?? '')}">${esc(label ?? '已关闭')}</span><span>${scope}</span></p><p class="extension-card-description">${esc(item.description)}</p><div class="extension-card-tags"><span>${groups.find(([id]) => id === group(item))?.[1] ?? '功能'}</span><span>${item.requiresInstall ? '需在 DSH 安装' : '项目内置'}</span></div>${item.requiresInstall ? '<footer class="extension-card-footer"><button class="text-link" data-meme-guide>安装说明</button></footer>' : ''}</article>`;
   }
   function paint() {
     const grid = document.querySelector('#extension-grid');
@@ -67,7 +80,29 @@ export function createExtensionMarket({ api, modal, toast, escapeHtml: esc, icon
       .forEach(button => button.setAttribute('aria-pressed', String(button.dataset.extensionCategory === category)));
   }
   async function page(catalog, overview) {
-    items = [...(catalog.plugins ?? []), ...catalog.extensions];
+    const plugins = catalog.plugins ?? [];
+    const voice = plugins.filter(item => [VOICE_PLUGIN, LEGACY_RECOGNIZER].includes(item.id));
+    const enabledVoice = voice.filter(item => item.enabled && !item.invalid);
+    const status = enabledVoice.find(item => item.statusTone === 'ok') ?? enabledVoice[0] ?? voice[0];
+    const allowed = catalog.allowedChatKeys ?? [];
+    const effectiveCount = allowed.filter(key =>
+      enabledVoice.some(item => item.chats === null || item.chats?.includes(key)),
+    ).length;
+    items = [
+      {
+        id: VOICE_CATALOG_ID,
+        management: 'wechatagent',
+        name: '语音服务',
+        description: '配置语音识别、语音合成、聊天授权和本机模型。',
+        enabled: enabledVoice.length > 0,
+        installed: voice.length > 0,
+        statusLabel: status?.statusLabel ?? (status?.invalid ? '无法读取' : '待安装'),
+        statusTone: status?.statusTone ?? (status?.invalid ? 'error' : 'warning'),
+        featureState: { effectiveCount, totalCount: allowed.length },
+      },
+      ...plugins.filter(item => ![VOICE_PLUGIN, LEGACY_RECOGNIZER].includes(item.id)),
+      ...catalog.extensions,
+    ];
     runtimeConnected = !!catalog.runtimeConnected;
     try {
       memeStatus = await api('/api/meme-library-status');

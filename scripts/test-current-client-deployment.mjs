@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import deployment from '../apps/console-desktop/deployment.cjs';
+import { BUNDLED_PLUGINS } from '../packages/plugin-api/bundled.mjs';
 import { desktopManifest, seedDesktopPayloads } from './test-fixtures/desktop-deployment.mjs';
 import { archivePlugin, configuration, pluginCatalog } from '../packages/plugin-api/catalog.mjs';
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -91,13 +92,13 @@ test('wrong client manifests and corrupted native executables are rejected', asy
   f.write('desktop-native/WechatQtActions.exe', 'changed');
   await assert.rejects(deployment.bootstrapDeployment(f.resources, f.home), /校验失败/);
 });
-test('both preinstalled voice plugins are builtin and disabled until configured', async t => {
+test('fresh installs offer one voice plugin and upgrades preserve the old independent recognizer', async t => {
   const f = fixture(t),
     id = 'speech-recognition',
-    dialogue = 'speech-synthesis';
-  f.manifest.builtinPlugins = [id, dialogue];
+    dialogue = BUNDLED_PLUGINS.find(item => item.id === 'speech-synthesis');
+  f.manifest.builtinPlugins = BUNDLED_PLUGINS.filter(item => item.builtin).map(item => item.id);
   const files = Object.fromEntries(
-    f.manifest.builtinPlugins.flatMap(plugin =>
+    [id, dialogue.id].flatMap(plugin =>
       ['plugin.json', 'index.mjs'].map(relative => {
         const file = 'optional-extensions/' + plugin + '/' + relative;
         return [file, fs.readFileSync(file)];
@@ -119,14 +120,11 @@ test('both preinstalled voice plugins are builtin and disabled until configured'
       permissions,
       chats,
     })),
-    [
-      { id, version: '1.7.2', builtin: true, enabled: false, permissions: [], chats: [] },
-      { id: dialogue, version: '1.8.2', builtin: true, enabled: false, permissions: [], chats: [] },
-    ],
+    [{ id: dialogue.id, version: dialogue.version, builtin: true, enabled: false, permissions: [], chats: [] }],
   );
   assert.equal(fs.existsSync(path.join(fresh.root, 'config/plugins.json')), false);
-  assert.throws(() => archivePlugin(fresh.root, id, configuration(fresh.root).revision), /内置/);
-  assert.throws(() => archivePlugin(fresh.root, dialogue, configuration(fresh.root).revision), /内置/);
+  assert.equal(fs.existsSync(path.join(fresh.root, 'plugins', id)), false);
+  assert.throws(() => archivePlugin(fresh.root, dialogue.id, configuration(fresh.root).revision), /内置/);
   const priorHome = path.join(f.home, 'upgrade'),
     priorRoot = path.join(priorHome, 'workspace'),
     priorPlugin = path.join(priorRoot, 'plugins', id);
@@ -135,6 +133,7 @@ test('both preinstalled voice plugins are builtin and disabled until configured'
   fs.writeFileSync(path.join(priorPlugin, 'plugin.json'), JSON.stringify(oldPackage));
   fs.writeFileSync(path.join(priorPlugin, 'index.mjs'), '// existing plugin');
   fs.mkdirSync(path.join(priorRoot, 'config'));
+  fs.writeFileSync(path.join(priorRoot, 'config/distribution.json'), JSON.stringify({ builtinPlugins: [id] }));
   const existingSettings = {
     version: 1,
     plugins: {
@@ -154,7 +153,7 @@ test('both preinstalled voice plugins are builtin and disabled until configured'
     pluginCatalog(priorRoot).plugins.map(({ id, version, builtin, enabled }) => ({ id, version, builtin, enabled })),
     [
       { id, version: '1.5.0', builtin: false, enabled: true },
-      { id: dialogue, version: '1.8.2', builtin: true, enabled: false },
+      { id: dialogue.id, version: dialogue.version, builtin: true, enabled: false },
     ],
   );
 });

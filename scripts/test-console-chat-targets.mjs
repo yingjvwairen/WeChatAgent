@@ -8,7 +8,7 @@ import { chatSettingsSnapshot } from '../public/console/conversation-settings.mj
 import { createChatTargetsApi } from './console-chat-targets.mjs';
 import { mergeTargetSave } from '../public/console/chat-targets.js';
 import { conversationGrant, reconcileRosterGrants } from '../packages/wechat-identity.mjs';
-import { withoutLiveSettings, requiresRestart } from '../public/console/layout-model.mjs';
+import { chatRows, filterChats, withoutLiveSettings, requiresRestart } from '../public/console/layout-model.mjs';
 
 const peer = 'fixture-friend',
   peerId = peer,
@@ -51,7 +51,7 @@ function fixture() {
   return { api, calls, setAccount: value => (account = value) };
 }
 
-async function chatSettingsFixture(t, { holdSessionCheck = false } = {}) {
+async function chatSettingsFixture(t, { holdSessionCheck = false, initialMode = 'assistant', readNames } = {}) {
   const temporary = fs.realpathSync(os.tmpdir());
   const root = fs.mkdtempSync(path.join(temporary, 'console-chat-mode-'));
   const chat = 'fixture@chatroom';
@@ -59,8 +59,8 @@ async function chatSettingsFixture(t, { holdSessionCheck = false } = {}) {
   const account = 'a'.repeat(64);
   const configFile = path.join(root, 'config/wechatagent.json');
   const config = JSON.parse(fs.readFileSync(new URL('../config/wechatagent.example.json', import.meta.url), 'utf8'));
-  config.wechat.whitelist = { private: [], groups: [chat] };
-  config.wechat.workModes = { [key]: 'assistant' };
+  config.wechat.whitelist = { private: [peerId], groups: [chat] };
+  if (initialMode !== 'social') config.wechat.workModes = { [key]: initialMode };
   const write = (file, value) => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(value));
@@ -84,6 +84,7 @@ async function chatSettingsFixture(t, { holdSessionCheck = false } = {}) {
   const app = createConsole({
     root,
     port: 0,
+    ...(readNames ? { readLocalContacts: (_root, _python, query) => readNames(query, account) } : {}),
     async fetchImpl(url) {
       const route = new URL(url).pathname;
       calls.push(route);
@@ -109,20 +110,102 @@ async function chatSettingsFixture(t, { holdSessionCheck = false } = {}) {
   const { token } = await fetch(base + '/api/info').then(response => response.json());
   const headers = { 'X-Console-Token': token, 'Content-Type': 'application/json' };
   const saved = await fetch(base + '/api/chat-targets', { headers }).then(response => response.json());
-  const change = () =>
-    fetch(base + '/api/chat-settings', {
+  const change = (mode = 'social', overrides = {}, from = saved) => {
+    const { settings, access } = chatSettingsSnapshot(from.config, key, mode);
+    return fetch(base + '/api/chat-settings', {
       method: 'POST',
       headers,
       body: JSON.stringify({
         key,
-        account: saved.account,
-        revision: saved.revision,
-        ...chatSettingsSnapshot(saved.config, key, 'social'),
+        account,
+        revision: from.revision,
+        settings: { ...settings, ...overrides },
+        access,
       }),
     });
+  };
   const currentMode = () => JSON.parse(fs.readFileSync(configFile, 'utf8')).wechat.workModes?.[key] ?? 'social';
-  return { key, change, entered, resume, calls, currentMode, setAccount, writeBuffer };
+  const readConfig = () => fetch(base + '/api/config', { headers }).then(response => response.json());
+  const saveConfig = body => fetch(base + '/api/config', { method: 'POST', headers, body: JSON.stringify(body) });
+  const readChats = () => fetch(base + '/api/chats', { headers }).then(response => response.json());
+  return {
+    key,
+    change,
+    entered,
+    resume,
+    calls,
+    currentMode,
+    setAccount,
+    writeBuffer,
+    readConfig,
+    saveConfig,
+    readChats,
+  };
 }
+
+test('settings distinguish a stale revision from a changed WeChat account', async t => {
+  const f = await chatSettingsFixture(t);
+  const original = await f.readConfig();
+  assert.equal(original.account, 'a'.repeat(64));
+  const stale = await f.saveConfig({ ...original, revision: 'old-revision' });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).code, 'CONFIG_REVISION_CHANGED');
+  f.setAccount('b'.repeat(64));
+  const current = await f.readConfig();
+  assert.equal(current.revision, original.revision);
+  assert.notEqual(current.account, original.account);
+  const rejected = await f.saveConfig(original);
+  assert.equal(rejected.status, 409);
+  assert.match((await rejected.json()).error, /微信账号已变化/);
+  assert.deepEqual(await f.readConfig(), current);
+});
+
+test('saving settings clears retired assistant replay fields and keeps the administrator list', async t => {
+  const f = await chatSettingsFixture(t);
+  const original = await f.readConfig();
+  const config = structuredClone(original.config);
+  config.wechat.assistant = {
+    administrators: [peerId],
+    replayOffline: true,
+    replayAuthorization: { since: 1, administrators: [peerId], chats: { [f.key]: 'legacy' } },
+  };
+  const saved = await f.saveConfig({ account: original.account, revision: original.revision, config });
+  assert.equal(saved.status, 200);
+  assert.deepEqual((await f.readConfig()).config.wechat.assistant, { administrators: [peerId] });
+});
+
+test('the selected contact catalog names a friend even before the first buffered message', async t => {
+  const f = await chatSettingsFixture(t, {
+    readNames: async (query, account) => {
+      assert.deepEqual(query, { namesFor: [peerId, 'fixture@chatroom'] });
+      return {
+        account,
+        contacts: [
+          { username: peerId, displayName: '好友备注' },
+          { username: 'not-selected', displayName: '未选好友' },
+        ],
+      };
+    },
+  });
+  assert.deepEqual((await f.readChats()).chats, [{ key: `wechat:private:${peerId}`, name: '好友备注', lastAt: 0 }]);
+  f.setAccount('b'.repeat(64));
+  assert.deepEqual((await f.readChats()).chats, []);
+});
+
+test('saving assistant proactive chat keeps the independent social selection across mode changes', async t => {
+  const f = await chatSettingsFixture(t, { initialMode: 'social' });
+  assert.equal((await f.change('social', { proactive: true })).status, 200);
+  const social = await f.readConfig();
+  assert.equal(chatSettingsSnapshot(social.config, f.key, 'assistant').settings.proactive, false);
+  assert.equal((await f.change('assistant', { proactive: true }, social)).status, 200);
+  const assistant = await f.readConfig();
+  assert.equal(assistant.config.wechat.proactive.assistantChats[f.key], true);
+  assert.equal(assistant.config.wechat.proactive.chats[f.key], true);
+  assert.equal((await f.change('social', { proactive: false }, assistant)).status, 200);
+  const switched = await f.readConfig();
+  assert.equal(switched.config.wechat.proactive.chats[f.key], false);
+  assert.equal(chatSettingsSnapshot(switched.config, f.key, 'assistant').settings.proactive, true);
+});
 
 for (const lane of ['main', 'member']) {
   test('the console checks pending chat work again after the DSH session probe, lane=' + lane, async t => {
@@ -178,6 +261,31 @@ test('read-only receipts can remain while changing the chat mode', async t => {
   assert.equal(saved.modeReady, true);
   assert.equal(f.currentMode(), 'social');
   assert.deepEqual(f.calls, ['/health', '/sessions', '/health', '/configure']);
+});
+
+test('chat filters follow the mode saved for the current roster even before DSH sessions update', async t => {
+  const f = await chatSettingsFixture(t, { initialMode: 'social' });
+  const previous = await f.readConfig();
+  assert.deepEqual(filterChats(chatRows(previous.config), { mode: 'assistant' }), []);
+  const response = await f.change('assistant');
+  const saved = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(saved));
+  assert.equal(f.currentMode(), 'assistant');
+  const refreshed = await f.readConfig();
+  assert.equal(refreshed.revision, saved.revision);
+  const rows = chatRows(refreshed.config, new Map(), [
+    { conversationKey: f.key, workMode: 'social' },
+    { conversationKey: peerKey, workMode: 'assistant' },
+  ]);
+  assert.deepEqual(
+    filterChats(rows, { mode: 'assistant' }).map(row => row.key),
+    [f.key],
+  );
+  assert.deepEqual(
+    filterChats(rows, { mode: 'social' }).map(row => row.key),
+    [peerKey],
+  );
+  assert.equal(filterChats(rows, { mode: 'all' }).length, 2);
 });
 
 test('one immediate target save combines friends and groups without changing unrelated settings', async () => {

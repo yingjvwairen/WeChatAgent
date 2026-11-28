@@ -4,7 +4,9 @@ const escape = value =>
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
   );
 export const needsWeChatRestart = output =>
-  /\b(?:DESKTOP_NOT_READY|DESKTOP_WINDOW_NOT_READY)\b/.test(String(output ?? ''));
+  /\b(?:DESKTOP_NOT_READY|DESKTOP_WINDOW_NOT_READY|DESKTOP_ACCOUNT_UNVERIFIED|READER_SETUP_CLEANUP_UNCONFIRMED)\b/.test(
+    String(output ?? ''),
+  );
 const detail = item =>
   `<strong>${escape(item.name)} <span class="subtle">PID ${Number(item.pid)}</span></strong><span>${escape(item.reason)}</span><code>${escape(item.path || '无法确认程序路径')}</code>`;
 

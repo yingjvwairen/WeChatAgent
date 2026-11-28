@@ -165,7 +165,12 @@ test('the rendered send check and the selected-client restart use the current co
 
   const probes = [],
     stops = [],
-    commands = [];
+    commands = [],
+    discovery = [];
+  const savedPath = path.join(root, 'previous-account');
+  const readerFile = path.join(root, 'state/weflow/WeFlow-config.json');
+  fs.mkdirSync(path.dirname(readerFile), { recursive: true });
+  fs.writeFileSync(readerFile, JSON.stringify({ dbPath: savedPath, decryptKey: 'test-only-secret' }));
   const client = { ...item, pid: 444, name: 'Weixin.exe', path: selected, ports: [] };
   const app = createConsole({
     root,
@@ -176,8 +181,13 @@ test('the rendered send check and the selected-client restart use the current co
     },
     processProbe: async input => {
       probes.push(input);
-      return { items: [item, client] };
+      return { items: [item, client, { ...client, path: path.join(root, 'other', 'Weixin.exe'), canStop: false }] };
     },
+    readerSetup: async ({ request }) => {
+      discovery.push(request);
+      return { ok: true, accounts: [] };
+    },
+    wechatClientInspector: async ({ executable }) => ({ path: executable, version: '4.2.0.53' }),
     processStop: async request => {
       stops.push(request);
       return { stopped: request.items.map(row => row.pid) };
@@ -259,11 +269,27 @@ test('the rendered send check and the selected-client restart use the current co
   assert.equal((await request('/api/process-recovery?purpose=retired')).status, 400);
   settings.input.wechatExecutable = '';
   fs.writeFileSync(file, JSON.stringify(settings));
+  const { data: found } = await request('/api/reader-accounts', { dbPath: '' });
+  assert.equal(found.candidate.path, selected);
+  assert.deepEqual(probes.at(-1).ports, []);
+  assert.deepEqual(discovery.at(-1), {
+    operation: 'discover',
+    dbPath: '',
+    wechatExecutable: selected,
+    savedAccountPath: savedPath,
+  });
+  const { data: manual } = await request('/api/reader-accounts', { dbPath: savedPath });
+  assert.equal(manual.candidate, undefined);
+  assert.equal(discovery.at(-1).wechatExecutable, undefined);
+  assert.equal(discovery.at(-1).dbPath, savedPath);
+  assert.equal(stops.length, 1);
+  assert.equal(commands.length, 2);
   assert.equal((await request('/api/process-recovery?purpose=wechat-restart')).status, 409);
   const { data: general } = await request('/api/process-recovery');
   assert.equal(general.purpose, 'ports');
   assert.equal(probes.at(-1).matchingWeChatOnly, false);
   assert.equal(needsWeChatRestart('Desktop sender check failed: DESKTOP_WINDOW_NOT_READY'), true);
+  assert.equal(needsWeChatRestart('READER_SETUP_CLEANUP_UNCONFIRMED'), true);
   assert.equal(needsWeChatRestart('READER_NOT_LISTENING'), false);
 });
 

@@ -31,6 +31,7 @@ import {
   ASSISTANT_ACCESS,
   assistantSenderAllowed,
   assistantGroupChatAllowed,
+  scheduledAssistantChatAllowed,
   assistantControlAllowed,
 } from './assistant-policy.mjs';
 import { conversationAccess, conversationWorkMode, allowedConversation } from './conversation-policy.mjs';
@@ -261,17 +262,17 @@ export function apply(ctx, config = {}) {
   const loadedAccount = activeReaderAccount(root);
   const accountReady = () => activeReaderAccount(root).id === loadedAccount.id;
   const liveWechat = () => JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat;
-  const chatInputAllowed = (key, sender, rosterGrant) => {
+  const chatInputAllowed = (key, sender, rosterGrant, scheduled = false) => {
     const wechat = liveWechat();
     return (
       matchesConversationGrant(wechat, key, rosterGrant) &&
       conversationWorkMode(wechat, key) === 'assistant' &&
-      assistantGroupChatAllowed(wechat, key, sender ?? '')
+      (scheduled ? scheduledAssistantChatAllowed(wechat, key) : assistantGroupChatAllowed(wechat, key, sender ?? ''))
     );
   };
-  const acceptsInput = (key, sender, rosterGrant) => {
+  const acceptsInput = (key, sender, rosterGrant, scheduled = false) => {
     if (!accountReady()) return false;
-    if (internalGroupChat) return chatInputAllowed(key, sender, rosterGrant);
+    if (internalGroupChat) return chatInputAllowed(key, sender, rosterGrant, scheduled);
     const wechat = liveWechat();
     return matchesConversationGrant(wechat, key, rosterGrant) && assistantSenderAllowed(wechat, key, sender);
   };
@@ -1142,7 +1143,7 @@ export function apply(ctx, config = {}) {
     retireTurnContext(session, createUserMessage);
     const previous = profiles[key] ?? {};
     const instructions = internalGroupChat
-        ? assistantChatInstructionsFor(root, body.replyMaxMessages)
+        ? assistantChatInstructionsFor(root, body.replyMaxMessages, key.startsWith('wechat:private:'))
         : stableChatInstructions(root, key, { maxMessages: body.replyMaxMessages }),
       instructionsDigest = hash(instructions);
     profiles[key] = {
@@ -1181,8 +1182,13 @@ export function apply(ctx, config = {}) {
     retireSearchContext(session);
     const title = sessionTitle(
       key,
-      (internalGroupChat ? '群友聊天 · ' : profiles[key].workMode === 'assistant' ? '助手 · ' : '') +
-        profiles[key].conversationName,
+      (internalGroupChat
+        ? key.startsWith('wechat:group:')
+          ? '群友聊天 · '
+          : '助手聊天 · '
+        : profiles[key].workMode === 'assistant'
+          ? '助手 · '
+          : '') + profiles[key].conversationName,
       profiles[key].personaName,
     );
     const titles = typeof ctx.get === 'function' ? ctx.get('sessionTitle') : ctx.sessionTitle;
@@ -1940,9 +1946,9 @@ export function apply(ctx, config = {}) {
     return serialize(key, async () => {
       requestController.signal.throwIfAborted();
       if (route === '/context-maintenance') return maintainContext(key, body);
-      if (route === '/followup' && readWorkMode(root, key) === 'assistant') {
-        const w = JSON.parse(fs.readFileSync(path.join(root, 'config/wechatagent.json'), 'utf8')).wechat;
-        if (!acceptsInput(key, body.assistantSender, body.rosterGrant)) throw Error('ASSISTANT_SENDER_DENIED');
+      if (route === '/followup' && (internalGroupChat || readWorkMode(root, key) === 'assistant')) {
+        if (!acceptsInput(key, body.assistantSender, body.rosterGrant, body.scheduledChat === true))
+          throw Error('ASSISTANT_SENDER_DENIED');
       }
       const repairing = route === '/repair-context';
       let repairBackup;
@@ -2177,7 +2183,9 @@ export function apply(ctx, config = {}) {
           rosterGrant: body.rosterGrant,
           fileTurn: {
             controller: webReaderTurn.controller,
-            sender: body.assistantSender,
+            sender: profiles[key].workMode === 'assistant' ? body.assistantSender : body.fileSender,
+            workMode: profiles[key].workMode ?? 'social',
+            rosterGrant: body.rosterGrant ?? 'legacy',
             batchId,
             files: Array.isArray(body.files) ? body.files.filter(validFileReference).slice(0, 3) : [],
             calls: 0,
@@ -2253,7 +2261,10 @@ export function apply(ctx, config = {}) {
           return;
         }
         try {
-          if (readWorkMode(root, key) === 'assistant' && !acceptsInput(key, body.assistantSender, body.rosterGrant))
+          if (
+            (internalGroupChat || readWorkMode(root, key) === 'assistant') &&
+            !acceptsInput(key, body.assistantSender, body.rosterGrant, body.scheduledChat === true)
+          )
             throw Error('ASSISTANT_SENDER_DENIED');
           agent.followup(
             createUserMessage({
@@ -2352,7 +2363,15 @@ export function apply(ctx, config = {}) {
         webReaderTurn,
         modelSearchTurn,
         dshAccessTurn: { controller: webReaderTurn.controller, skillCalls: 0, toolCalls: 0 },
-        fileTurn: { controller: webReaderTurn.controller, sender: owner.sender, batchId, files: [], calls: 0 },
+        fileTurn: {
+          controller: webReaderTurn.controller,
+          sender: owner.sender,
+          workMode: 'assistant',
+          rosterGrant: owner.rosterGrant ?? 'legacy',
+          batchId,
+          files: [],
+          calls: 0,
+        },
         memeTurn: { controller: webReaderTurn.controller, calls: 0, choices: [], allowedUrls: webReaderTurn.urls },
         memberMemoryTurn: memberMemory.openTurn(key, [], webReaderTurn.controller),
         extensionTurn: {
@@ -2939,8 +2958,10 @@ export function apply(ctx, config = {}) {
       )
         return reply(400, { error: 'invalid_request' });
       let output;
+      if (body.scheduledChat !== undefined && (req.url !== '/assistant-chat' || body.scheduledChat !== true))
+        throw taskFault('ASSISTANT_SENDER_DENIED', 403);
       if (req.url === '/assistant-chat') {
-        if (!chatInputAllowed(key, body.assistantSender, body.rosterGrant))
+        if (!chatInputAllowed(key, body.assistantSender, body.rosterGrant, body.scheduledChat === true))
           throw taskFault('ASSISTANT_SENDER_DENIED', 403);
         if (body.files?.length || body.assistantTaskId || body.assistantParentId)
           throw taskFault('ASSISTANT_ADMIN_REQUIRED', 403);

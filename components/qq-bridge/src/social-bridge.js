@@ -22,7 +22,7 @@ import { ProactiveEngine } from './core/proactive-engine.js';
 import { ContextMaintenance } from './core/context-maintenance.js';
 import { HistoryStore } from '../../../packages/dsh-social-bridge-plugin/history-store.mjs';
 import { historyScopeKey, scopeHistory } from '../../../packages/dsh-social-bridge-plugin/work-modes.mjs';
-import { activeReaderAccount } from '../../../scripts/reader-account-state.mjs';
+import { activeReaderAccount, assistantChatBufferFile } from '../../../scripts/reader-account-state.mjs';
 import { ReplyDeliveryControls } from '../../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -80,7 +80,6 @@ import {
   assistantSenderAllowed,
   assistantGroupChatAllowed,
   verifiedAssistantSender,
-  assistantReplayAllowed,
 } from '../../../packages/dsh-social-bridge-plugin/assistant-policy.mjs';
 import {
   conversationGrant,
@@ -209,15 +208,11 @@ const memberArchive = {
     return memberHistory.append(...args);
   },
 };
-const memberBuffer = new MessageBuffer(
-  path.join(
-    historyRoot,
-    'state/accounts',
-    historyAccount.id || historyAccount.legacyId || 'legacy',
-    'assistant-group-chat.json',
-  ),
-  { maxPerChat: buffer.maxPerChat, archive: memberArchive, readerAccount: historyAccount.id },
-);
+const memberBuffer = new MessageBuffer(assistantChatBufferFile(historyRoot, historyAccount), {
+  maxPerChat: buffer.maxPerChat,
+  archive: memberArchive,
+  readerAccount: historyAccount.id,
+});
 const memberConnection = new DshConnectionGuard({
   buffer: memberBuffer,
   probe: () => plugin.connectionHealth({ projectRoot: historyRoot, accountScope: historyAccount.id }),
@@ -230,10 +225,8 @@ const memberEngine = engine.createGroupChat({
     conversationWorkMode(memberSettings(), key) === 'assistant' &&
     assistantGroupChatAllowed(memberSettings(), key, verifiedAssistantSender(message)),
 });
-const proactive = new ProactiveEngine({
-  stateFile: path.resolve(config.proactive_state_file ?? path.join(root, 'state/proactive/state.json')),
-  buffer,
-  social: engine,
+const proactiveState = path.resolve(config.proactive_state_file ?? path.join(root, 'state/proactive/state.json'));
+const proactiveOptions = {
   settingsFor: () =>
     config.proactive_policy_file
       ? JSON.parse(fs.readFileSync(config.proactive_policy_file, 'utf8').replace(/^\uFEFF/, ''))
@@ -250,6 +243,15 @@ const proactive = new ProactiveEngine({
   isReady: () => connection.ready && adapter.stats.connected && !!adapter.selfId,
   selfIdFor: () => adapter.selfId,
   log,
+};
+const proactive = new ProactiveEngine({ ...proactiveOptions, stateFile: proactiveState, buffer, social: engine });
+const assistantProactive = new ProactiveEngine({
+  ...proactiveOptions,
+  stateFile: proactiveState + '.assistant-chat.json',
+  buffer: memberBuffer,
+  social: memberEngine,
+  taskContext: { buffer, social: engine },
+  isReady: () => proactiveOptions.isReady() && memberConnection.ready,
 });
 const contextMaintenance = new ContextMaintenance({
   buffer,
@@ -262,7 +264,7 @@ const contextMaintenance = new ContextMaintenance({
     boundedTask(signal => plugin.maintainContext(key, version, { signal, ...connection.metadata() }), {
       signal: connection.signal,
     }),
-  proactivePending: key => !!proactive.state.chats[key]?.job,
+  proactivePending: key => !!(proactive.state.chats[key]?.job || assistantProactive.state.chats[key]?.job),
   isReady: () => connection.ready && adapter.stats.connected && !!adapter.selfId,
   log,
 });
@@ -338,8 +340,7 @@ function applyReplayPolicy(message, key, live) {
     : 'social';
   // Never move an event recorded in one role into another role's history.
   if (message.readerRole && message.readerRole !== currentRole) return false;
-  if (assistant && (!message.readerRole || !assistantReplayAllowed(live, key, message.timestamp)))
-    message.readerReplay = 'context';
+  if (assistant) message.readerReplay = 'context';
   return true;
 }
 
@@ -384,10 +385,7 @@ async function routeIncoming(message) {
     if (memberLane) memberEngine.receive({ ...message, assistant_chat_only: true }, { deferArchive: true });
     else engine.receive(message, { deferArchive: true });
     if ((memberLane ? memberBuffer : buffer).confirmBuffered(message)) return true;
-    if (
-      (message.files?.length && engine.workModeFor(key) !== 'assistant') ||
-      (message.kind === 'private' && engine.workModeFor(key) === 'assistant' && !engine.assistantAllowed(key, message))
-    )
+    if (message.kind === 'private' && engine.workModeFor(key) === 'assistant' && !engine.assistantAllowed(key, message))
       return true;
     return false;
   } catch (error) {
@@ -441,8 +439,12 @@ const noticeDelivery = createAssistantNoticeDelivery({
   log,
 });
 const assistantNoticeTimer = setInterval(() => void noticeDelivery.tick(), 5000);
-const proactiveTimer = setInterval(() => void proactive.tick(), 60000);
-void proactive.tick();
+const tickProactive = () => {
+  void proactive.tick();
+  void assistantProactive.tick();
+};
+const proactiveTimer = setInterval(tickProactive, 60000);
+tickProactive();
 const contextTimer = setInterval(() => void contextMaintenance.tick(), 30000);
 void contextMaintenance.tick();
 const stop = async () => {

@@ -37,10 +37,7 @@ export function desktopMediaAllowed(root, config, job, forInput = true) {
     if (job.localReference) {
       const catalog = new ReplyMediaCatalog({ root });
       if (job.localReference.id !== job.sha256 || job.localReference.sha256 !== job.sha256) return false;
-      if (!forInput) {
-        const { enabled, items } = catalog.snapshot();
-        return enabled && items.some(item => item.id === job.sha256);
-      }
+      if (!forInput) return catalog.snapshot().items.some(item => item.id === job.sha256);
       const asset = catalog.resolve(job.localReference.id);
       return asset.md5 === job.md5 && path.resolve(asset.path).toLowerCase() === path.resolve(job.path).toLowerCase();
     }

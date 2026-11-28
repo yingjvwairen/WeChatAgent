@@ -85,6 +85,26 @@ export function createProcessRecovery({
       for (const [id, value] of map) if (value.expiresAt <= now()) map.delete(id);
   };
   return {
+    async runningWeChatPaths() {
+      const result = await probe({
+        root,
+        ports: [],
+        wechatExecutable: '',
+        protectedPids: [process.pid],
+        matchingWeChatOnly: false,
+      });
+      const paths = new Map();
+      for (const item of Array.isArray(result) ? result : (result.items ?? [])) {
+        if (
+          item.canStop !== true ||
+          !path.isAbsolute(item.path ?? '') ||
+          path.basename(item.path).toLowerCase() !== 'weixin.exe'
+        )
+          continue;
+        paths.set(path.normalize(item.path).toLowerCase(), item.path);
+      }
+      return [...paths.values()];
+    },
     async scan(config, revision, { healthyPorts = [], purpose = 'ports' } = {}) {
       prune();
       const restart = purpose === 'wechat-restart';

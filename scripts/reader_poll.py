@@ -116,7 +116,9 @@ def poll_chat(reader, talker, now, wechat, scan, read_heads, source_shards):
             late = message.get('lateArrival') is True and message['createTime'] < max(baseline, now - RESCAN_SECONDS)
             if late:
                 payload['contextOnly'] = True
-            payload['readerRole'] = reader.replay_role(talker, payload, wechat)
+            payload['readerRole'] = (
+                None if wechat.get('workModes', {}).get(chat_key(talker)) == 'assistant' else 'social'
+            )
             admission = reader.intake.capture(
                 payload,
                 grant,
