@@ -9,6 +9,7 @@ from wechat_files import FILE_TYPE, FileCatalog, file_policy, parse_file_message
 
 KEY, SENDER = 'wechat:group:123', 'wxid_fixture'
 
+
 class Files(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -17,7 +18,13 @@ class Files(unittest.TestCase):
         self.account = self.root / 'account'
         (self.account / 'msg/file/2026-10').mkdir(parents=True)
         (self.root / 'config').mkdir()
-        self.config = {'wechat': {'whitelist': {'groups': ['123'], 'private': []}, 'workModes': {KEY: 'assistant'}, 'assistant': {'administrators': [SENDER], 'fileTransferChats': {KEY: True}}}}
+        self.config = {
+            'wechat': {
+                'whitelist': {'groups': ['123'], 'private': []},
+                'workModes': {KEY: 'assistant'},
+                'assistant': {'administrators': [SENDER], 'fileTransferChats': {KEY: True}},
+            }
+        }
         self.save()
         self.catalog = FileCatalog(self.root, self.account)
 
@@ -28,13 +35,21 @@ class Files(unittest.TestCase):
         return {'name': '报告.txt', 'size': len(data), 'md5': hashlib.md5(data).hexdigest()}
 
     def remember(self, info=None):
-        return self.catalog.remember({'rawid': 'a' * 64, 'talkerId': SENDER, 'timestamp': int(time.time()), 'file': info or self.info()}, KEY)
+        return self.catalog.remember(
+            {'rawid': 'a' * 64, 'talkerId': SENDER, 'timestamp': int(time.time()), 'file': info or self.info()}, KEY
+        )
 
     def test_file_xml_types_are_verified_and_nested_cards_are_not_current_files(self):
-        xml = '<msg><appmsg><title>报告.txt</title><type>6</type><appattach><totallen>10</totallen><md5>' + 'b' * 32 + '</md5></appattach></appmsg></msg>'
+        xml = (
+            '<msg><appmsg><title>报告.txt</title><type>6</type><appattach><totallen>10</totallen><md5>'
+            + 'b' * 32
+            + '</md5></appattach></appmsg></msg>'
+        )
         for kind in (49, FILE_TYPE):
             self.assertEqual(parse_file_message(kind, xml)['name'], '报告.txt')
-        self.assertIsNone(parse_file_message(49, '<msg><appmsg><type>19</type><recorditem>' + xml + '</recorditem></appmsg></msg>'))
+        self.assertIsNone(
+            parse_file_message(49, '<msg><appmsg><type>19</type><recorditem>' + xml + '</recorditem></appmsg></msg>')
+        )
         self.assertIsNone(parse_file_message(47, xml))
         for name in ('../x', 'a:b.txt', 'CON.txt', 'x.', 'x\u202eexe'):
             self.assertIsNone(parse_file_message(FILE_TYPE, xml.replace('报告.txt', name)))
@@ -68,22 +83,27 @@ class Files(unittest.TestCase):
         (self.account / 'msg/file/2026-10/报告.txt').write_bytes(b'wrong data')
         self.remember()
         self.assertEqual(self.catalog.resolve('a' * 64, KEY, SENDER)['status'], 'integrity_failed')
-        info = self.info();info['md5'] = ''
+        info = self.info()
+        info['md5'] = ''
         self.remember(info)
-        folder = self.account / 'msg/file/other';folder.mkdir()
+        folder = self.account / 'msg/file/other'
+        folder.mkdir()
         (folder / '报告.txt').write_bytes(b'wrong data')
         self.assertEqual(self.catalog.resolve('a' * 64, KEY, SENDER)['status'], 'ambiguous')
 
     def test_group_open_mode_does_not_open_private_or_unselected_chats(self):
-        w = self.config['wechat'];w['assistant']['adminOnlyGroups'] = {KEY: False}
+        w = self.config['wechat']
+        w['assistant']['adminOnlyGroups'] = {KEY: False}
         self.assertTrue(file_policy(self.config, KEY, 'wxid_other'))
         self.assertFalse(file_policy(self.config, 'wechat:private:123', 'wxid_other'))
         self.assertFalse(file_policy(self.config, 'wechat:group:999', SENDER))
 
     def test_account_change_and_cache_junctions_fail_closed(self):
-        self.remember();self.catalog.active = lambda: False
+        self.remember()
+        self.catalog.active = lambda: False
         with self.assertRaises(PermissionError):
             self.catalog.resolve('a' * 64, KEY, SENDER)
+
 
 if __name__ == '__main__':
     unittest.main()

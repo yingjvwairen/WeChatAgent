@@ -1,4 +1,5 @@
 """Account-scoped group identities. Display names never identify new groups."""
+
 import contextlib
 import hashlib
 import json
@@ -38,13 +39,24 @@ class GroupBindings:
         try:
             data = json.loads(self.file.read_text(encoding='utf-8'))
             records = data['groups']
-            if data['version'] != 1 or data['scope'] != self.scope or not isinstance(records, dict) or len(records) > 10000:
+            if (
+                data['version'] != 1
+                or data['scope'] != self.scope
+                or not isinstance(records, dict)
+                or len(records) > 10000
+            ):
                 raise ValueError()
             ids = set()
             for username, item in records.items():
                 if not group_username(username) or not numeric_id(item['id']) or item['id'] in ids:
                     raise ValueError()
-                if not isinstance(item['name'], str) or len(item['name']) > 500 or not isinstance(item['aliases'], list) or len(item['aliases']) > 12 or any(not isinstance(a, str) or len(a) > 500 for a in item['aliases']):
+                if (
+                    not isinstance(item['name'], str)
+                    or len(item['name']) > 500
+                    or not isinstance(item['aliases'], list)
+                    or len(item['aliases']) > 12
+                    or any(not isinstance(a, str) or len(a) > 500 for a in item['aliases'])
+                ):
                     raise ValueError()
                 ids.add(item['id'])
             return records
@@ -58,22 +70,25 @@ class GroupBindings:
             with self.file.with_suffix('.lock').open('a+b') as handle:
                 handle.seek(0, 2)
                 if handle.tell() == 0:
-                    handle.write(b'0'); handle.flush()
+                    handle.write(b'0')
+                    handle.flush()
                 until = time.monotonic() + 2
                 while True:
                     try:
                         handle.seek(0)
                         if os.name == 'nt':
                             import msvcrt
+
                             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                         else:
                             import fcntl
+
                             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except OSError:
                         if time.monotonic() >= until:
                             raise RuntimeError('GROUP_BINDINGS_BUSY') from None
-                        time.sleep(.01)
+                        time.sleep(0.01)
                 try:
                     self.records = self._read()
                     yield
@@ -86,7 +101,7 @@ class GroupBindings:
 
     def _save(self):
         text = json.dumps({'version': 1, 'scope': self.scope, 'groups': self.records}, ensure_ascii=False)
-        if len(text.encode('utf-8')) > 8*1024*1024:
+        if len(text.encode('utf-8')) > 8 * 1024 * 1024:
             raise RuntimeError('GROUP_BINDINGS_LIMIT')
         temporary = self.file.with_suffix('.' + str(os.getpid()) + '.tmp')
         temporary.write_text(text, encoding='utf-8')
@@ -144,7 +159,13 @@ class GroupBindings:
         return None
 
     def bind(self, username, identity, allowed, observed):
-        if self.readonly or not group_username(username) or not numeric_id(identity) or identity not in map(str, allowed) or username not in observed:
+        if (
+            self.readonly
+            or not group_username(username)
+            or not numeric_id(identity)
+            or identity not in map(str, allowed)
+            or username not in observed
+        ):
             raise RuntimeError('GROUP_BINDING_NOT_ALLOWED')
         with self.transaction():
             current = self.records.get(username)

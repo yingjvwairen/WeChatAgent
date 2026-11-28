@@ -8,9 +8,21 @@ export function validateContextSettings(settings) {
   if (settings === undefined) return;
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw Error('context settings invalid');
   if (settings.enabled !== undefined && typeof settings.enabled !== 'boolean') throw Error('context enabled invalid');
-  if (settings.maxTokens !== undefined && !validLimit(settings.maxTokens)) throw Error('context maxTokens must be 4000–2000000');
-  if (settings.idleSeconds !== undefined && (!Number.isSafeInteger(settings.idleSeconds) || settings.idleSeconds < 15 || settings.idleSeconds > 3600)) throw Error('context idleSeconds must be 15–3600');
-  if (settings.chats !== undefined && (!settings.chats || typeof settings.chats !== 'object' || Array.isArray(settings.chats) || Object.entries(settings.chats).some(([key, value]) => !chatKey.test(key) || value !== 0 && !validLimit(value)))) throw Error('context chat override invalid');
+  if (settings.maxTokens !== undefined && !validLimit(settings.maxTokens))
+    throw Error('context maxTokens must be 4000–2000000');
+  if (
+    settings.idleSeconds !== undefined &&
+    (!Number.isSafeInteger(settings.idleSeconds) || settings.idleSeconds < 15 || settings.idleSeconds > 3600)
+  )
+    throw Error('context idleSeconds must be 15–3600');
+  if (
+    settings.chats !== undefined &&
+    (!settings.chats ||
+      typeof settings.chats !== 'object' ||
+      Array.isArray(settings.chats) ||
+      Object.entries(settings.chats).some(([key, value]) => !chatKey.test(key) || (value !== 0 && !validLimit(value))))
+  )
+    throw Error('context chat override invalid');
 }
 
 export function contextPolicy(wechat, key) {
@@ -18,8 +30,14 @@ export function contextPolicy(wechat, key) {
   validateContextSettings(settings);
   const limit = settings.chats?.[key] ?? settings.maxTokens ?? CONTEXT_DEFAULTS.maxTokens;
   const match = chatKey.exec(key);
-  const allowed = match && (wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(key.split(':')[2]);
-  return { enabled: !!allowed && settings.enabled === true && limit !== 0, maxTokens: limit, idleSeconds: settings.idleSeconds ?? CONTEXT_DEFAULTS.idleSeconds };
+  const allowed =
+    match &&
+    (wechat.whitelist?.[match[1] === 'group' ? 'groups' : 'private'] ?? []).map(String).includes(key.split(':')[2]);
+  return {
+    enabled: !!allowed && settings.enabled === true && limit !== 0,
+    maxTokens: limit,
+    idleSeconds: settings.idleSeconds ?? CONTEXT_DEFAULTS.idleSeconds,
+  };
 }
 
 export const contextBufferVersion = rows => crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex');

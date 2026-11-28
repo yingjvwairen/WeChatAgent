@@ -11,17 +11,22 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 async function freePort() {
   const server = net.createServer();
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
-  await new Promise((resolve) => server.close(resolve));
+  await new Promise(resolve => server.close(resolve));
   return port;
 }
 function waitFor(check, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const timer = setInterval(() => {
-      if (check()) { clearInterval(timer); resolve(check()); }
-      else if (Date.now() - started > timeoutMs) { clearInterval(timer); reject(new Error('timed out')); }
+      if (check()) {
+        clearInterval(timer);
+        resolve(check());
+      } else if (Date.now() - started > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error('timed out'));
+      }
     }, 10);
   });
 }
@@ -34,53 +39,112 @@ test('OneBot group batch reaches plugin and only RESPOND sends a OneBot action',
   let answer = 'SILENT';
   const plugin = http.createServer(async (req, res) => {
     assert.equal(req.headers.authorization, `Bearer ${token}`);
-    if(req.method==='GET'&&req.url==='/health'){
-      res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,project:'WeChatAgent',projectRoot:dir,contextMode:'native-session-v1',instanceId:'fixture-instance',searchBudget:'per-turn-count-v1',searchReasoning:'model-default-v1'}));return;
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          project: 'WeChatAgent',
+          projectRoot: dir,
+          contextMode: 'native-session-v1',
+          instanceId: 'fixture-instance',
+          searchBudget: 'per-turn-count-v1',
+          searchReasoning: 'model-default-v1',
+        }),
+      );
+      return;
     }
-    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
     prompts.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ text: answer }));
   });
-  await new Promise((resolve) => plugin.listen(0, '127.0.0.1', resolve));
+  await new Promise(resolve => plugin.listen(0, '127.0.0.1', resolve));
   const config = {
     project_root: dir,
-    platforms: { wechat: { enabled: true, whitelist: { groups: ['123'], private: ['42'] },
-      onebot: { server: { port, path: '/ws' } }, wake_mode: 'hybrid', wake_words: ['@小助手'] } },
+    platforms: {
+      wechat: {
+        enabled: true,
+        whitelist: { groups: ['123'], private: ['42'] },
+        onebot: { server: { port, path: '/ws' } },
+        wake_mode: 'hybrid',
+        wake_words: ['@小助手'],
+      },
+    },
     dsh_plugin: { url: `http://127.0.0.1:${plugin.address().port}`, timeoutMs: 3000 },
-    message_buffer: { path: path.join(dir, 'messages.json') }, social: { batch_ms: 30 }, role: '普通群友',
+    message_buffer: { path: path.join(dir, 'messages.json') },
+    social: { batch_ms: 30 },
+    role: '普通群友',
   };
   const configPath = path.join(dir, 'config.json');
-  fs.mkdirSync(path.join(dir,'config'));
-  fs.writeFileSync(path.join(dir,'config/wechatagent.json'),JSON.stringify({wechat:{...config.platforms.wechat,search:{enabled:false},stickers:{enabled:false}}}));
+  fs.mkdirSync(path.join(dir, 'config'));
+  fs.writeFileSync(
+    path.join(dir, 'config/wechatagent.json'),
+    JSON.stringify({
+      wechat: { ...config.platforms.wechat, search: { enabled: false }, stickers: { enabled: false } },
+    }),
+  );
   fs.writeFileSync(configPath, JSON.stringify(config));
   const child = spawn(process.execPath, ['src/social-bridge.js', configPath], {
-    cwd: root, env: { ...process.env, SOCIAL_DSH_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    cwd: root,
+    env: { ...process.env, SOCIAL_DSH_TOKEN: token },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
   });
   let output = '';
-  child.stdout.on('data', (chunk) => { output += chunk; });
-  child.stderr.on('data', (chunk) => { output += chunk; });
+  child.stdout.on('data', chunk => {
+    output += chunk;
+  });
+  child.stderr.on('data', chunk => {
+    output += chunk;
+  });
   let ws;
   try {
     await waitFor(() => output.includes('reverse OneBot listening'));
     ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-    await new Promise((resolve, reject) => { ws.addEventListener('open', resolve, { once: true }); ws.addEventListener('error', reject, { once: true }); });
+    await new Promise((resolve, reject) => {
+      ws.addEventListener('open', resolve, { once: true });
+      ws.addEventListener('error', reject, { once: true });
+    });
     const actions = [];
-    ws.addEventListener('message', (event) => {
+    ws.addEventListener('message', event => {
       const action = JSON.parse(event.data);
-      if(action.action==='get_sticker_list'){
-        ws.send(JSON.stringify({echo:action.echo,status:'ok',retcode:0,data:{enabled:false,stickers:[]}}));return;
+      if (action.action === 'get_sticker_list') {
+        ws.send(
+          JSON.stringify({ echo: action.echo, status: 'ok', retcode: 0, data: { enabled: false, stickers: [] } }),
+        );
+        return;
       }
       // Capability query before each turn: this fixture backend cannot send voice.
-      if(action.action==='get_voice_capability'){
-        ws.send(JSON.stringify({echo:action.echo,status:'ok',retcode:0,data:{voice:false}}));return;
+      if (action.action === 'get_voice_capability') {
+        ws.send(JSON.stringify({ echo: action.echo, status: 'ok', retcode: 0, data: { voice: false } }));
+        return;
       }
       actions.push(action);
-      ws.send(JSON.stringify({ echo: action.echo, status: 'ok', retcode: 0, data: { message_id: 42, receipt: 'wechat-server-id' } }));
+      ws.send(
+        JSON.stringify({
+          echo: action.echo,
+          status: 'ok',
+          retcode: 0,
+          data: { message_id: 42, receipt: 'wechat-server-id' },
+        }),
+      );
     });
-    const sendEvent = (groupId, value) => ws.send(JSON.stringify({ post_type: 'message', message_type: 'group',
-      self_id: 99, user_id: 42, group_id: groupId, group_name: '实验群', time: Date.now() / 1000,
-      sender: { user_id: 42, nickname: '张三' }, message: [{ type: 'text', data: { text: value } }] }));
+    const sendEvent = (groupId, value) =>
+      ws.send(
+        JSON.stringify({
+          post_type: 'message',
+          message_type: 'group',
+          self_id: 99,
+          user_id: 42,
+          group_id: groupId,
+          group_name: '实验群',
+          time: Date.now() / 1000,
+          sender: { user_id: 42, nickname: '张三' },
+          message: [{ type: 'text', data: { text: value } }],
+        }),
+      );
     sendEvent(999, '不在白名单');
     sendEvent(123, '今天训练怎么样');
     sendEvent(123, '跑到 0.42');
@@ -95,18 +159,28 @@ test('OneBot group batch reaches plugin and only RESPOND sends a OneBot action',
     assert.equal(actions[0].params.group_id, 123);
     assert.equal(actions[0].params.message[0].data.text, '可以再跑一轮看看');
     assert.equal(prompts.length, 2);
-    ws.send(JSON.stringify({ post_type: 'message', message_type: 'private',
-      self_id: 99, user_id: 42, time: Date.now() / 1000,
-      sender: { user_id: 42, nickname: '柔石激化' },
-      message: [{ type: 'text', data: { text: '你好' } }] }));
+    ws.send(
+      JSON.stringify({
+        post_type: 'message',
+        message_type: 'private',
+        self_id: 99,
+        user_id: 42,
+        time: Date.now() / 1000,
+        sender: { user_id: 42, nickname: '柔石激化' },
+        message: [{ type: 'text', data: { text: '你好' } }],
+      }),
+    );
     await waitFor(() => actions.length === 2);
     assert.equal(actions[1].action, 'send_private_msg');
     assert.equal(actions[1].params.user_id, 42);
     assert.equal(prompts[2].conversationKey, 'wechat:private:42');
     assert.equal(fs.existsSync(config.message_buffer.path), true);
   } finally {
-    ws?.close();const exited=new Promise(resolve=>child.once('exit',resolve));child.kill();await exited;
-    await new Promise((resolve) => plugin.close(resolve));
+    ws?.close();
+    const exited = new Promise(resolve => child.once('exit', resolve));
+    child.kill();
+    await exited;
+    await new Promise(resolve => plugin.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

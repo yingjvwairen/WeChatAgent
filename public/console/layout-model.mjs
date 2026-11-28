@@ -33,7 +33,8 @@ export const LIVE_WECHAT_SECTIONS = [
   'assistant',
 ];
 export const requiresRestart = path =>
-  path !== 'input.paused' && !LIVE_WECHAT_SECTIONS.some(section => path === 'wechat.' + section || path.startsWith('wechat.' + section + '.'));
+  path !== 'input.paused' &&
+  !LIVE_WECHAT_SECTIONS.some(section => path === 'wechat.' + section || path.startsWith('wechat.' + section + '.'));
 export function withoutLiveSettings(config) {
   const copy = structuredClone(config);
   for (const section of LIVE_WECHAT_SECTIONS) delete copy.wechat?.[section];

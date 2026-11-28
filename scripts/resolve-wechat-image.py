@@ -1,4 +1,5 @@
 """Resolve one authorized image locally using unchanged weflow-cli codecs."""
+
 import base64
 import hashlib
 import importlib.util
@@ -18,6 +19,7 @@ try:
     from wechat_sticker import resolve_sticker
     from PIL import Image, ImageOps, UnidentifiedImageError
     import subprocess
+
     spec = importlib.util.spec_from_file_location('reader_api_image', ROOT / 'scripts' / 'reader-api.py')
     reader_api = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(reader_api)
@@ -45,9 +47,13 @@ def resolve(descriptor):
     content = row['imageXml']
     if row['localType'] == 47:
         project = reader_api.read_json(ROOT / 'config' / 'wechatagent.json')
-        return resolve_sticker(reader.account, content, normalize_image,
+        return resolve_sticker(
+            reader.account,
+            content,
+            normalize_image,
             allow_cdn=project.get('wechat', {}).get('media', {}).get('allowStickerCdn', False) is True,
-            allow_cdn_alias=project.get('wechat', {}).get('media', {}).get('allowStickerCdnAlias', False) is True)
+            allow_cdn_alias=project.get('wechat', {}).get('media', {}).get('allowStickerCdnAlias', False) is True,
+        )
     resource = reader.account / 'db_storage' / 'message' / 'message_resource.db'
     ids = list(media.extract_media_md5s(content))
     if resource.is_file():
@@ -57,7 +63,10 @@ def resolve(descriptor):
             connection, cursor = reader_api.nt.connect_nt_db(str(resource), key, salt)
             cursor.execute('PRAGMA query_only=ON')
             if int(descriptor['serverId'] or 0):
-                cursor.execute('SELECT packed_info FROM MessageResourceInfo WHERE message_svr_id=? AND message_local_id=? AND message_create_time=? LIMIT 8', (int(descriptor['serverId']), descriptor['localId'], descriptor['createTime']))
+                cursor.execute(
+                    'SELECT packed_info FROM MessageResourceInfo WHERE message_svr_id=? AND message_local_id=? AND message_create_time=? LIMIT 8',
+                    (int(descriptor['serverId']), descriptor['localId'], descriptor['createTime']),
+                )
                 for (packed,) in cursor.fetchall():
                     ids.extend(media.extract_blob_md5s(packed))
         except Exception:
@@ -97,16 +106,24 @@ def resolve(descriptor):
                         raw = decoded[0]
                         if decoded[1] == 'image/x-wxgf':
                             remaining = wxgf_deadline - time.monotonic()
-                            if remaining <= .05:
+                            if remaining <= 0.05:
                                 break
                             raw = decode_image_source(raw, timeout=remaining)
                         with Image.open(io.BytesIO(raw)) as image:
                             width, height = image.size
                         area = width * height
                         if best_area < area <= 40_000_000:
-                            best = {**normalize_image(raw, max_side=2048, max_source_bytes=media.MAX_IMAGE_SOURCE_SIZE),
-                                'sourceQuality': 'thumbnail' if thumbnail else 'full', 'sourceWidth': width, 'sourceHeight': height,
-                                '_imageSource': {'version': media.IMAGE_SOURCE_VERSION, 'ids': ids, 'fingerprint': fingerprint}}
+                            best = {
+                                **normalize_image(raw, max_side=2048, max_source_bytes=media.MAX_IMAGE_SOURCE_SIZE),
+                                'sourceQuality': 'thumbnail' if thumbnail else 'full',
+                                'sourceWidth': width,
+                                'sourceHeight': height,
+                                '_imageSource': {
+                                    'version': media.IMAGE_SOURCE_VERSION,
+                                    'ids': ids,
+                                    'fingerprint': fingerprint,
+                                },
+                            }
                             best_area = area
                         break
                     except Exception:
@@ -137,9 +154,11 @@ def image_error_code(error):
 
 
 def image_failure_payload(error):
-    result = {'success': False, 'error': image_error_code(error),
-              'exceptionType': type(error).__name__}
-    if result['error'] == 'IMAGE_STICKER_LOCAL_COPY_UNAVAILABLE' and getattr(error, 'reason', None) == 'STICKER_CDN_DISABLED':
+    result = {'success': False, 'error': image_error_code(error), 'exceptionType': type(error).__name__}
+    if (
+        result['error'] == 'IMAGE_STICKER_LOCAL_COPY_UNAVAILABLE'
+        and getattr(error, 'reason', None) == 'STICKER_CDN_DISABLED'
+    ):
         result.update(reason='STICKER_CDN_DISABLED', setting='wechat.media.allowStickerCdn')
     return result
 

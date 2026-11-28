@@ -1,4 +1,5 @@
 """Bounded local parser for WeChat appmsg/19 merged chat records."""
+
 import html
 import re
 import xml.etree.ElementTree as ET
@@ -69,7 +70,7 @@ def parse_forwarded_record(value):
                 clock = re.sub(r'[\r\n\t]+', ' ', child_text(item, 'sourcetime', 64))
                 full_desc = child_text(item, 'datadesc', MAX_XML) or child_text(item, 'content', MAX_XML)
                 desc = full_desc[:800]
-                if len(full_desc)>800:
+                if len(full_desc) > 800:
                     truncated = True
                     desc += '…'
                 heading = child_text(item, 'datatitle', 200)
@@ -78,15 +79,22 @@ def parse_forwarded_record(value):
                 elif kind == '14':
                     text = '[嵌套聊天记录]' + (' ' + heading if heading else '')
                 else:
-                    label = {'2': '图片，未提供图片内容', '3': '语音，未转写', '4': '视频，未提供视频内容',
-                             '5': '链接', '6': '位置', '8': '文件，未读取文件内容', '7': '音乐'}.get(kind, '未支持的消息')
+                    label = {
+                        '2': '图片，未提供图片内容',
+                        '3': '语音，未转写',
+                        '4': '视频，未提供视频内容',
+                        '5': '链接',
+                        '6': '位置',
+                        '8': '文件，未读取文件内容',
+                        '7': '音乐',
+                    }.get(kind, '未支持的消息')
                     text = '[' + label + ']' + (' ' + (heading or desc) if heading or desc else '')
                 cost = len(name) + len(clock) + len(text) + 12
                 if cost > remaining:
-                    text = text[:max(0, remaining-len(name)-len(clock)-12)] + '…'
+                    text = text[: max(0, remaining - len(name) - len(clock) - 12)] + '…'
                     truncated = True
                 items.append({'sender': name, 'time': clock, 'kind': kind, 'text': text, 'depth': depth})
-                remaining -= len(name)+len(clock)+len(text)+12
+                remaining -= len(name) + len(clock) + len(text) + 12
                 if kind == '14':
                     nested = item.find('recordxml')
                     if nested is None:
@@ -95,7 +103,7 @@ def parse_forwarded_record(value):
                         if depth >= MAX_DEPTH:
                             truncated = True
                         else:
-                            collect(record_root(nested), depth+1)
+                            collect(record_root(nested), depth + 1)
 
         collect(container, 0)
         return {'version': 1, 'title': title, 'items': items, 'truncated': truncated, 'unavailable': not items}

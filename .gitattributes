@@ -1,0 +1,25 @@
+# Shipped plugin ZIPs are verified byte-for-byte against their source trees.
+.gitattributes text eol=lf
+optional-extensions/fish-notebook/** text=auto eol=lf
+optional-extensions/speech-recognition/** text=auto eol=lf
+optional-extensions/speech-synthesis/** text=auto eol=lf
+optional-extensions/**/assets/*.wav -text
+optional-extensions/packages/*.zip -text
+optional-extensions/packages/*.zip.sha256 text eol=lf
+
+# Match the signed-off SILK payload manifest on all checkout platforms.
+packages/voice-codec/silk-wasm/package.json text eol=lf
+packages/voice-codec/silk-wasm/lib/index.mjs text eol=lf
+packages/voice-codec/silk-wasm/lib/silk.wasm -text
+
+# Project-owned source uses identical bytes in working trees and releases.
+scripts/** text=auto eol=lf
+components/qq-bridge/** text=auto eol=lf
+packages/dsh-social-bridge-plugin/** text=auto eol=lf
+packages/plugin-api/** text=auto eol=lf
+packages/extension-runtime/** text=auto eol=lf
+packages/wechat-*.mjs text eol=lf
+packages/speech-contract/** text=auto eol=lf
+apps/console-desktop/** text=auto eol=lf
+public/console/** text=auto eol=lf
+eslint.config.mjs text eol=lf

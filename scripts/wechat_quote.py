@@ -1,4 +1,5 @@
 """Bounded parser for WeChat appmsg/57 replies, without exposing raw media XML."""
+
 import html
 import re
 import xml.etree.ElementTree as ET
@@ -32,11 +33,17 @@ def _reference_text(kind, value, depth):
         if not value or value.lower() in ('null', '(null)'):
             return '[被引用文字不可用]', True, False
         return value[:MAX_REFERENCE], False, len(value) > MAX_REFERENCE
-    labels = {'3': '图片，未提供图片内容', '34': '语音，未转写', '43': '视频，未提供视频内容',
-              '47': '表情包，未提供表情内容', '48': '位置，未解析位置内容', '10000': '系统消息'}
+    labels = {
+        '3': '图片，未提供图片内容',
+        '34': '语音，未转写',
+        '43': '视频，未提供视频内容',
+        '47': '表情包，未提供表情内容',
+        '48': '位置，未解析位置内容',
+        '10000': '系统消息',
+    }
     if kind in labels:
         return '[' + labels[kind] + ']', True, False
-    if kind == '49' or (kind.isdigit() and int(kind) & 0xffffffff == 49):
+    if kind == '49' or (kind.isdigit() and int(kind) & 0xFFFFFFFF == 49):
         # References may contain an XML tree, CDATA, or doubly escaped XML.
         for _ in range(3):
             if value.startswith('<'):
@@ -56,9 +63,17 @@ def _reference_text(kind, value, depth):
                     if nested:
                         ref = nested['reference']
                         text = '回复：' + nested['reply'] + '\n引用 ' + ref['senderName'] + '：' + ref['text']
-                        return text[:MAX_REFERENCE], ref['unavailable'], nested['truncated'] or ref['truncated'] or len(text) > MAX_REFERENCE
-                label = {'5': '链接', '6': '文件，未读取文件内容', '8': '表情包，未提供表情内容',
-                         '19': '合并聊天记录，未展开'}.get(subtype, '应用消息，未解析附件')
+                        return (
+                            text[:MAX_REFERENCE],
+                            ref['unavailable'],
+                            nested['truncated'] or ref['truncated'] or len(text) > MAX_REFERENCE,
+                        )
+                label = {
+                    '5': '链接',
+                    '6': '文件，未读取文件内容',
+                    '8': '表情包，未提供表情内容',
+                    '19': '合并聊天记录，未展开',
+                }.get(subtype, '应用消息，未解析附件')
                 full_title = _text(app, 'title') if subtype in ('5', '6', '19') else ''
                 title = full_title[:500]
                 return '[' + label + ']' + (' ' + title if title else ''), True, len(full_title) > 500
@@ -84,13 +99,27 @@ def parse_quote_reply(value, depth=0):
         kind = _text(ref, 'type')
         kind = kind if re.fullmatch(r'[0-9]{1,16}', kind) else ''
         content = ref.find('content') if ref is not None else None
-        raw = ET.tostring(content[0], encoding='unicode') if content is not None and len(content) else _text(ref, 'content')
+        raw = (
+            ET.tostring(content[0], encoding='unicode')
+            if content is not None and len(content)
+            else _text(ref, 'content')
+        )
         text, unavailable, truncated = _reference_text(kind, raw, depth)
-        return {'version': 1, 'reply': reply[:MAX_REPLY], 'truncated': len(reply) > MAX_REPLY,
-                'reference': {'senderId': sender, 'senderName': _metadata(_text(ref, 'displayname'), 80) or '未知发言人',
-                              'conversationId': source if group else '',
-                              'messageId': _metadata(_text(ref, 'svrid'), 32),
-                              'time': _metadata(_text(ref, 'createtime'), 64), 'kind': kind,
-                              'text': text, 'unavailable': unavailable, 'truncated': truncated}}
+        return {
+            'version': 1,
+            'reply': reply[:MAX_REPLY],
+            'truncated': len(reply) > MAX_REPLY,
+            'reference': {
+                'senderId': sender,
+                'senderName': _metadata(_text(ref, 'displayname'), 80) or '未知发言人',
+                'conversationId': source if group else '',
+                'messageId': _metadata(_text(ref, 'svrid'), 32),
+                'time': _metadata(_text(ref, 'createtime'), 64),
+                'kind': kind,
+                'text': text,
+                'unavailable': unavailable,
+                'truncated': truncated,
+            },
+        }
     except (ValueError, ET.ParseError, RecursionError):
         return None

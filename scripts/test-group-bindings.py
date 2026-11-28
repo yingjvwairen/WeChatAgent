@@ -10,15 +10,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from wechat_group_bindings import GroupBindings, legacy_group_id
+
 spec = importlib.util.spec_from_file_location('group_reader', pathlib.Path(__file__).with_name('reader-api.py'))
-api = importlib.util.module_from_spec(spec); spec.loader.exec_module(api)
+api = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api)
 
 
 class GroupRecovery(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name)
-        self.account = self.root/'account-A'
+        self.account = self.root / 'account-A'
         self.bindings = GroupBindings(self.root, self.account)
 
     def test_legacy_identity_survives_leave_rename_rejoin_and_restart(self):
@@ -36,7 +39,8 @@ class GroupRecovery(unittest.TestCase):
         old = legacy_group_id('同名群')
         self.bindings.reconcile(names, [old])
         a, b = [self.bindings.identifier(u) for u in names]
-        self.assertNotEqual(a, b); self.assertNotIn(old, [a, b])
+        self.assertNotEqual(a, b)
+        self.assertNotIn(old, [a, b])
         self.bindings.bind('room-A@chatroom', old, [old], names)
         self.assertEqual(self.bindings.identifier('room-A@chatroom'), old)
         self.assertEqual(self.bindings.identifier('room-B@chatroom'), b)
@@ -55,7 +59,8 @@ class GroupRecovery(unittest.TestCase):
 
     def test_account_isolation_and_readonly_workers_never_overwrite_bindings(self):
         self.bindings.reconcile({'room@chatroom': 'A'})
-        other = GroupBindings(self.root, self.root/'account-B'); other.reconcile({'room@chatroom': 'A'})
+        other = GroupBindings(self.root, self.root / 'account-B')
+        other.reconcile({'room@chatroom': 'A'})
         self.assertNotEqual(self.bindings.identifier('room@chatroom'), other.identifier('room@chatroom'))
         before = self.bindings.file.read_bytes()
         worker = GroupBindings(self.root, self.account, readonly=True)
@@ -81,15 +86,22 @@ class GroupRecovery(unittest.TestCase):
         self.assertEqual(self.bindings.identifier('room@chatroom'), old)
 
     def test_reader_uses_stable_identity_for_selection_search_and_media_permissions(self):
-        reader = api.Reader.__new__(api.Reader); reader.root = self.root; reader.account = self.account
-        reader.settings_file = self.root/'settings.json'; reader.settings_file.write_text(json.dumps({'messagePushFilterList': ['room@chatroom', 'unselected@chatroom']}))
-        (self.root/'config').mkdir(); config = self.root/'config/wechatagent.json'
-        old = legacy_group_id('旧名'); config.write_text(json.dumps({'wechat': {'whitelist': {'groups': [old], 'private': []}}}))
-        reader.names = {'room@chatroom': '旧名', 'unselected@chatroom': '其他群'}; reader.group_bindings = self.bindings
+        reader = api.Reader.__new__(api.Reader)
+        reader.root = self.root
+        reader.account = self.account
+        reader.settings_file = self.root / 'settings.json'
+        reader.settings_file.write_text(json.dumps({'messagePushFilterList': ['room@chatroom', 'unselected@chatroom']}))
+        (self.root / 'config').mkdir()
+        config = self.root / 'config/wechatagent.json'
+        old = legacy_group_id('旧名')
+        config.write_text(json.dumps({'wechat': {'whitelist': {'groups': [old], 'private': []}}}))
+        reader.names = {'room@chatroom': '旧名', 'unselected@chatroom': '其他群'}
+        reader.group_bindings = self.bindings
         reader.own_wxid = 'self'
         reader.refresh_names = lambda **kwargs: None
         self.bindings.reconcile(reader.names, [old])
-        reader.names['room@chatroom'] = '重进新名'; self.bindings.reconcile(reader.names, [old])
+        reader.names['room@chatroom'] = '重进新名'
+        self.bindings.reconcile(reader.names, [old])
         self.assertEqual(reader.selected_talkers(), ['room@chatroom'])
         self.assertTrue(reader.image_talker_allowed('room@chatroom'))
         self.assertFalse(reader.image_talker_allowed('unselected@chatroom'))
@@ -97,30 +109,62 @@ class GroupRecovery(unittest.TestCase):
         contacts = reader.contacts('旧名', 'groups')
         self.assertEqual(contacts[0]['conversationId'], old)
         self.assertEqual(reader.sessions()[0]['conversationId'], old)
-        payload = reader.make_payload('room@chatroom', {'senderUsername': 'friend', 'isSend': 0, 'localType': 1, 'fullText': 'fixture', 'createTime': 1})
+        payload = reader.make_payload(
+            'room@chatroom',
+            {'senderUsername': 'friend', 'isSend': 0, 'localType': 1, 'fullText': 'fixture', 'createTime': 1},
+        )
         self.assertEqual(payload['conversationId'], old)
         self.assertEqual(payload['groupName'], '重进新名')
 
     def test_session_catalog_restores_a_room_missing_from_contacts_without_reading_summary(self):
-        self.account.mkdir(); file = self.account/'db_storage/session/session.db'; file.parent.mkdir(parents=True)
+        self.account.mkdir()
+        file = self.account / 'db_storage/session/session.db'
+        file.parent.mkdir(parents=True)
         connection = sqlite3.connect(file)
-        connection.executescript("CREATE TABLE SessionTable(username TEXT, summary TEXT); CREATE TABLE SessionNoContactInfoTable(username TEXT,session_title TEXT); INSERT INTO SessionTable VALUES ('room@chatroom','private message must not be selected'); INSERT INTO SessionNoContactInfoTable VALUES ('room@chatroom','重进后的群');")
-        connection.commit(); connection.close()
-        reader = api.Reader.__new__(api.Reader); reader.account = self.account; reader.passphrase = 'fixture'; reader.group_metadata_error = ''
+        connection.executescript(
+            "CREATE TABLE SessionTable(username TEXT, summary TEXT); CREATE TABLE SessionNoContactInfoTable(username TEXT,session_title TEXT); INSERT INTO SessionTable VALUES ('room@chatroom','private message must not be selected'); INSERT INTO SessionNoContactInfoTable VALUES ('room@chatroom','重进后的群');"
+        )
+        connection.commit()
+        connection.close()
+        reader = api.Reader.__new__(api.Reader)
+        reader.account = self.account
+        reader.passphrase = 'fixture'
+        reader.group_metadata_error = ''
         statements = []
+
         def connect(*args):
-            conn = sqlite3.connect(file); conn.set_trace_callback(statements.append); return conn, conn.cursor()
-        with patch.object(api.nt, 'derive_database_key', return_value=('fixture', 'fixture')), patch.object(api.nt, 'connect_nt_db', side_effect=connect):
+            conn = sqlite3.connect(file)
+            conn.set_trace_callback(statements.append)
+            return conn, conn.cursor()
+
+        with (
+            patch.object(api.nt, 'derive_database_key', return_value=('fixture', 'fixture')),
+            patch.object(api.nt, 'connect_nt_db', side_effect=connect),
+        ):
             self.assertEqual(reader.group_session_names(), {'room@chatroom': '重进后的群'})
         self.assertFalse(any('SELECT summary' in s or 'message_content' in s for s in statements))
 
     def test_fresh_session_titles_are_searchable_when_the_contact_title_is_only_an_identifier(self):
-        (self.root/'config').mkdir(); (self.root/'config/wechatagent.json').write_text(json.dumps({'wechat': {'whitelist': {'groups': [], 'private': []}}}))
-        reader = api.Reader.__new__(api.Reader); reader.root = self.root; reader.account = self.account
-        reader.names = {}; reader.names_lock = threading.Lock(); reader.names_refreshed_at = 0
-        reader.contact_db = self.root/'contact.db'; reader.passphrase = 'fixture'; reader.group_bindings = self.bindings
+        (self.root / 'config').mkdir()
+        (self.root / 'config/wechatagent.json').write_text(
+            json.dumps({'wechat': {'whitelist': {'groups': [], 'private': []}}})
+        )
+        reader = api.Reader.__new__(api.Reader)
+        reader.root = self.root
+        reader.account = self.account
+        reader.names = {}
+        reader.names_lock = threading.Lock()
+        reader.names_refreshed_at = 0
+        reader.contact_db = self.root / 'contact.db'
+        reader.passphrase = 'fixture'
+        reader.group_bindings = self.bindings
         reader.group_session_names = lambda: {'room@chatroom': '会话库里的新群名'}
-        with patch.object(api.nt, 'derive_database_key', return_value=('key', 'salt')), patch.object(api.nt, 'load_contact_names', return_value={'friend': 'Friend', 'room@chatroom': 'room@chatroom'}):
+        with (
+            patch.object(api.nt, 'derive_database_key', return_value=('key', 'salt')),
+            patch.object(
+                api.nt, 'load_contact_names', return_value={'friend': 'Friend', 'room@chatroom': 'room@chatroom'}
+            ),
+        ):
             found = reader.contacts('新群名', 'groups', refresh=True)
         self.assertEqual(found[0]['displayName'], '会话库里的新群名')
         self.assertEqual(found[0]['conversationId'], self.bindings.identifier('room@chatroom'))
