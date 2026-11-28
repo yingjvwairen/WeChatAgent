@@ -1,5 +1,5 @@
 import {AssistantNotifications} from './assistant-notifications.mjs';
-import {apply as applyAssistantToolGuard} from './social-tool-restrict.mjs';
+import {apply as applyAssistantToolGuard,bindSocialToolExecutor} from './social-tool-restrict.mjs';
 import {AssistantTasks,ASSISTANT_CONTROLLER,liveTask,taskFault,assistantHelp,formatAssistantTask} from './assistant-tasks.mjs';
 import {createAssistantControl} from './assistant-control.mjs';
 import { activeReaderAccount } from '../../scripts/reader-account-state.mjs';
@@ -433,6 +433,7 @@ export function apply(ctx, config={}) {
     });
   }
   async function bindConversationTools(agent,key,sid){
+    bindSocialToolExecutor(agent.ctx,agent);
     if(internalGroupChat){Object.defineProperty(agent.ctx,ASSISTANT_ACCESS,{configurable:true,value:()=>false});applyAssistantToolGuard(agent.ctx);return;}
     if(!webReaderBindings.has(sid))webReaderBindings.set(sid,bindWebReader(agent.ctx,root,key,()=>pending.get(sid)?.webReaderTurn));
     const extension = await extensions();
