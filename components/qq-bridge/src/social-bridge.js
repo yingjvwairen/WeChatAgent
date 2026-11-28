@@ -336,7 +336,11 @@ if (sendPrivateTest)
         target,
         text: '这是蓝色大肥鱼的 AI 接入测试。收到后请回复“测试”，我会尝试自动回应。',
       })
-      .then(() => log('[WeChat] private test confirmed by server receipt'))
+      .then(result => {
+        if (result.confirmed) log('[WeChat] private test confirmed by server receipt');
+        else if (result.pending) log('[WeChat] private test queued, awaiting server receipt');
+        else log('[WeChat] private test delivery unconfirmed');
+      })
       .catch(error => log(`[WeChat] private test failed=${error?.message ?? error}`));
   });
 await Promise.all([connection.check({ force: true }), memberConnection.check({ force: true })]);

@@ -1,0 +1,5 @@
+# Optional local CPU OCR diagnostic; install only inside state/ocr/venv.
+rapidocr==3.10.0
+onnxruntime==1.31.0
+pillow==13.0.0
+numpy==2.5.4

@@ -519,7 +519,7 @@ internal static partial class WechatDraftProbe
             if (copied == original.Sequence)
             {
                 // No clipboard update is not enough to prove an empty draft. The
-                // operator-calibrated *entire editor* blank image must also match.
+                // entire editor must also match a verified blank image.
                 SendEvents(ChordEvents(0x23));
                 long emptyDeadline = Now() + 650;
                 QtPause(frame, 50);
@@ -662,6 +662,7 @@ internal static partial class WechatDraftProbe
                       "emptyTemplateCheck", emptyTiming == null ? null : emptyTiming.Report()));
         if (empty && draft == "" && restored)
         {
+            Need(copied == original.Sequence, "QT_EMPTY_DRAFT_UNVERIFIED");
             object proof = QtIssueEmptyPhaseProof(frame, editor, emptyTemplates);
             if (proof != null)
                 outcome.Add("emptyDraftPhaseProof", proof);
