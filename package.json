@@ -68,7 +68,8 @@
     "test:hook-41513": "node --test scripts/test-hook-41513.mjs scripts/test-hook-native-apis-41513.mjs",
     "test:client-pin": "node --test scripts/test-client-pin.mjs",
     "media:prepare": "python scripts/prepare-local-whisper.py --download",
-    "media:check": "python scripts/prepare-local-whisper.py"
+    "media:check": "python scripts/prepare-local-whisper.py",
+    "desktop:window-probe": "node scripts/window-message-probe.mjs"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
