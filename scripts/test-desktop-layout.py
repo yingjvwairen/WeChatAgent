@@ -175,6 +175,31 @@ def pinned_fixture(dpi=144, source_dpi=144):
 
 
 class LayoutTests(unittest.TestCase):
+    def test_search_only_finds_the_search_control_when_conversation_layout_is_unavailable(self):
+        pixels, _, recognize, _ = fixture()
+        pixels[40:795, 375:1095] = 31
+        # Layout recovery depends on the search proof, even with unrelated
+        # content in the conversation pane.
+        pixels[220:260, 570:640] = 47
+        digest = hashlib.sha256(pixels.tobytes()).hexdigest()
+
+        def recognize_search(region):
+            return {**recognize(region), 'imageSha256': digest}
+
+        with self.assertRaisesRegex(ValueError, 'LAYOUT_HEADER_BOUNDARY_UNCERTAIN'):
+            m.locate(pixels, digest, 120, m.VERSION, recognize_search)
+        search = m.locate(pixels, digest, 120, m.VERSION, recognize_search, search_only=True)
+        self.assertTrue(search['searchOnly'])
+        self.assertFalse(search['inputSent'])
+        self.assertGreaterEqual(search['confidence'], 0.97)
+        self.assertEqual(set(search['layout']), {'search', 'pointerParkRect'})
+
+        def unverified_search(region):
+            return {**recognize_search(region), 'words': []}
+
+        with self.assertRaises(ValueError):
+            m.locate(pixels, digest, 120, m.VERSION, unverified_search, search_only=True)
+
     def test_editor_frame_is_recovered_from_complete_inner_contour_when_history_touches_outside(self):
         # Reproduce a clipped voice bubble/bright avatar touching the editor's
         # upper stroke. The unmodified inner contour remains independently

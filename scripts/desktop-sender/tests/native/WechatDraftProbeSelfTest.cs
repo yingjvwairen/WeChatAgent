@@ -149,14 +149,20 @@ internal static partial class WechatDraftProbe
                      !Json.Serialize(rich).Contains("fixture text"),
                  "TEST_STRUCTURE_PRIVACY");
             checks++;
-            foreach (string grapheme in new[] { " ", "\u4e2d", "\uD83D\uDE0A", "e\u0301",
+            foreach (string grapheme in new[] { " ", "\u4e2d", "\uff0c", "\uD83D\uDE0A", "e\u0301",
                                                 "\uD83D\uDC69\u200d\uD83D\uDCBB", "\uD83D\uDC4D\uD83C\uDFFD",
                                                 "\uD83C\uDDE8\uD83C\uDDF3" })
             {
                 var events = TextEvents(grapheme);
-                Need(events.Length == grapheme.Length * 2 && events[0].Value.Keyboard.Flags == 4 &&
-                         events[1].Value.Keyboard.Flags == 6,
-                     "TEST_UNICODE_PAIRS");
+                Need(events.Length == grapheme.Length * 2, "TEST_UNICODE_PAIRS");
+                for (int index = 0; index < grapheme.Length; index++)
+                {
+                    var press = events[index * 2].Value.Keyboard;
+                    var release = events[index * 2 + 1].Value.Keyboard;
+                    Need(press.Key == 0 && release.Key == 0 && press.Scan == grapheme[index] &&
+                             release.Scan == grapheme[index] && press.Flags == 4 && release.Flags == 6,
+                         "TEST_UNICODE_PAIRS");
+                }
                 checks++;
             }
             foreach (string forbidden in new[] { "\n", "\r", "\t", "\0", "\u2028", "\u202e" })

@@ -6,10 +6,12 @@ import { QtWindowFrames } from './qt-window-frames.mjs';
 import { QtNativeConnection } from './qt-native-connection.mjs';
 import { navigationAccess, attachmentAccess, voiceAccess } from './qt-session-access.mjs';
 import { textCommand, nativeTextProof } from './qt-text-command.mjs';
-import { probeAccountBinding } from './account-probe.mjs';
+import { textDraftRequiresReview } from './text-contract.mjs';
+import { desktopProcessIdentity, probeAccountBinding } from './account-probe.mjs';
 import { recognizeImage, warmLocalOcr } from './visual-probe.mjs';
 import path from 'node:path';
 import {
+  appliedPasteResult,
   clipboardSettled,
   codeFor,
   fault,
@@ -644,19 +646,7 @@ class QtVisualDriver {
     };
   }
   appliedPaste(result, text) {
-    if (
-      result?.performed !== true ||
-      result.attempted !== true ||
-      result.pasteApplied !== true ||
-      result.readbackPerformed !== false ||
-      result.intendedText !== text ||
-      !clipboardSettled(result, this.allowClipboardReplacement) ||
-      typeof result.interrupted !== 'boolean' ||
-      result.revision !== this.#frames.transaction.revision
-    )
-      throw fault('UI_QT_PASTE_UNCONFIRMED');
-    if (result.clipboardConsumerConfirmed !== true) throw fault('UI_QT_PASTE_UNCONFIRMED');
-    return result;
+    return appliedPasteResult(result, text, this.#frames.transaction?.revision, this.allowClipboardReplacement);
   }
   appliedTypedText(result, text) {
     if (
@@ -981,7 +971,7 @@ class QtVisualDriver {
       borrowedFocus,
       unborrowedForeground,
       backgroundAccountFailure,
-      returnCaptionFailure,
+      focusPreflightFailure,
       cleanup,
     } = preparation;
     // Retain the original transaction until its own profile popup has been
@@ -1022,6 +1012,13 @@ class QtVisualDriver {
     this.#frames.clearTransaction();
     this.#frames.invalidateFrame('main');
     const returned = await this.#focus.releaseTextFocus();
+    if (
+      failedSurface === 'main' &&
+      popupCleanupUnattempted &&
+      this.#canIsolateTextDraft(job, previous, error) &&
+      this.#isolateTextDraft(job, returned)
+    )
+      return { ready: false, reason: codeFor(error), inputReleased: true };
     const pristineDraft =
       job.index === 0 &&
       !job.pendingInput &&
@@ -1057,7 +1054,7 @@ class QtVisualDriver {
         clipboardPreparationClean: true,
       };
     if (
-      returnCaptionFailure === error &&
+      focusPreflightFailure === error &&
       !borrowedFocus &&
       !this.#focus.preparationLease() &&
       !voicePreparation &&
@@ -1223,6 +1220,7 @@ class QtVisualDriver {
           draftPolicy: 'unchecked',
           editorToken: current.editorToken,
           activityRevision: current.revision,
+          inputProcess: desktopProcessIdentity(current.binding),
         };
       }
       const frame = await this.#frames.capture(['header', 'editor']);
@@ -1244,6 +1242,7 @@ class QtVisualDriver {
         draft: current.draft,
         editorToken: current.editorToken,
         activityRevision: current.revision,
+        inputProcess: desktopProcessIdentity(current.binding),
       };
     } catch (error) {
       return {
@@ -1252,6 +1251,56 @@ class QtVisualDriver {
         ...clipboardFailureDiagnostic(error),
       };
     }
+  }
+  async #verifiedSubmitFrame(job, current) {
+    if (
+      this.config.layoutMode !== 'adaptive-v1' ||
+      !current.shared ||
+      current.draftPolicy !== 'unchecked' ||
+      current.textEntryMode !== 'humanized'
+    )
+      return this.frame;
+    const { frame, textEnterProof } = await this.#editor.verifyTypedForSubmit(
+      job,
+      current.draft,
+      current.textEnterProof,
+    );
+    current.textEnterProof = textEnterProof;
+    current.header = this.#frames.regionDigest(frame, 0);
+    current.editor = this.#frames.regionDigest(frame, 1);
+    current.binding = structuredClone(frame.binding);
+    return frame;
+  }
+  #canIsolateTextDraft(job, current, error) {
+    return (
+      !job.quote &&
+      !job.pendingInput &&
+      current?.shared === true &&
+      current.jobId === job.id &&
+      Boolean(current.draft && current.textEnterProof) &&
+      sharedTargetProof(current.privateChatProof) &&
+      current.privateChatProof.account === job.account &&
+      current.privateChatProof.target === job.target &&
+      this.textSubmitAttempted !== job.id &&
+      !this.#focus.voiceFocusLease &&
+      !error.controlsCleanupFailed &&
+      (error.clipboardRestored === true || (error.attempted === false && error.clipboardRestored !== false)) &&
+      textDraftRequiresReview(error.code)
+    );
+  }
+  #isolateTextDraft(job, returned) {
+    if (!(
+      returned?.restored === true ||
+      returned?.released === false ||
+      returned?.inPlace === true ||
+      returned?.focusRestoreOutcome?.foregroundOwnedByWechat === false
+    ))
+      return false;
+    this.#current = null;
+    if (this.#textResume?.jobId === job.id) this.#textResume = null;
+    if (this.sharedDraftResume?.jobId === job.id) this.sharedDraftResume = null;
+    if (this.#draftHold?.account === job.account && this.#draftHold?.target === job.target) this.#draftHold = null;
+    return true;
   }
   async sendAction(action, job, guard, local = {}) {
     if (local.beforeSubmit !== undefined && (action !== 'submit' || typeof local.beforeSubmit !== 'function'))
@@ -1327,7 +1376,7 @@ class QtVisualDriver {
           attempted: false,
           reason: 'UI_QT_INPUT_AUTHORIZATION_REQUIRED',
         };
-      const frame = this.frame;
+      const frame = action === 'submit' ? await this.#verifiedSubmitFrame(job, current) : this.frame;
       await this.verifyControlBinding(job, frame, action === 'submit' ? 'text-submit' : 'text-input', guard.signal);
       if (action === 'submit' && local.beforeSubmit) {
         const receipt = await local.beforeSubmit();
@@ -1440,7 +1489,9 @@ class QtVisualDriver {
                 stepBinding: this.textStepBinding(job),
               }
             : {}),
-          verifiedEmptyHashes: verified.verifiedEmptyHashes,
+          // Paced input updates the expected prefix but keeps the blank
+          // baseline needed for the final protected clipboard readback.
+          verifiedEmptyHashes: verified.verifiedEmptyHashes ?? current.verifiedEmptyHashes,
           emptyDraftPhaseProof: verified.emptyDraftPhaseProof,
           verifiedEmptyPhase: verified.verifiedEmptyPhase,
         };
@@ -1491,6 +1542,11 @@ class QtVisualDriver {
       } else if (current?.shared && (current.draft || attempted)) this.sharedDraftResume = current;
       this.#current = null;
       this.#frames.invalidateFrame();
+      if (definitelyUnattempted && this.#canIsolateTextDraft(job, current, error)) {
+        const returned = await this.#focus.releaseTextFocus();
+        if (this.#isolateTextDraft(job, returned))
+          return { performed: false, attempted: false, reason: codeFor(error), inputReleased: true };
+      }
       if (definitelyUnattempted)
         return {
           performed: false,
@@ -1502,17 +1558,10 @@ class QtVisualDriver {
     }
   }
   typeGrapheme(job, guard, local = {}) {
-    return this.sendAction(
-      this.#current?.draftPolicy === 'unchecked' &&
-        (this.config.layoutMode === 'uia-v1' || this.#current.textEntryMode !== 'humanized')
-        ? 'paste'
-        : 'type',
-      job,
-      {
-        ...guard,
-        canInput: local.canInput,
-      },
-    );
+    return this.sendAction('type', job, {
+      ...guard,
+      canInput: local.canInput,
+    });
   }
   pasteText(job, guard, local = {}) {
     return this.sendAction('paste', job, {

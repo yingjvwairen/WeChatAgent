@@ -631,7 +631,7 @@ export function createUiaControlProvider({
     pending.finally(() => inFlight.delete(pending)).catch(() => {});
     return pending;
   }
-  async function ensureBound(binding, { signal, config } = {}) {
+  async function ensureBound(binding, { signal, config, allowSearchOnly = false } = {}) {
     providerActive(signal);
     if (!geometry(binding)) throw fault('UIA_MODE_BINDING_INVALID');
     if (sameProcess(enabledProcess, binding)) return;
@@ -641,6 +641,7 @@ export function createUiaControlProvider({
       first = checkedLayout(
         await invoke('WechatBackgroundControls', '--layout', requestFor(config, binding), { signal }),
         binding,
+        allowSearchOnly,
       );
     } catch (error) {
       if (error.nativeReason !== 'UI_CONTROLS_ROOT_UNAVAILABLE') throw error;
@@ -651,6 +652,7 @@ export function createUiaControlProvider({
         first = checkedLayout(
           await invoke('WechatBackgroundControls', '--layout', requestFor(config, binding), { signal }),
           binding,
+          allowSearchOnly,
         );
     }
     if (first) {
@@ -663,6 +665,7 @@ export function createUiaControlProvider({
     const result = checkedLayout(
       await invoke('WechatBackgroundControls', '--layout', requestFor(config, binding), { signal }),
       binding,
+      allowSearchOnly,
     );
     enabledProcess = structuredClone(binding);
     return result;
@@ -687,7 +690,7 @@ export function createUiaControlProvider({
     )
       throw fault('UIA_MODE_BINDING_CHANGED');
   }
-  function checkedLayout(result, binding) {
+  function checkedLayout(result, binding, allowSearchOnly) {
     checkedObservation(result, binding);
     if (
       ![result.missing, result.ambiguous].every(
@@ -698,8 +701,28 @@ export function createUiaControlProvider({
     if (
       result.missing?.some(key => requiredRoles.includes(key)) ||
       result.ambiguous?.some(key => requiredRoles.includes(key))
-    )
+    ) {
+      const search = result.controls?.search;
+      const client = binding.clientRect;
+      if (
+        allowSearchOnly &&
+        result.layoutAvailable === false &&
+        result.layout?.width === client.right &&
+        result.layout?.height === client.bottom &&
+        result.layout?.dpi === binding.dpi &&
+        ![...result.missing, ...result.ambiguous].includes('search') &&
+        search?.enabled === true &&
+        search.offscreen === false &&
+        search.controlType === 'ControlType.Edit' &&
+        search.className === 'mmui::XValidatorTextEdit' &&
+        rectangle(search.rect, client) &&
+        same(search.rect, result.layout.search)
+      )
+        throw Object.assign(fault('UIA_MODE_CONTROLS_UNAVAILABLE'), {
+          searchLayout: { width: client.right, height: client.bottom, dpi: binding.dpi, search: search.rect },
+        });
       throw fault('UIA_MODE_CONTROLS_UNAVAILABLE');
+    }
     const client = binding.clientRect;
     if (
       !object(result.layout) ||
@@ -720,15 +743,16 @@ export function createUiaControlProvider({
     processCreatedFileTimeUtc: binding.processCreatedFileTimeUtc,
     executable: config.executable,
   });
-  async function layout(config, binding, { signal } = {}) {
+  async function layout(config, binding, { signal, allowSearchOnly = false } = {}) {
     if (!geometry(binding)) throw fault('UIA_MODE_BINDING_INVALID');
-    const first = await ensure(binding, { signal, config });
+    const first = await ensure(binding, { signal, config, allowSearchOnly });
     cachedLayout = undefined;
     const result =
         first ??
         checkedLayout(
           await invoke('WechatBackgroundControls', '--layout', requestFor(config, binding), { signal }),
           binding,
+          allowSearchOnly,
         ),
       proof = verificationProof(result);
     if (proof) {

@@ -331,6 +331,12 @@ internal static partial class WechatDraftProbe
                  !QtQuoteThumbnailCarrier("sticker", "mmui::XImage", ControlType.Button),
              "QT_TEST_QUOTE_NOT_TOOLBAR_OR_CLOSE_ICON");
         checks++;
+        Need(QtQuoteEmptyViewportShape("QWidget", ControlType.Group, "") &&
+                 !QtQuoteEmptyViewportShape("QWidget", ControlType.Image, "") &&
+                 !QtQuoteEmptyViewportShape("mmui::XImageView", ControlType.Group, "") &&
+                 !QtQuoteEmptyViewportShape("QWidget", ControlType.Group, "attachment"),
+             "QT_TEST_EMPTY_EDITOR_VIEWPORT_IS_NOT_RICH_CONTENT");
+        checks++;
         return checks;
     }
     static QtUiaNode QtQuoteEditor(Binding binding)
@@ -493,25 +499,69 @@ internal static partial class WechatDraftProbe
         }
         return true;
     }
+    static bool QtQuoteEmptyViewportShape(string className, ControlType type, string name)
+    {
+        return className == "QWidget" && type == ControlType.Group && String.IsNullOrEmpty(name);
+    }
+    static bool QtQuoteEditorContentClear(QtUiaNode editor)
+    {
+        var element = editor.Element;
+        object value, text;
+        if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out value) || ((ValuePattern)value).Current.Value != "")
+            return false;
+        var child = TreeWalker.ContentViewWalker.GetFirstChild(element);
+        bool hasText = element.TryGetCurrentPattern(TextPattern.Pattern, out text);
+        if (hasText)
+        {
+            var range = ((TextPattern)text).DocumentRange;
+            if (range.GetText(1).Length != 0 || range.GetChildren().Length != 0)
+                return false;
+        }
+        if (child == null)
+            return true;
+        // WeChat 4.2.0.53 exposes an empty Qt viewport under the blank editor.
+        // This viewport can report keyboard focus while the editor is empty.
+        // Require empty document text and rule out any other raw descendants.
+        var properties = child.Current;
+        var raw = TreeWalker.RawViewWalker;
+        return hasText && QtQuoteEmptyViewportShape(properties.ClassName, properties.ControlType, properties.Name) &&
+               properties.ProcessId == editor.Pid && !properties.BoundingRectangle.IsEmpty &&
+               element.Current.BoundingRectangle.Contains(properties.BoundingRectangle) &&
+               Object.Equals(raw.GetFirstChild(element), child) && raw.GetNextSibling(child) == null &&
+               raw.GetFirstChild(child) == null && child.TryGetCurrentPattern(ValuePattern.Pattern, out value) &&
+               ((ValuePattern)value).Current.Value == "";
+    }
     static object QtCheckClearQuote(Dictionary<string, object> request)
     {
         var frame = QtGuard(request, true);
-        var editor = QtQuoteEditor(frame.Binding);
-        object value;
-        bool clear = QtQuoteInputClear(editor) &&
-                     editor.Element.TryGetCurrentPattern(ValuePattern.Pattern, out value) &&
-                     ((ValuePattern)value).Current.Value == "" &&
-                     TreeWalker.ContentViewWalker.GetFirstChild(editor.Element) == null;
-        object text;
-        if (clear && editor.Element.TryGetCurrentPattern(TextPattern.Pattern, out text))
+        bool captureTemplate = request.ContainsKey("emptyEditorRect");
+        Rect template = new Rect();
+        if (captureTemplate)
         {
-            var range = ((TextPattern)text).DocumentRange;
-            clear = range.GetText(1).Length == 0 && range.GetChildren().Length == 0;
+            template = ParseRect(Get(request, "emptyEditorRect"));
+            Need(!frame.MetadataOnly && frame.Anchors.Count == 1, "QT_EMPTY_EDITOR_TEMPLATE_SCOPE_INVALID");
+            QtNeedDraftSource(frame, ParseRect(Get(request, "headerRect")), template);
         }
+        var editor = QtQuoteEditor(frame.Binding);
+        if (captureTemplate)
+        {
+            // OCR may include the blank padding surrounding the UIA edit control.
+            Need(Contains(editor.Rect, template) || Contains(template, editor.Rect),
+                 "QT_EMPTY_EDITOR_TEMPLATE_SCOPE_INVALID");
+        }
+        bool clear = QtQuoteInputClear(editor) && QtQuoteEditorContentClear(editor);
         QtQuoteGuardWindow(frame, false);
-        if (clear)
-            QtActiveQuote = null;
-        return Data("clear", clear);
+        if (!clear)
+            return Data("clear", false);
+        var result = Data("clear", true);
+        if (captureTemplate)
+        {
+            string current = QtHash(QtPixels(frame.Binding, template));
+            QtGuard(request, true);
+            result["emptyEditorSha256"] = current;
+        }
+        QtActiveQuote = null;
+        return result;
     }
     static bool QtQuotePreviewLabel(string label, string text, QtQuotePattern pattern)
     {
@@ -1073,10 +1123,7 @@ internal static partial class WechatDraftProbe
         var binding = frame.Binding;
         var editor = QtQuoteEditor(binding);
         var page = QtUiaAncestor(editor, "mmui::ChatMessagePage");
-        object value;
-        Need(editor.Element.TryGetCurrentPattern(ValuePattern.Pattern, out value) &&
-                 ((ValuePattern)value).Current.Value == "",
-             "QT_QUOTE_DRAFT_PRESENT");
+        Need(QtQuoteEditorContentClear(editor), "QT_QUOTE_DRAFT_PRESENT");
         Need(QtQuoteInputClear(editor) && QtQuotePreview(editor, text, pattern) == null &&
                  QtQuoteMenuItem(binding) == null,
              "QT_QUOTE_DRAFT_PRESENT");

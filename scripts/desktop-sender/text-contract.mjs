@@ -1,6 +1,8 @@
 export const MAX_TEXT_CHARS = 10000;
 export const MAX_TEXT_BYTES = 16000;
 export const normalizeDesktopText = text => (typeof text === 'string' ? text.replace(/\r\n?/g, '\n') : text);
+export const textDraftRequiresReview = code =>
+  ['QT_TEXT_STEP_REVOKED', 'QT_TEXT_STEP_UNAVAILABLE', 'UI_QT_TYPED_TEXT_MISMATCH'].includes(code);
 
 const segmenter = new Intl.Segmenter('zh', { granularity: 'grapheme' });
 export const textGraphemes = text => Array.from(segmenter.segment(text), item => item.segment);

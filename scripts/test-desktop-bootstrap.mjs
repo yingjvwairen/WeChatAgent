@@ -13,6 +13,7 @@ import {
   defaultSearchPopup,
 } from './desktop-sender/bootstrap.mjs';
 import { resolveQtBootstrapLayout } from './desktop-sender/qt-auto-layout.mjs';
+import { createDesktopRuntimeDriver } from './desktop-sender/runtime-driver.mjs';
 import { QtActionsClient } from './desktop-sender/qt-visual-driver.mjs';
 
 import { calibrateDesktop } from './desktop-sender/calibrate.mjs';
@@ -180,6 +181,130 @@ test('failed native layout closes its own provider and does not save an invented
     fs.readdirSync(path.join(options.root, 'state/desktop')).some(file => file.startsWith('native-')),
     false,
   );
+});
+test('UIA bootstrap binds a verified search-only layout without publishing an editor configuration', async t => {
+  const options = fixture(t);
+  const search = rect(60, 10, 250, 40);
+  let closed = false;
+  await assert.rejects(
+    bootstrapDesktopSender({
+      ...options,
+      nativeProbe: async () => ({}),
+      createProvider: () => ({
+        async inspectControls(_seed, _binding, { allowSearchOnly }) {
+          assert.equal(allowSearchOnly, true);
+          throw Object.assign(Error('UIA_MODE_CONTROLS_UNAVAILABLE'), {
+            code: 'UIA_MODE_CONTROLS_UNAVAILABLE',
+            searchLayout: { width: 1000, height: 800, dpi: 120, search },
+          });
+        },
+        async close() {
+          closed = true;
+        },
+      }),
+    }),
+    error => {
+      assert.equal(error.code, 'UI_QT_CONVERSATION_LAYOUT_REQUIRED');
+      assert.equal(error.attempted, false);
+      const recovery = error.searchRecovery;
+      assert.deepEqual(recovery.binding, bootstrapBinding(options.account));
+      assert.equal(recovery.config.accountRef, options.account.accountRef);
+      assert.equal(recovery.config.hwnd, options.account.binding.hwnd);
+      assert.deepEqual(recovery.config.layout, { width: 1000, height: 800, dpi: 120, search });
+      return true;
+    },
+  );
+  assert.equal(closed, true);
+  assert.deepEqual(fs.readdirSync(path.join(options.root, 'state/desktop')), []);
+});
+test('a later UIA layout failure keeps the existing executor and reports the original refusal', async t => {
+  const f = fixture(t);
+  const search = rect(60, 10, 250, 40);
+  const config = {
+    version: 1,
+    backend: 'qt-visual',
+    sharedDesktop: true,
+    account: f.account.accountWxid,
+    accountRef: f.account.accountRef,
+    executable: f.account.executable,
+    executableVersion: f.account.executableVersion,
+    executableSha256: f.account.executableSha256,
+    hwnd: 'auto',
+    layoutMode: 'uia-v1',
+    focusActivationMode: 'uia-caption-v1',
+    idleMs: 1000,
+    ocrBackend: 'windows',
+    searchPopupCalibration: checkedSearchPopup(f.account, f.popupEvidence),
+    layout: {
+      width: 1000,
+      height: 800,
+      dpi: 120,
+      search,
+      header: rect(300, 50, 900, 100),
+      editor: rect(300, 500, 950, 700),
+      send: rect(850, 740, 950, 780),
+    },
+  };
+  const refusal = Object.assign(Error('UIA_MODE_CONTROLS_UNAVAILABLE'), {
+    code: 'UIA_MODE_CONTROLS_UNAVAILABLE',
+    searchLayout: { width: 1000, height: 800, dpi: 120, search },
+  });
+  let bootstraps = 0;
+  const driver = await createDesktopRuntimeDriver({
+    root: f.root,
+    account: f.account,
+    settings: {
+      controlMode: 'uia',
+      wechatExecutable: f.account.executable,
+      expectedVersion: f.account.executableVersion,
+      voiceSend: false,
+    },
+    createOffscreen: () => ({ close: async () => {} }),
+    bootstrap: async () => {
+      assert.equal(++bootstraps, 1, 'refresh should use the existing executor');
+      return {
+        config,
+        provider: {
+          navigationPolicy: 'uia-controls-v1',
+          resolveControls: async () => {
+            throw refusal;
+          },
+          close: async () => {},
+        },
+      };
+    },
+    recoverSearch: () => assert.fail('layout refresh should not search for a conversation'),
+    createDriver: options =>
+      createLayoutAwareQtDriver({
+        ...options,
+        driverFactory: ({ config }) => ({
+          config,
+          requestNative: async action => {
+            assert.equal(action, 'inspectLayout');
+            return {
+              version: 1,
+              readOnly: true,
+              inputSent: false,
+              focusChanged: false,
+              clipboardAccessed: false,
+              executableVersion: f.account.executableVersion,
+              executableSha256: f.account.executableSha256,
+              binding: f.account.binding,
+            };
+          },
+          resolveLayoutWith: (resolve, request) => resolve(request),
+          prepare: () => assert.fail('sending preparation requires the complete layout'),
+          close: async () => {},
+        }),
+      }),
+  });
+  const job = { id: 'fixture-job', index: 0 };
+  try {
+    await assert.rejects(driver.prepare(job, { canInput: () => true }), error => error === refusal);
+    assert.equal(bootstraps, 1);
+  } finally {
+    await driver.close();
+  }
 });
 test('OCR bootstrap refuses clients that may send input before any screenshot', () => {
   assert.throws(

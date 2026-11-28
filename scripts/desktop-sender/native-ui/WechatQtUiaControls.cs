@@ -478,6 +478,45 @@ internal static partial class WechatDraftProbe
         }
         return result;
     }
+    static object QtVerifyOpenChatTitle(Dictionary<string, object> request)
+    {
+        var frame = QtGuard(request, true);
+        string expected = Text(request, "titleSha256");
+        Need(!frame.MetadataOnly && QtSurface == "main" && QtPopup == null && QtPendingPopup == null &&
+                 QtFocus.Parked == null && expected != null && expected.Length == 64,
+             "QT_UIA_CONTROL_REQUEST_INVALID");
+        bool matches = false;
+        try
+        {
+            var header = QtUiaResolveRoles(frame.Binding, new[] { "header" })["header"].Node;
+            // Bind to the same primary label as the background UIA verifier.
+            // In groups, the member count is a separate sibling label.
+            const string boxId = "content_view.top_content_view.title_h_view.left_v_view.left_content_v_view.left_ui_" +
+                                 ".big_title_line_h_view";
+            var labels = header.Element.FindAll(
+                TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.AutomationIdProperty, boxId + ".current_chat_name_label"));
+            if (labels.Count == 1)
+            {
+                var label = labels[0];
+                var value = label.Current;
+                var parent = TreeWalker.RawViewWalker.GetParent(label);
+                matches = parent != null && parent.Current.AutomationId == boxId &&
+                          parent.Current.ClassName == "mmui::XHBoxView" &&
+                          parent.Current.ControlType == ControlType.Text &&
+                          parent.Current.ProcessId == frame.Binding.Pid && value.ProcessId == frame.Binding.Pid &&
+                          !value.IsOffscreen && value.ClassName == "mmui::XTextView" &&
+                          value.ControlType == ControlType.Text && !String.IsNullOrEmpty(value.Name) &&
+                          QtHash(Encoding.UTF8.GetBytes(value.Name)) == expected;
+            }
+        }
+        catch (Exception)
+        {
+            // With no readable title, the regular guarded contact search can identify the chat.
+        }
+        QtGuard(request, true);
+        return Data("matches", matches);
+    }
     static void QtCheckUiaFrame(QtFrame frame)
     {
         if (frame == null || !frame.MetadataOnly)

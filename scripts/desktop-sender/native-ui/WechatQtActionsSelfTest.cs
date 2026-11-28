@@ -1201,6 +1201,53 @@ static int QtEnterSelfTest()
         Need(!QtTypedPrefixMatches(typedProof, step, "\u597d", "\u4f60\u597d", typedFrame, "typed"),
              "QT_TEST_TYPED_PAUSE_NEEDS_RESUME");
         count++;
+        var readFrame = new QtFrame { Binding = typedFrame.Binding, Revision = typedFrame.Revision,
+                                      Anchors = new List<QtAnchor> { typedFrame.Anchors[0] } };
+        var typedRequest = Data("textEnterProofId", typedProof.Id, "textSha256", typedProof.Digest);
+        typedProof.Paused = false;
+        QtPendingEnter = typedProof;
+        var beforeReadback =
+            QtRequireDraftReadbackProof(typedRequest, readFrame, typedFrame.Anchors[0].Rect, editor, step);
+        var verified = new QtEnterProof { Id = typedProof.Id, Kind = "text",      Digest = typedProof.Digest,
+                                          Epoch = QtEpoch,    Frame = typedFrame, Step = step };
+        Need(Object.ReferenceEquals(beforeReadback, typedProof), "QT_TEST_READBACK_REQUIRES_ORIGINAL_PROOF");
+        count++;
+        bool savedInput = QtEnableInput;
+        try
+        {
+            QtEnableInput = false;
+            Expect(delegate { QtAct(Data(), "movePointer"); }, "QT_INPUT_DISABLED");
+            Expect(delegate { QtReadDraft(new QtClipboardOperation(), Data(), IntPtr.Zero); }, "QT_INPUT_DISABLED");
+            Expect(delegate { QtPaste(new QtClipboardOperation(), Data(), IntPtr.Zero); }, "QT_INPUT_DISABLED");
+            Expect(delegate { QtPasteWithoutReadback(new QtClipboardOperation(), Data(), IntPtr.Zero); },
+                   "QT_INPUT_DISABLED");
+            Need(Object.ReferenceEquals(QtPendingEnter, beforeReadback) && !beforeReadback.Consumed,
+                 "QT_TEST_REFUSED_NONMUTATING_ACTIONS_KEEP_PROOF");
+            count++;
+        }
+        finally
+        {
+            QtEnableInput = savedInput;
+        }
+        QtPublishEnterProof(verified, beforeReadback);
+        Need(Object.ReferenceEquals(QtPendingEnter, verified) && verified.Id == beforeReadback.Id &&
+                 beforeReadback.Consumed && !verified.Consumed && !verified.InputOnly,
+             "QT_TEST_VERIFIED_READBACK_COMMITS_SAME_PROOF_ID");
+        count++;
+        var interruptedReadback =
+            QtRequireDraftReadbackProof(typedRequest, readFrame, typedFrame.Anchors[0].Rect, editor, step);
+        var staleResult = new QtEnterProof { Id = verified.Id, Kind = "text",      Digest = verified.Digest,
+                                             Epoch = QtEpoch,  Frame = typedFrame, Step = step };
+        QtRevokeEnter();
+        Expect(delegate { QtPublishEnterProof(staleResult, interruptedReadback); }, "QT_TEXT_STEP_REVOKED");
+        Need(QtPendingEnter == null, "QT_TEST_READBACK_CANNOT_REVIVE_REVOKED_PROOF");
+        count += 2;
+        QtPendingEnter = proof();
+        var other = QtPendingEnter;
+        Expect(delegate { QtPublishEnterProof(staleResult, interruptedReadback); }, "QT_TEXT_STEP_REVOKED");
+        Need(Object.ReferenceEquals(QtPendingEnter, other) && !other.Consumed,
+             "QT_TEST_READBACK_CANNOT_REPLACE_NEW_PROOF");
+        count += 2;
         for (int change = 0; change < 5; change++)
         {
             var invalid = new Dictionary<string, object>(stepPacket);
@@ -2119,6 +2166,15 @@ static int QtSelfTest()
         Need(QtIdleReason(3000, 3000, 1000, 1, 0) == null && QtIdleReason(3000, 3000, 1000, 1, 1) == "QT_USER_ACTIVE",
              "QT_TEST_ZERO_IDLE_NO_EXTRA_DELAY");
         count++;
+        Need(QtLayoutIdle(120000, 118000, 119990, 0, 2000) && QtLayoutIdle(120000, 90000, 119990, 0, 30000),
+             "QT_TEST_COLD_LAYOUT_USES_REAL_SESSION_IDLE");
+        Need(!QtLayoutIdle(120000, 118001, 119990, 0, 2000) && !QtLayoutIdle(120000, 115000, 119999, 1, 2000) &&
+                 QtLayoutIdle(120000, 118000, 118000, 1, 2000),
+             "QT_TEST_LAYOUT_REQUIRES_BOTH_SYSTEM_AND_OBSERVED_IDLE");
+        Need(QtLayoutIdle((long)UInt32.MaxValue + 1000, UInt32.MaxValue - 1000, 0, 0, 2000) &&
+                 !QtLayoutIdle(120000, 120001, 0, 0, 0),
+             "QT_TEST_LAYOUT_IDLE_HANDLES_TICK_WRAP_AND_REFUSES_FUTURE_INPUT");
+        count += 3;
         var observed = new ActivityCounters();
         observed.Observe(true, 0x100, 0, 0x10, UIntPtr.Zero);
         observed.Observe(false, 0x200, 0, 1, UIntPtr.Zero);

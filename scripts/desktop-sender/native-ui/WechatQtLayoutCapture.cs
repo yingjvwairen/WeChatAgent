@@ -160,6 +160,11 @@ internal static partial class WechatDraftProbe
             CloseHandle(process);
         }
     }
+    static bool QtDormantInputWindow(bool visible, Rect bounds, string windowClass)
+    {
+        return !visible && bounds.Width == 0 && bounds.Height == 0 &&
+               (windowClass == "IME" || windowClass == "MSCTFIME UI");
+    }
     static Dictionary<IntPtr, bool> QtLayoutOwnedTopmost(WindowIdentity target)
     {
         var windows = new Dictionary<IntPtr, bool>();
@@ -180,6 +185,17 @@ internal static partial class WechatDraftProbe
                     uint pid;
                     GetWindowThreadProcessId(window, out pid);
                     Need(pid == target.Pid && windows.Count < 128, "QT_LAYOUT_WINDOW_FAMILY_UNCONFIRMED");
+                    // Focusing Qt can create invisible Windows IME helper windows
+                    // with their own topmost flags. They occupy no screen area.
+                    if (!IsWindowVisible(window))
+                    {
+                        Rect bounds;
+                        var windowClass = new System.Text.StringBuilder(32);
+                        if (GetWindowRect(window, out bounds) &&
+                            GetClassName(window, windowClass, windowClass.Capacity) > 0 &&
+                            QtDormantInputWindow(IsWindowVisible(window), bounds, windowClass.ToString()))
+                            return true;
+                    }
                     windows.Add(window, (GetWindowLongPtr(window, -20).ToInt64() & 8) != 0);
                 }
             }
@@ -286,6 +302,11 @@ internal static partial class WechatDraftProbe
             wait(10);
         }
     }
+    static bool QtLayoutIdle(long now, uint inputTick, long lastActivity, long revision, long minimum)
+    {
+        long? sessionIdle = FocusInputIdleMilliseconds(now, inputTick);
+        return sessionIdle.HasValue && sessionIdle.Value >= minimum && (revision == 0 || now - lastActivity >= minimum);
+    }
     static object QtCaptureLayoutRaised(Dictionary<string, object> request)
     {
         Need(QtEnableInput && !Stopping && QtFocus.Active == null && QtFocus.Parked == null && QtSurface == "main" &&
@@ -296,10 +317,13 @@ internal static partial class WechatDraftProbe
         Need(QtLayoutExpectedMatches(expected, Map(Get(inspection, "binding"))), "QT_BINDING_CHANGED");
         long idle = Number(Get(request, "idleMs"));
         Need(idle >= 0 && idle <= 300000, "QT_IDLE_INVALID");
-        QtRequireIdle(idle);
-        NoKeysHeld();
         long revision = Interlocked.Read(ref Revision);
         uint inputTick = QtInputTick();
+        // A capture-only helper starts with no hook history of its own. Use
+        // the session's actual idle age and retain both activity guards.
+        Need(QtLayoutIdle(Now(), inputTick, Interlocked.Read(ref LastActivity), revision, idle), "QT_USER_ACTIVE");
+        NoKeysHeld();
+        Need(revision == Interlocked.Read(ref Revision) && inputTick == QtInputTick(), "QT_HUMAN_ACTIVITY_CHANGED");
         var source = QtLayoutState(QtFocusWindow(GetForegroundWindow()));
         var target =
             QtLayoutState(QtFocusWindow(new IntPtr(DecimalString(Get(expected, "hwnd"))), QtExecutable), QtExecutable);
@@ -548,7 +572,13 @@ internal static partial class WechatDraftProbe
     }
     static int QtLayoutRaisedSelfTest()
     {
-        int count = 0;
+        var empty = new Rect(0, 0, 0, 0);
+        Need(QtDormantInputWindow(false, empty, "IME") && QtDormantInputWindow(false, empty, "MSCTFIME UI") &&
+                 !QtDormantInputWindow(true, empty, "IME") &&
+                 !QtDormantInputWindow(false, new Rect(0, 0, 1, 1), "MSCTFIME UI") &&
+                 !QtDormantInputWindow(false, empty, "Qt51514QWindowIcon"),
+             "QT_TEST_LAYOUT_ONLY_IGNORES_DORMANT_SYSTEM_INPUT_WINDOWS");
+        int count = 1;
         int raises = 0, samples = 0;
         long clock = 0;
         Action guard = delegate {};

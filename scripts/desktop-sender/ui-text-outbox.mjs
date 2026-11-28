@@ -4,7 +4,8 @@ import crypto from 'node:crypto';
 import { archiveDelivery, readArchivedDelivery, boundedDeliveryNames, deliverySequence } from './delivery-archive.mjs';
 import { clipboardBackupDiagnostic, clipboardBackupRefusal } from './clipboard-backup-diagnostic.mjs';
 import { acquireDeliveryLock } from './delivery-lock.mjs';
-import { validDesktopText as validText, textGraphemes } from './text-contract.mjs';
+import { validDesktopText as validText, textDraftRequiresReview, textGraphemes } from './text-contract.mjs';
+import { desktopProcessPrecedes } from './account-probe.mjs';
 import {
   RECEIPT_BASELINE_UNAVAILABLE,
   TERMINAL_DELIVERY_STATES as terminal,
@@ -70,6 +71,7 @@ const JOB_FIELDS = new Set([
   'manualPause',
   'reason',
   'pendingInput',
+  'inputProcess',
   'submittedAt',
   'deadlineAt',
   'inputReleased',
@@ -234,9 +236,12 @@ function validateJob(job, id) {
   }
   if (
     (job.receipt !== undefined && !validReceipt(job.receipt)) ||
+    (job.inputProcess !== undefined &&
+      (typeof job.inputProcess !== 'string' || !/^[1-9]\d{0,9}:[1-9]\d{0,18}$/.test(job.inputProcess))) ||
     (job.state === 'confirmed' && !validReceipt(job.receipt)) ||
     (job.inputReleased !== undefined &&
-      (job.inputReleased !== true || !['submitted', 'confirmed', 'unconfirmed'].includes(job.state))) ||
+      (job.inputReleased !== true ||
+        !['submitted', 'confirmed', 'unconfirmed', 'conflict', 'cancelled', 'failed'].includes(job.state))) ||
     (job.clipboardBackup !== undefined && !clipboardBackupDiagnostic(job.clipboardBackup))
   )
     throw fault('UI_OUTBOX_STATE_INVALID');
@@ -371,7 +376,7 @@ export class UiTextOutbox {
       if (
         this.isRetired(job.id) ||
         job.state === 'confirmed' ||
-        (job.state === 'cancelled' && job.index === 0 && !job.pendingInput)
+        (job.state === 'cancelled' && (job.inputReleased || (job.index === 0 && !job.pendingInput)))
       ) {
         archiveDelivery(this.archiveDirectory, job.id, job, MAX_JOB_BYTES);
         this.onArchive?.(job.id);
@@ -507,6 +512,22 @@ export class UiTextOutbox {
     return result;
   }
 
+  detachPreviousProcess(id, currentProcess) {
+    return this.#change(id, job => {
+      if (job.inputReleased || !desktopProcessPrecedes(job.inputProcess, currentProcess) || job.state === 'confirmed')
+        return;
+      if (job.submittedAt !== undefined) {
+        // A late receipt belongs to the original attempt. It can never
+        // trigger another Enter in the newly opened client.
+        job.state = 'unconfirmed';
+      } else if (job.index > 0 || job.pendingInput) {
+        if (!terminal.has(job.state)) job.state = 'conflict';
+      } else return;
+      job.reason = 'UI_WECHAT_PROCESS_RESTARTED';
+      job.inputReleased = true;
+    });
+  }
+
   rejectUnstartedQuote(id) {
     return this.#change(id, job => {
       if (
@@ -593,6 +614,25 @@ export class UiTextOutbox {
       },
       job.revision,
     );
+  }
+
+  #holdDraft(job, result) {
+    return this.#change(job.id, value => {
+      if (
+        value.index !== job.index ||
+        value.pendingInput ||
+        value.submittedAt !== job.submittedAt ||
+        (terminal.has(value.state) && value.state !== 'cancelled')
+      )
+        return;
+      if (value.state !== 'cancelled') {
+        value.state = 'conflict';
+        value.reason = safeReason(result.reason);
+      }
+      if (result.inputReleased === true) value.inputReleased = true;
+      delete value.submittedAt;
+      delete value.deadlineAt;
+    });
   }
 
   async reconcileReceipt(id) {
@@ -765,7 +805,10 @@ export class UiTextOutbox {
       return this.#wait(job, 'UI_OBSERVATION_FAILED');
     }
     if (!this.#canAct(job, lease)) return this.get(job.id);
-    if (observation?.ready !== true) return this.#wait(job, observation?.reason);
+    if (observation?.ready !== true)
+      return textDraftRequiresReview(observation?.reason) && job.index > 0 && !job.pendingInput
+        ? this.#holdDraft(job, observation)
+        : this.#wait(job, observation?.reason);
     if (observation.account !== job.account || observation.target !== job.target)
       return this.#wait(job, 'UI_TARGET_NOT_VERIFIED');
     if (observation.foreground !== true) return this.#wait(job, 'UI_FOREGROUND_REQUIRED');
@@ -777,6 +820,8 @@ export class UiTextOutbox {
       !token(observation.activityRevision)
     )
       return this.#wait(job, 'UI_EDITOR_NOT_VERIFIED');
+    if (job.inputProcess && job.inputProcess !== observation.inputProcess)
+      return this.#conflict(job, 'UI_WECHAT_PROCESS_CHANGED');
 
     const parts = textGraphemes(job.text);
     let expectedDraft = parts.slice(0, job.index).join('');
@@ -836,6 +881,7 @@ export class UiTextOutbox {
       const intention = this.#change(
         job.id,
         value => {
+          if (observation.inputProcess) value.inputProcess = observation.inputProcess;
           value.pendingInput = {
             index: value.index,
             text,
@@ -874,6 +920,7 @@ export class UiTextOutbox {
             // A control can change the revision while the same input is in flight.
             if (JSON.stringify(value.pendingInput) !== JSON.stringify(intention.pendingInput)) return;
             delete value.pendingInput;
+            if (value.index === 0) delete value.inputProcess;
             if (value.revision !== intention.revision) return;
             value.state = 'paused';
             value.reason = safeReason(result.reason);
@@ -933,7 +980,9 @@ export class UiTextOutbox {
       );
     }
     if (result?.performed === false && result?.attempted === false)
-      return this.#pauseUnsubmitted(intention, result.reason);
+      return textDraftRequiresReview(result.reason)
+        ? this.#holdDraft(intention, result)
+        : this.#pauseUnsubmitted(intention, result.reason);
     return (
       this.#change(
         job.id,

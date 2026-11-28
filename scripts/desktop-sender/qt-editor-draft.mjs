@@ -4,6 +4,7 @@ import {
   observedLayout,
   preparationWaits,
   codeFor,
+  hash,
   qtEmptyEditorHashes,
   validateQtEmptyDraftPhaseProof,
   validateQtEmptyDraftPhase,
@@ -15,10 +16,11 @@ export class QtEditorDraft {
   /** @param {import('./qt-window-frames.mjs').QtWindowFrames} frames
    * @param {import('./qt-focus-session.mjs').QtFocusSession} focus
    * @param {Pick<import('./qt-visual-driver.mjs').QtVisualDriver,'action'|'active'|'requestNative'|'textStepBinding'|'verifyControlBinding'|'current'|'discardNativeFrameImage'|'root'|'operationSignal'>} input */
-  constructor(frames, focus, input) {
+  constructor(frames, focus, input, { inspectEditor = inspectEditorPixels } = {}) {
     this.frames = frames;
     this.focus = focus;
     this.input = input;
+    this.inspectEditor = inspectEditor;
   }
   async verifyNew(job, verified, signal) {
     // Input after this point may paste or submit. Acquire an empty editor once,
@@ -43,12 +45,19 @@ export class QtEditorDraft {
       await this.input.verifyControlBinding(job, verified.frame, 'prepare', signal);
     }
   }
-  async readDraft(job) {
+  async verifyTypedForSubmit(job, expected, textEnterProof) {
+    const submitProof = nativeTextProof(textEnterProof, expected);
+    const verified = await this.readDraft(job, { submitProof });
+    if (verified.draft !== expected || verified.textEnterProof?.id !== submitProof.id)
+      throw fault('UI_QT_TYPED_TEXT_MISMATCH');
+    return verified;
+  }
+  async readDraft(job, { submitProof } = {}) {
     // Moving away from the editor removes its hover/placeholder variation.
     // This is a fresh guarded move only: the editor keeps keyboard focus and
     // the native empty-template observation retains its original time limit.
     const pointerParkRect = this.frames.config.layout.pointerParkRect ?? this.frames.config.layout.focusActivateRect;
-    if (pointerParkRect) {
+    if (pointerParkRect && !submitProof) {
       const parked = await this.input.action(
         'movePointer',
         {
@@ -68,23 +77,48 @@ export class QtEditorDraft {
     const currentDraft = this.input.current;
     if (!verifiedEmptyHashes.length && currentDraft?.jobId === job?.id)
       verifiedEmptyHashes = currentDraft?.verifiedEmptyHashes ?? [];
-    let measured;
-    if (!verifiedEmptyHashes.length) {
+    let measured, frame;
+    if (!verifiedEmptyHashes.length && !submitProof) {
       measured = await this.frames.capture(['header', 'editor'], true);
       try {
-        verifiedEmptyHashes = await inspectEditorPixels({
+        verifiedEmptyHashes = await this.inspectEditor({
           root: this.input.root,
           frame: measured,
           header: layout.header,
           editor: layout.editor,
           signal: this.input.operationSignal,
         });
+      } catch (error) {
+        if (error?.code !== 'UI_QT_LAYOUT_EDITOR_CORNER_UNCERTAIN') throw error;
+        // The image is geometry evidence. The native empty-editor check
+        // observes the current control and its current pixels under a
+        // fresh, matching header, independent of the old caret image.
+        frame = await this.frames.capture(['header']);
+        if (!sameHeaderView(measured, frame)) throw fault('UI_QT_HEADER_CHANGED');
+        const { token, epoch, revision } = frame;
+        let check;
+        try {
+          check = await this.input.requestNative('checkClearMessageQuote', {
+            token,
+            epoch,
+            revision,
+            idleMs: this.frames.config.idleMs,
+            headerRect: layout.header,
+            emptyEditorRect: layout.editor,
+          });
+        } catch (unavailable) {
+          if (/^QT_UIA_/.test(unavailable?.code ?? '') || unavailable?.code === 'QT_OPERATION_FAILED') throw error;
+          throw unavailable;
+        }
+        if (check?.clear !== true || !hash(check.emptyEditorSha256)) throw error;
+        verifiedEmptyHashes = [check.emptyEditorSha256];
       } finally {
         this.input.discardNativeFrameImage(measured);
       }
     }
-    const frame = await this.frames.capture(['header']);
+    frame ??= await this.frames.capture(['header']);
     if (measured && !sameHeaderView(measured, frame)) throw fault('UI_QT_HEADER_CHANGED');
+    const shared = observedLayout(this.frames.config) && (submitProof || Boolean(this.focus.preparationLease()));
     let result;
     try {
       result = await this.input.requestNative('readDraft', {
@@ -93,7 +127,7 @@ export class QtEditorDraft {
         revision: frame.revision,
         idleMs: this.frames.config.idleMs,
         editorRect: this.frames.config.layout.editor,
-        ...(observedLayout(this.frames.config) && this.focus.preparationLease()
+        ...(shared
           ? {
               headerRect: this.frames.config.layout.header,
               ...(job
@@ -103,8 +137,9 @@ export class QtEditorDraft {
                 : {}),
             }
           : {}),
-        emptyEditorSha256: verifiedEmptyHashes[0],
-        emptyEditorSha256s: verifiedEmptyHashes,
+        ...(submitProof
+          ? { textEnterProofId: submitProof.id, textSha256: submitProof.textSha256 }
+          : { emptyEditorSha256: verifiedEmptyHashes[0], emptyEditorSha256s: verifiedEmptyHashes }),
       });
     } catch (error) {
       if (preparationWaits.has(codeFor(error)) && error?.attempted !== false && error?.clipboardRestored !== true)
@@ -130,11 +165,10 @@ export class QtEditorDraft {
           )
         : undefined;
     if (emptyDraftPhaseProof && result.richContentVerified !== true) throw fault('UI_QT_EMPTY_PHASE_PROOF_INVALID');
-    const shared = observedLayout(this.frames.config) && Boolean(this.focus.preparationLease()),
-      current =
-        shared && result.draft !== ''
-          ? this.frames.acceptPostPasteFrame(result.postPasteFrame, frame, ['header', 'editor'])
-          : await this.frames.capture(['header', 'editor']);
+    const current =
+      shared && result.draft !== ''
+        ? this.frames.acceptPostPasteFrame(result.postPasteFrame, frame, ['header', 'editor'])
+        : await this.frames.capture(['header', 'editor']);
     const verifiedEmptyPhase =
       emptyDraftPhaseProof && !verifiedEmptyHashes.includes(current.regions[1].rgbaSha256)
         ? await this.inspectEmptyDraftPhase(current, emptyDraftPhaseProof)

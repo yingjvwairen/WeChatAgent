@@ -192,7 +192,7 @@ export async function bootstrapDesktopSender({
   try {
     if (settings.controlMode === 'uia') {
       provider = createProvider({ root, configFile, ensureAccessibility });
-      const observed = await provider.inspectControls(seed, binding, { signal });
+      const observed = await provider.inspectControls(seed, binding, { signal, allowSearchOnly: true });
       config = validateQtConfig(
         toUiaLayoutConfig(seed, { layout: observed.layout, voice: observed.voice, searchPopupCalibration: popup }),
       );
@@ -263,6 +263,25 @@ export async function bootstrapDesktopSender({
     };
   } catch (error) {
     await provider?.close();
+    if (
+      ['UI_QT_CONVERSATION_LAYOUT_REQUIRED', 'UIA_MODE_CONTROLS_UNAVAILABLE'].includes(error?.code) &&
+      error.searchLayout
+    )
+      throw Object.assign(fault('UI_QT_CONVERSATION_LAYOUT_REQUIRED'), {
+        searchRecovery: {
+          binding,
+          accountProbe,
+          config: validateQtConfig(
+            {
+              ...seed,
+              hwnd: binding.hwnd,
+              layoutMode: settings.controlMode === 'uia' ? 'uia-v1' : 'adaptive-v1',
+              layout: error.searchLayout,
+            },
+            { searchOnly: true },
+          ),
+        },
+      });
     throw error;
   }
 }

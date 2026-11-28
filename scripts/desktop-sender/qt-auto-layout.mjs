@@ -71,12 +71,12 @@ function bindingMatches(before, after) {
     same(before.captureRect, after.captureRect)
   );
 }
-function readonlyFrame(frame, inspection, handoff = false) {
+function readonlyFrame(frame, inspection) {
   if (
     !object(frame) ||
     frame.readOnly !== true ||
     frame.inputSent !== false ||
-    frame.focusChanged !== handoff ||
+    frame.focusChanged !== false ||
     frame.authorizationGranted !== false ||
     frame.pixelFormat !== 'rgba-row-major-opaque-v1' ||
     frame.token !== undefined ||
@@ -125,40 +125,6 @@ function layoutVisibilityRestored(outcome) {
   );
 }
 function restoredLayoutPair(packet, inspection) {
-  if (packet?.mode === 'focus-handoff-layout-pair-v1') {
-    const interval = packet.foregroundInterval,
-      outcome = packet.focusRestoreOutcome;
-    if (
-      packet.version !== 1 ||
-      packet.focusChanged !== true ||
-      typeof packet.inputSent !== 'boolean' ||
-      packet.chatInputSent !== false ||
-      packet.clipboardAccessed !== false ||
-      packet.authorizationGranted !== false ||
-      packet.restored !== true ||
-      packet.activityUnchanged !== true ||
-      outcome?.reason !== 'restored' ||
-      outcome.restored !== true ||
-      outcome.skipped !== false ||
-      outcome.identitiesUnchanged !== true ||
-      outcome.activityUnchanged !== true ||
-      interval?.complete !== true ||
-      interval.phase !== 'preparation' ||
-      !Number.isSafeInteger(interval.durationMs) ||
-      interval.durationMs < 0 ||
-      interval.durationMs > 60000 ||
-      !Array.isArray(packet.frames) ||
-      packet.frames.length !== 2
-    )
-      throw fault('UI_QT_LAYOUT_FOCUS_RETURN_UNVERIFIED');
-    for (const frame of packet.frames) {
-      readonlyFrame(frame, inspection, true);
-      if (frame.binding.foreground !== true || !Array.isArray(frame.regions) || frame.regions.length)
-        throw fault('UI_QT_LAYOUT_CAPTURE_INVALID');
-    }
-    if (packet.frames[0].image?.file === packet.frames[1].image?.file) throw fault('UI_QT_LAYOUT_CAPTURE_INVALID');
-    return packet.frames;
-  }
   const interval = packet?.raisedVisibilityInterval;
   if (
     !object(packet) ||
@@ -199,25 +165,6 @@ function restoredLayoutPair(packet, inspection) {
   }
   if (packet.frames[0].image?.file === packet.frames[1].image?.file) throw fault('UI_QT_LAYOUT_CAPTURE_INVALID');
   return packet.frames;
-}
-export function unborrowedLayoutRefusal(error) {
-  const focus = error?.focusConfirmation,
-    outcome = error?.focusRestoreOutcome;
-  return (
-    error?.code === 'QT_FOCUS_ACQUIRE_UNCONFIRMED' &&
-    error.attempted === false &&
-    focus?.attempted === true &&
-    focus.accepted === false &&
-    focus.confirmed === false &&
-    focus.reason === 'request-rejected' &&
-    outcome?.reason === 'foreground-not-wechat' &&
-    outcome.foregroundOwnedByWechat === false &&
-    outcome.restored === false &&
-    outcome.skipped === true &&
-    outcome.identitiesUnchanged === true &&
-    outcome.activityUnchanged === true &&
-    outcome.keysReleased === true
-  );
 }
 
 /** Project-owned, isolated Python only. Output contains geometry/hashes, never
@@ -320,6 +267,50 @@ export async function runQtLayoutPython({
 
 const requiredLayout = ['header', 'profileOpen', 'search', 'selfOpen', 'editor', 'send', 'focusActivateRect'];
 const score = (value, min) => Number.isFinite(value) && value >= min && value <= 1;
+const conversationLayoutFailures = new Set([
+  'UI_QT_LAYOUT_HEADER_BOUNDARY_UNCERTAIN',
+  'UI_QT_LAYOUT_CHAT_TITLE_UNCERTAIN',
+  'UI_QT_LAYOUT_EDITOR_FRAME_UNCERTAIN',
+  'UI_QT_LAYOUT_EDITOR_CONTENT_UNCERTAIN',
+  'UI_QT_LAYOUT_LABEL_CONTROL_BOUNDARY_UNCERTAIN',
+]);
+
+async function recoverableSearchLayout(runPython, request, identity, frame, originalError) {
+  let value;
+  try {
+    value = await runPython({ ...request, args: [...request.args, '--search-only'] });
+  } catch (error) {
+    if (request.signal?.aborted) throw error;
+    throw originalError;
+  }
+  if (
+    value?.searchOnly !== true ||
+    value.version !== 1 ||
+    value.ok !== true ||
+    value.readOnly !== true ||
+    value.inputSent !== false ||
+    value.emptyDraftAuthorized !== false ||
+    value.identityVerified !== false ||
+    value.imageSha256 !== frame.image.sha256 ||
+    value.executableVersion !== identity.executableVersion ||
+    value.width !== identity.width ||
+    value.height !== identity.height ||
+    value.dpi !== identity.dpi ||
+    !score(value.confidence, 0.97) ||
+    !rect(value.layout?.search, identity.width, identity.height) ||
+    !rect(value.layout?.pointerParkRect, identity.width, identity.height)
+  )
+    throw originalError;
+  throw Object.assign(fault('UI_QT_CONVERSATION_LAYOUT_REQUIRED'), {
+    searchLayout: {
+      width: identity.width,
+      height: identity.height,
+      dpi: identity.dpi,
+      search: value.layout.search,
+      pointerParkRect: value.layout.pointerParkRect,
+    },
+  });
+}
 const navigationTemplateSha256 = '7f10b2c4d70489b61d2fa1a94cc98f40e3181c77e3f3c4c4894987a83682c005';
 function navigationEvidence(row, value) {
   if (!Object.hasOwn(row, 'method')) return !Object.hasOwn(row, 'neutralSupport') && score(row.support, 0.78);
@@ -749,14 +740,9 @@ async function resolveQtLayout(
       );
       let packet;
       try {
-        if (client.layoutOnlyFocus)
-          try {
-            packet = await client.request('captureLayoutHandoff', { expectedBinding, idleMs: config.idleMs });
-          } catch (error) {
-            if (!unborrowedLayoutRefusal(error)) throw error;
-            packet = await client.request('captureLayoutRaised', { expectedBinding, idleMs: config.idleMs });
-          }
-        else packet = await client.request('captureLayoutRaised', { expectedBinding, idleMs: config.idleMs });
+        // Geometry needs pixels, so expose the bound window without borrowing
+        // keyboard focus. The send transaction acquires focus independently.
+        packet = await client.request('captureLayoutRaised', { expectedBinding, idleMs: config.idleMs });
       } catch (error) {
         if (error?.code === 'QT_WINDOW_OBSCURED' && layoutVisibilityRestored(error.visibilityRestoreOutcome))
           throw Object.assign(new Error('UI_QT_LAYOUT_VISIBILITY_BLOCKED'), {
@@ -780,12 +766,20 @@ async function resolveQtLayout(
     }
     const file = boundImage(root, frame.image, identity.width, identity.height);
     files.add(file);
-    const located = await runPython({
+    const locatorRequest = {
       root,
       script: 'locate-wechat-layout.py',
       args: ['--image', file, '--dpi', String(identity.dpi), '--version', identity.executableVersion],
       signal,
-    });
+    };
+    let located;
+    try {
+      located = await runPython(locatorRequest);
+    } catch (error) {
+      if (bootstrapIdentity && conversationLayoutFailures.has(error?.code) && !signal?.aborted)
+        await recoverableSearchLayout(runPython, locatorRequest, identity, frame, error);
+      throw error;
+    }
     const regions = locatorRegions(located, identity, frame.image.sha256);
     if (config.sharedDesktop === true) {
       // Layout discovery needs edges and toolbar glyphs, not an empty editor.

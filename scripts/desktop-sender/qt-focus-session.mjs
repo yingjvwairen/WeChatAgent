@@ -89,6 +89,15 @@ export class QtFocusSession {
   }
   async acquireForPreparation(job, preparation, { warmLocators, freshAccount, resumableTextStep, now }) {
     const { previous, voicePreparation, signal, borrowedFocus } = preparation;
+    if (voicePreparation || this.#voiceFocusLease) {
+      const lease = this.#voiceFocusLease;
+      // The voice path already acquired this exact lease before navigation.
+      // An idle handoff inspection would refuse while that lease is active.
+      if (!lease || voicePreparation?.lease !== lease || lease.owner !== this.#native.owner || lease.parked)
+        throw fault('UI_QT_FOCUS_LEASE_INVALID', { attempted: false });
+      this.#active();
+      return;
+    }
     if (!this.textFocusLease) {
       if (this.textFocusRelease) await this.textFocusRelease;
       const owner = this.#native.owner;
@@ -96,10 +105,9 @@ export class QtFocusSession {
       const inPlace =
         preflight.reason === 'QT_FOCUS_RETURN_WINDOW_REQUIRED' &&
         this.#frames.config.layoutMode === 'uia-v1' &&
-        !voicePreparation &&
         job.mode !== 'voice';
       if (preflight.ready || inPlace) {
-        if (!voicePreparation && !resumableTextStep(previous, job)) {
+        if (!resumableTextStep(previous, job)) {
           // Process/database inspection does not need foreground. Bind this
           // one preparation to its current geometry, then validate its
           // unchanged 500ms evidence window again after acquiring focus.
@@ -148,7 +156,6 @@ export class QtFocusSession {
             if (
               !borrowedFocus &&
               !this.preparationLease() &&
-              !voicePreparation &&
               !signal?.aborted &&
               /^(?:UI_ACCOUNT_[A-Z_]+|UI_QT_ACCOUNT_UNVERIFIED)$/.test(error?.code ?? '') &&
               error.code !== 'UI_ACCOUNT_PROBE_ABORTED'
@@ -183,13 +190,14 @@ export class QtFocusSession {
             owner,
           );
         } catch (error) {
-          // These two codes originate while probing the return caption,
-          // before the native focus lease is created or WeChat is activated.
+          // A refusal before input can be retried with fresh focus evidence.
           if (
             error.attempted === false &&
-            ['QT_RETURN_CAPTION_UNAVAILABLE', 'QT_RETURN_CAPTION_WARMUP'].includes(error.code)
+            ['QT_RETURN_CAPTION_UNAVAILABLE', 'QT_RETURN_CAPTION_WARMUP', 'DRAFT_FOCUS_SOURCE_CHANGED'].includes(
+              error.code,
+            )
           )
-            preparation.returnCaptionFailure = error;
+            preparation.focusPreflightFailure = error;
           throw error;
         }
         if (
@@ -206,7 +214,7 @@ export class QtFocusSession {
           attempted: false,
         });
         if (['QT_RETURN_CAPTION_UNAVAILABLE', 'QT_RETURN_CAPTION_WARMUP'].includes(preflight.reason))
-          preparation.returnCaptionFailure = error;
+          preparation.focusPreflightFailure = error;
         throw error;
       }
     }

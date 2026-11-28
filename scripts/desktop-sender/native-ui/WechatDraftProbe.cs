@@ -902,16 +902,25 @@ internal static partial class WechatDraftProbe
         Need(current == source, "DRAFT_FOCUS_SOURCE_CHANGED");
         return false;
     }
-    static void FocusThreadReady(uint thread)
+    static void FocusThreadReady(uint thread, Dictionary<string, object> diagnostic = null, string flagsKey = null)
     {
         Need(thread != 0 &&
                  String.Equals(ObjectName(GetThreadDesktop(thread)), "Default", StringComparison.OrdinalIgnoreCase),
              "DRAFT_DESKTOP_UNAVAILABLE");
         var info = new GuiInfo { Size = (uint)Marshal.SizeOf(typeof(GuiInfo)) };
-        Need(GetGUIThreadInfo(thread, ref info) && (info.Flags & 0x1e) == 0, "DRAFT_FOCUS_MENU_ACTIVE");
+        Need(GetGUIThreadInfo(thread, ref info), "DRAFT_FOCUS_UNAVAILABLE");
+        uint flags = info.Flags & 0x1e;
+        if (diagnostic != null)
+            diagnostic[flagsKey] = flags;
+        Need(flags == 0, "DRAFT_MENU_OR_MOVE_ACTIVE");
+    }
+    static long? FocusInputIdleMilliseconds(long now, uint inputTick)
+    {
+        uint elapsed = unchecked((uint)now - inputTick);
+        return elapsed <= Int32.MaxValue ? (long?)elapsed : null;
     }
     // No attached input queues: SetForegroundWindow can block synchronously
-    // when queues are linked. A calibrated ordinary click is the only fallback.
+    // when queues are linked. Use verified caption input as the physical fallback.
     static bool ActivateForegroundOnce(IntPtr source, IntPtr target, Action guard, FocusActivation calibration = null,
                                        Action<Rect> semanticGuard = null)
     {
@@ -929,8 +938,8 @@ internal static partial class WechatDraftProbe
                  "foregroundLastErrorInformational", true, "foregroundAfter", "not-requested",
                  "calibratedClickAttempted", false, "calibratedClickApplied", false, "pointerRestored", false);
         FocusActivationDiagnostic = diagnostic;
-        FocusThreadReady(from);
-        FocusThreadReady(to);
+        FocusThreadReady(from, diagnostic, "sourceMenuOrMoveFlags");
+        FocusThreadReady(to, diagnostic, "targetMenuOrMoveFlags");
         Action validate = delegate
         {
             guard();
@@ -940,12 +949,38 @@ internal static partial class WechatDraftProbe
             Need(GetWindowThreadProcessId(source, out a) == from && a == sourcePid &&
                      GetWindowThreadProcessId(target, out b) == to && b == targetPid,
                  "DRAFT_FOCUS_THREAD_CHANGED");
-            FocusThreadReady(from);
-            FocusThreadReady(to);
+            FocusThreadReady(from, diagnostic, "sourceMenuOrMoveFlags");
+            FocusThreadReady(to, diagnostic, "targetMenuOrMoveFlags");
         };
-        return FocusTryRequest(delegate{validate();Need(GetForegroundWindow()==source,"DRAFT_FOCUS_SOURCE_CHANGED");FocusClearLastError(0);bool accepted=FocusSetForegroundWindow(target);diagnostic["foregroundRequestAccepted"]=accepted;diagnostic["foregroundLastError"]=Marshal.GetLastWin32Error();IntPtr after=GetForegroundWindow();diagnostic["foregroundAfter"]=after==target?"target":after==source?"source":after==IntPtr.Zero?"none":"other";return accepted;},
-            calibration==null?(Func<bool>)null:delegate{return FocusCalibratedClick(source,target,targetPid,calibration,validate,diagnostic,semanticGuard);},
-            delegate{return FocusTargetBeforeClick(source,target,validate,GetForegroundWindow,diagnostic);});
+        return FocusTryRequest(
+            delegate {
+                diagnostic["callerWasForegroundProcess"] = sourcePid == GetCurrentProcessId();
+                var input = new LastInput { Size = (uint)Marshal.SizeOf(typeof(LastInput)) };
+                if (GetLastInputInfo(ref input))
+                    diagnostic["sessionIdleMs"] = FocusInputIdleMilliseconds(Now(), input.Time);
+                uint timeout;
+                if (FocusGetSystemParameter(0x2000, 0, out timeout, 0))
+                    diagnostic["foregroundLockTimeoutMs"] = timeout;
+                validate();
+                Need(GetForegroundWindow() == source, "DRAFT_FOCUS_SOURCE_CHANGED");
+                FocusClearLastError(0);
+                bool accepted = FocusSetForegroundWindow(target);
+                diagnostic["foregroundRequestAccepted"] = accepted;
+                diagnostic["foregroundLastError"] = Marshal.GetLastWin32Error();
+                IntPtr after = GetForegroundWindow();
+                diagnostic["foregroundAfter"] = after == target        ? "target"
+                                                : after == source      ? "source"
+                                                : after == IntPtr.Zero ? "none"
+                                                                       : "other";
+                diagnostic["foregroundAfterRequest"] = diagnostic["foregroundAfter"];
+                return accepted;
+            },
+            calibration == null ? (Func<bool>)null
+                                : delegate {
+                                      return FocusCalibratedClick(source, target, targetPid, calibration, validate,
+                                                                  diagnostic, semanticGuard);
+                                  },
+            delegate { return FocusTargetBeforeClick(source, target, validate, GetForegroundWindow, diagnostic); });
     }
     static bool FocusBlankCaption(byte[] pixels)
     {
@@ -1471,7 +1506,8 @@ internal static partial class WechatDraftProbe
         }
     }
     static FocusConfirmation ConfirmFocusOnce(IntPtr source, IntPtr target, Func<bool> activate, Action guard,
-                                              Func<IntPtr> foreground, Func<long> clock, Action<int> wait)
+                                              Func<IntPtr> foreground, Func<long> clock, Action<int> wait,
+                                              Action finish = null)
     {
         var result = new FocusConfirmation();
         long started = clock(), deadline = started + 500;
@@ -1545,6 +1581,16 @@ internal static partial class WechatDraftProbe
             result.ElapsedMs = Math.Max(0, clock() - started);
             result.Activation = FocusActivationDiagnostic;
             FocusActivationDiagnostic = null;
+            try
+            {
+                if (finish != null)
+                    finish();
+            }
+            catch (Exception error)
+            {
+                error.Data["focusConfirmation"] = result;
+                throw;
+            }
         }
     }
     static void NeedFocusConfirmed(FocusConfirmation result, string code)
@@ -1576,18 +1622,35 @@ internal static partial class WechatDraftProbe
         {
             clock += ms;
         };
+        bool exposureRestored = false;
         var result = ConfirmFocusOnce(source, target, accept, guard,
                                       delegate { return clock == 0   ? source
                                                         : clock < 30 ? IntPtr.Zero
                                                                      : target; },
-                                      delegate { return clock; }, wait);
-        Need(result.Confirmed && result.Accepted && calls == 1 && result.ElapsedMs == 30, "TEST_FOCUS_ASYNC_CONFIRM");
+                                      delegate { return clock; }, wait,
+                                      delegate {
+                                          Need(clock == 30, "TEST_FOCUS_EXPOSURE_LASTS_UNTIL_TARGET_CONFIRMED");
+                                          exposureRestored = true;
+                                      });
+        Need(result.Confirmed && result.Accepted && calls == 1 && result.ElapsedMs == 30 && exposureRestored,
+             "TEST_FOCUS_ASYNC_CONFIRM");
         checks++;
         calls = 0;
         clock = 0;
+        exposureRestored = false;
         result = ConfirmFocusOnce(source, target, accept, guard, delegate { return source; },
+                                  delegate { return clock; }, wait, delegate { exposureRestored = true; });
+        Need(!result.Confirmed && result.Reason == "timeout" && calls == 1 && clock == 500 && exposureRestored,
+             "TEST_FOCUS_WAIT_BOUNDED");
+        checks++;
+        calls = 0;
+        clock = 0;
+        int foregroundReads = 0;
+        result = ConfirmFocusOnce(source, target, accept, guard,
+                                  delegate { return ++foregroundReads == 2 ? target : source; },
                                   delegate { return clock; }, wait);
-        Need(!result.Confirmed && result.Reason == "timeout" && calls == 1 && clock == 500, "TEST_FOCUS_WAIT_BOUNDED");
+        Need(!result.Confirmed && result.Reason == "timeout" && calls == 1,
+             "TEST_FOCUS_BRIEF_TRANSITION_DOES_NOT_GRANT_INPUT");
         checks++;
         calls = 0;
         clock = 0;
@@ -2232,6 +2295,8 @@ internal static partial class WechatDraftProbe
     static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
     [DllImport("user32.dll", EntryPoint = "SetForegroundWindow", SetLastError = true)]
     static extern bool FocusSetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW")]
+    static extern bool FocusGetSystemParameter(uint action, uint parameter, out uint value, uint flags);
     [DllImport("user32.dll", EntryPoint = "SetWindowPos", SetLastError = true)]
     static extern bool FocusSetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll", EntryPoint = "GetWindow")]

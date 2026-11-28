@@ -19,6 +19,7 @@ import { ownsDesktop, selectDelivery } from './scheduler.mjs';
 import { ReplyDeliveryControls } from '../../packages/dsh-social-bridge-plugin/reply-delivery-controls.mjs';
 import { FILE_LIMIT, safeFileName } from '../../packages/wechat-file-reference.mjs';
 import { normalizeDesktopText, validDesktopText, canTypeDesktopText } from './text-contract.mjs';
+import { desktopProcessIdentity, desktopProcessPrecedes } from './account-probe.mjs';
 import {
   canRefreshReleasedReceipt,
   canSettleStoredVoiceReceipt,
@@ -39,6 +40,33 @@ const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value
 const routeId = payload => hash(JSON.stringify([payload.account, payload.deliveryId]));
 const voicePreflightWaitMs = 30000;
 const awaitsVoiceReceipt = state => state?.segments?.some(voicePartNeedsReceipt);
+const foregroundPreparationRefusals = new Set([
+  'QT_FOCUS_ACQUIRE_UNCONFIRMED',
+  'QT_UIA_CAPTION_OBSCURED',
+  'QT_WINDOW_OBSCURED',
+]);
+function stoppedBeforeReplyInput({ context, row, state, revoked }) {
+  const { job } = row;
+  return (
+    job.operation === 'text' &&
+    !job.quote &&
+    !row.paused &&
+    !row.revoked &&
+    !revoked &&
+    state.state === 'paused' &&
+    state.submission === 'not-started' &&
+    !ownsDesktop(state) &&
+    !state.inputStarted &&
+    !state.focusRecoveryRequired &&
+    foregroundPreparationRefusals.has(state.reason) &&
+    digest(job.parentId) &&
+    context.chatControls.hasSubmissionClaim(
+      'wechat:' + job.kind + ':' + job.target,
+      job.rosterGrant ?? 'legacy',
+      job.parentId,
+    )
+  );
+}
 const admissionRefusalCodes = new Set([
   'CONVERSATION_NOT_ALLOWED',
   'DESKTOP_TARGET_CHANGED',
@@ -206,10 +234,16 @@ export class DesktopSenderEngine {
     const settings = structuredClone(this.settings());
     const configurationKey = this.configurationKey(settings);
     let context = this.contexts.get(account.accountRef);
+    const currentProcess = desktopProcessIdentity(account.binding);
+    const replacingClient = desktopProcessPrecedes(desktopProcessIdentity(context?.account.binding), currentProcess);
     if (context) {
       if (context.account.accountWxid !== account.accountWxid) throw fault('DESKTOP_ACCOUNT_CHANGED');
-      if (context.configurationKey === configurationKey) return context;
-      if (
+      if (context.configurationKey === configurationKey && !replacingClient) return context;
+      if (replacingClient) {
+        context.rebinding = true;
+        await this.pumping;
+        if (this.closed) throw fault('DESKTOP_ENGINE_STOPPED');
+      } else if (
         this.pumping ||
         [...context.metadata.values()].some(
           row => this.blocks(context, row) && ownsDesktop(this.snapshot(context, row)),
@@ -258,8 +292,13 @@ export class DesktopSenderEngine {
         settings,
       };
       createDeliveryQueues(this, context);
-      for (const row of context.metadata.values()) this.ensureAdmission(context, row);
+      for (const row of context.metadata.values()) {
+        this.ensureAdmission(context, row);
+        if (currentProcess && row.job.operation === 'text' && !row.admissionError)
+          context.text.detachPreviousProcess(row.job.id, currentProcess);
+      }
       this.contexts.set(account.accountRef, context);
+      if (replacingClient) this.kick();
       return context;
     } catch (error) {
       await driver.close();
@@ -301,6 +340,7 @@ export class DesktopSenderEngine {
       const row = this.metadata(context, job.id);
       if (
         this.closed ||
+        context.rebinding ||
         this.inputExpired(row) ||
         this.settings().paused ||
         row.paused ||
@@ -341,7 +381,9 @@ export class DesktopSenderEngine {
           (outcome.confirmed ||
             (outcome.state === 'unconfirmed' && outcome.inputReleased) ||
             (['cancelled', 'failed'].includes(outcome.state) &&
-              (!outcome.inputStarted || (row.job.operation === 'voice' && !ownsDesktop(outcome))))))
+              (!outcome.inputStarted ||
+                outcome.inputReleased ||
+                (row.job.operation === 'voice' && !ownsDesktop(outcome))))))
       ) {
         if (['file', 'image', 'sticker'].includes(row.job.operation)) context.images.releaseAsset(row.job.id);
         context.store.retire(row, outcome);
@@ -719,6 +761,7 @@ export class DesktopSenderEngine {
     while (!this.closed) {
       if (this.configurationPending && this.configurationSafe()) return;
       const candidates = [...this.contexts.values()].flatMap(context => {
+        if (context.rebinding) return [];
         const holds = context.chatControls.heldChats();
         return [...context.metadata.values()]
           .filter(row => this.blocks(context, row))
@@ -738,6 +781,13 @@ export class DesktopSenderEngine {
             };
           });
       });
+      // The bridge must get a terminal result when a failed automatic reply
+      // is proven to have no draft or submission to reconcile.
+      const blockedReply = candidates.find(stoppedBeforeReplyInput);
+      if (blockedReply) {
+        await this.retireInput(blockedReply.context, blockedReply.row, blockedReply.state.reason);
+        continue;
+      }
       const voiceReceipt = candidates.find(
         ({ row, state }) => row.job.operation === 'voice' && awaitsVoiceReceipt(state),
       );

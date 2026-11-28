@@ -197,16 +197,17 @@ export function savedRecovery({ root, accountRef, id, voiceState = undefined }) 
     : readArchivedDelivery(archiveFor(root, accountRef), id, 16384);
 }
 export function reviewedRecovery(scope) {
-  return savedRecovery(scope)?.recovered === true;
+  const recovery = savedRecovery(scope);
+  return recovery?.recovered === true && recovery.resolvedByClientRestart !== true;
 }
-export function resolveRecovery({ root, accountRef, id }) {
+export function resolveRecovery({ root, accountRef, id, clientRestart = false }) {
   const file = fileFor(root, accountRef, id),
     value = read(file);
   if (value && !value.recovered)
     archiveResolved(root, accountRef, id, {
       ...value,
       recovered: true,
-      resolvedByReceipt: true,
+      ...(clientRestart ? { resolvedByClientRestart: true } : { resolvedByReceipt: true }),
       canRecover: false,
     });
 }
@@ -316,7 +317,11 @@ export function deliveryRecovery(root, row, state, activeJob) {
     resolveRecovery({ root, accountRef: row.job.accountRef, id: row.job.id });
     return null;
   }
-  if (state.inputReleased === true) return null;
+  if (state.inputReleased === true && state.state !== 'conflict') {
+    if (state.reason === 'UI_WECHAT_PROCESS_RESTARTED')
+      resolveRecovery({ root, accountRef: row.job.accountRef, id: row.job.id, clientRestart: true });
+    return null;
+  }
   const quoteDraft = row.job.quote && readQuoteDraft(root, row.job.accountRef, row.job.target);
   if (quoteDraft?.id === row.job.id && (state.manualPause || ['cancelled', 'failed', 'conflict'].includes(state.state)))
     return publishRecovery({

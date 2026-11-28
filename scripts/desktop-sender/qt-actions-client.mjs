@@ -8,6 +8,7 @@ import {
   noLinks,
   object,
   pasteCommands,
+  sameRect,
   validateQtConfig,
 } from './qt-contract.mjs';
 import path from 'node:path';
@@ -15,6 +16,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { clipboardBackupDiagnostic } from './clipboard-backup-diagnostic.mjs';
+import { recordForegroundDiagnostic } from './foreground-diagnostics.mjs';
 import {
   focusConfirmationDiagnostic,
   focusRestoreOutcomeDiagnostic,
@@ -28,6 +30,9 @@ import {
   visibilityRestoreOutcomeDiagnostic,
 } from './qt-diagnostics.mjs';
 
+const searchOnlyObservations = new Set(['inspectLayout', 'inspectFocusHandoff', 'inspectPopup', 'releaseFocusHandoff']);
+const searchOnlyTransitions = new Set(['beginFocusHandoff', 'beginForegroundSession', 'searchEnter']);
+
 class QtActionsClient {
   constructor({
     root,
@@ -36,10 +41,17 @@ class QtActionsClient {
     calibration = false,
     layoutOnlyFocus = false,
     canCapture,
+    searchOnly = false,
+    canNavigate,
     spawnImpl = spawn,
     timeoutMs = 20000,
     closeTimeoutMs = 3000,
   }) {
+    if (
+      typeof searchOnly !== 'boolean' ||
+      (searchOnly && (calibration || !enableInput || typeof canNavigate !== 'function'))
+    )
+      throw fault('UI_QT_SEARCH_CLIENT_OPTIONS_INVALID');
     if (typeof layoutOnlyFocus !== 'boolean' || (layoutOnlyFocus && (!calibration || typeof canCapture !== 'function')))
       throw fault('UI_QT_CALIBRATION_OPTIONS_INVALID');
     if (calibration) {
@@ -53,12 +65,14 @@ class QtActionsClient {
       )
         throw fault('UI_QT_CALIBRATION_OPTIONS_INVALID');
       this.config = structuredClone(config);
-    } else this.config = validateQtConfig(config);
+    } else this.config = validateQtConfig(config, { searchOnly });
     this.root = path.resolve(root);
     this.spawnImpl = spawnImpl;
     this.enableInput = enableInput;
     this.layoutOnlyFocus = layoutOnlyFocus;
     this.canCapture = canCapture;
+    this.searchOnly = searchOnly;
+    this.canNavigate = canNavigate;
     if (
       typeof enableInput !== 'boolean' ||
       !Number.isInteger(timeoutMs) ||
@@ -72,6 +86,7 @@ class QtActionsClient {
     this.timeoutMs = timeoutMs;
     this.closeTimeoutMs = closeTimeoutMs;
     this.sequence = 0;
+    this.diagnosticId = crypto.randomBytes(8).toString('hex');
     this.child = null;
     this.pending = null;
     this.failure = null;
@@ -236,6 +251,16 @@ class QtActionsClient {
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pending = null;
+    if (this.enableInput || this.layoutOnlyFocus)
+      recordForegroundDiagnostic(this.root, {
+        client: this.diagnosticId,
+        sequence: pending.id,
+        action: pending.action,
+        role: pending.role,
+        startedAt: pending.startedAt,
+        error: this.failure ?? error,
+        result,
+      });
     if (
       ['readDraft', 'diagnoseDraftStructure'].includes(pending.action) &&
       result?.clipboardRestored !== true &&
@@ -268,6 +293,7 @@ class QtActionsClient {
       ![
         'verifyMessageQuote',
         'checkClearMessageQuote',
+        'verifyOpenChatTitle',
         'prepareQuoteHistory',
         'attachMessageQuote',
         'scrollOcrQuoteHistory',
@@ -352,6 +378,15 @@ class QtActionsClient {
       !(this.layoutOnlyFocus && ['captureLayoutHandoff', 'captureLayoutRaised'].includes(action))
     )
       return Promise.reject(fault('UI_QT_INPUT_DISABLED', { attempted: false }));
+    if (this.searchOnly && !searchOnlyObservations.has(action)) {
+      const capture = action === 'capture' && values.image === false && values.regions?.length === 1;
+      const navigate =
+        searchOnlyTransitions.has(action) ||
+        (action === 'chord' && ['Control+F', 'Escape'].includes(values.key)) ||
+        (action === 'paste' && values.scope === 'search' && values.replaceSearch === true && values.readback === false);
+      if (!capture && (!navigate || this.canNavigate() !== true))
+        return Promise.reject(fault('UI_QT_SEARCH_INPUT_NOT_AUTHORIZED', { attempted: false }));
+    }
     this.start();
     if (this.pending) return Promise.reject(fault('UI_QT_BUSY', { attempted: false }));
     const id = ++this.sequence,
@@ -366,6 +401,10 @@ class QtActionsClient {
       this.pending = {
         id,
         action,
+        startedAt: Date.now(),
+        ...(action === 'click'
+          ? { role: ['editor', 'search'].find(role => sameRect(values.rect, this.config.layout?.[role])) }
+          : {}),
         timer,
         resolve,
         reject,

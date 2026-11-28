@@ -332,9 +332,13 @@ function focusConfirmationDiagnostic(value) {
       'returnRaiseAccepted',
       'returnRaiseConfirmed',
       'foregroundRequestAccepted',
+      'callerWasForegroundProcess',
       'alreadyTargetWithoutClick',
       'calibratedRaiseAttempted',
       'calibratedRaiseAccepted',
+      'temporaryTopmostAttempted',
+      'temporaryTopmostAccepted',
+      'temporaryTopmostRestored',
       'sourceLowerAttempted',
       'sourceLowerAccepted',
       'automaticBlankCaption',
@@ -348,6 +352,19 @@ function focusConfirmationDiagnostic(value) {
     ])
       if (typeof activation[key] === 'boolean') report.activation[key] = activation[key];
   if (report.activation) {
+    if (['source', 'target', 'none', 'other'].includes(activation.foregroundAfterRequest))
+      report.activation.foregroundAfterRequest = activation.foregroundAfterRequest;
+    for (const key of ['sessionIdleMs', 'foregroundLockTimeoutMs'])
+      if (Number.isSafeInteger(activation[key]) && activation[key] >= 0 && activation[key] <= 0xffffffff)
+        report.activation[key] = activation[key];
+    for (const key of ['sourceMenuOrMoveFlags', 'targetMenuOrMoveFlags'])
+      if (
+        Number.isInteger(activation[key]) &&
+        activation[key] >= 0 &&
+        activation[key] <= 0x1e &&
+        !(activation[key] & 1)
+      )
+        report.activation[key] = activation[key];
     if (typeof activation.allPointsOwned === 'boolean') report.activation.allPointsOwned = activation.allPointsOwned;
     for (const key of ['actualRgbaSha256', 'expectedRgbaSha256'])
       if (hash(activation[key])) report.activation[key] = activation[key];

@@ -3,15 +3,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   createDesktopRuntimeDriver,
   inspectCableEndpoints,
   readCableEndpoints,
 } from './desktop-sender/runtime-driver.mjs';
 import { QtActionsClient } from './desktop-sender/qt-visual-driver.mjs';
-import { unborrowedLayoutRefusal } from './desktop-sender/qt-auto-layout.mjs';
+import { resolveQtBootstrapLayout } from './desktop-sender/qt-auto-layout.mjs';
 import { acquireDesktopQueue } from './desktop-sender/delivery-lock.mjs';
 import { DesktopSender } from './desktop-sender.mjs';
+import { checkedSearchPopup, defaultSearchPopup } from './desktop-sender/bootstrap.mjs';
+import { recoverConversationBySearch } from './desktop-sender/qt-search-recovery.mjs';
 const rect = (left, top, right, bottom) => ({ left, top, right, bottom });
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-layout-lazy-'));
@@ -61,6 +67,244 @@ function fixture(t) {
     },
   };
 }
+
+function searchRecovery(f) {
+  return {
+    binding: f.account.binding,
+    config: {
+      version: 1,
+      backend: 'qt-visual',
+      sharedDesktop: true,
+      account: f.account.accountWxid,
+      accountRef: f.account.accountRef,
+      executable: f.account.executable,
+      executableVersion: f.account.executableVersion,
+      executableSha256: f.account.executableSha256,
+      hwnd: f.account.binding.hwnd,
+      layoutMode: 'adaptive-v1',
+      idleMs: 0,
+      ocrBackend: 'windows',
+      layout: { width: 1000, height: 800, dpi: 120, search: rect(85, 49, 260, 75) },
+      searchPopupCalibration: checkedSearchPopup(f.account, defaultSearchPopup(f.account)),
+    },
+  };
+}
+
+function unavailableLayout(recovery) {
+  return Object.assign(Error('UI_QT_CONVERSATION_LAYOUT_REQUIRED'), {
+    code: 'UI_QT_CONVERSATION_LAYOUT_REQUIRED',
+    searchRecovery: recovery,
+  });
+}
+
+for (const mode of ['ocr', 'uia']) {
+  test(mode + ' searches after a layout failure and prepares input only with a fresh full layout', async t => {
+    const f = fixture(t);
+    f.settings.controlMode = mode;
+    const recovery = searchRecovery(f);
+    const calls = [];
+    const job = { id: 'fixture-job', account: f.account.accountWxid, target: 'wxid_fixture' };
+    const driver = await createDesktopRuntimeDriver({
+      ...f,
+      resolveTarget: async native => ({
+        wxid: native.target,
+        name: 'Fixture target',
+        uniqueSearchName: true,
+        uniqueTitle: true,
+      }),
+      createOffscreen: () => ({ close: async () => {} }),
+      bootstrap: async () => {
+        calls.push('layout');
+        if (!calls.includes('search')) throw unavailableLayout(recovery);
+        return { config: { fullLayout: true }, health: { ready: true } };
+      },
+      recoverSearch: async ({ recovery: plan, job: target, canInput, resolveTarget }) => {
+        calls.push('search');
+        assert.equal(plan, recovery);
+        assert.equal(target, job);
+        assert.equal(canInput(), true);
+        assert.equal((await resolveTarget(job)).wechatId, job.target);
+      },
+      createDriver: ({ config }) => {
+        assert.equal(config.fullLayout, true);
+        return {
+          prepare: async target => {
+            assert.equal(target, job);
+            calls.push('prepare');
+            return { ready: true };
+          },
+          close: async () => {},
+        };
+      },
+    });
+    try {
+      assert.equal((await driver.prepare(job, { canInput: () => true })).ready, true);
+      assert.deepEqual(calls, ['layout', 'search', 'layout', 'prepare']);
+      await driver.prepare(job, { canInput: () => true });
+      assert.deepEqual(calls, ['layout', 'search', 'layout', 'prepare', 'prepare']);
+    } finally {
+      await driver.close();
+    }
+  });
+}
+
+test('layout recovery waits for an authorized task and retries inspection without a second search', async t => {
+  const f = fixture(t);
+  f.settings.controlMode = 'uia';
+  const recovery = searchRecovery(f);
+  let searches = 0;
+  const driver = await createDesktopRuntimeDriver({
+    ...f,
+    bootstrap: async () => {
+      throw unavailableLayout(recovery);
+    },
+    recoverSearch: async () => {
+      searches++;
+    },
+    recoverOffscreen: async () => {},
+    createOffscreen: () => ({ setEnabled: async () => ({}), close: async () => {} }),
+    createDriver: () => assert.fail('there is no fully verified input layout'),
+  });
+  try {
+    assert.equal((await driver.applySettings()).applied, true);
+    assert.equal((await driver.health({ verifyLayout: true })).layoutCheck.verified, false);
+    await assert.rejects(
+      driver.prepare({ id: 'fixture-job' }, { canInput: () => false }),
+      /UI_QT_CONVERSATION_LAYOUT_REQUIRED/,
+    );
+    await assert.rejects(
+      driver.prepare({ id: 'fixture-job', index: 1 }, { canInput: () => true }),
+      /UI_QT_LAYOUT_CHANGED_WITH_DRAFT/,
+    );
+    assert.equal(searches, 0);
+    await assert.rejects(
+      driver.prepare({ id: 'fixture-job' }, { canInput: () => true }),
+      /UI_QT_SEARCH_TRANSITION_UNCONFIRMED/,
+    );
+    assert.equal(searches, 1);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('the fallback search enters a verified query without enabling the message editor', async t => {
+  const f = fixture(t);
+  const recovery = searchRecovery(f);
+  const binding = { ...recovery.binding, foreground: true };
+  const query = 'fixture-target';
+  const querySha256 = crypto.createHash('sha256').update(query).digest('hex');
+  const actions = [];
+  const frame = (token, popup) => ({
+    pixelFormat: 'rgba-row-major-opaque-v1',
+    epoch: '1'.repeat(32),
+    revision: 1,
+    idleMs: 100,
+    token: token.repeat(32),
+    binding,
+    regions: [{ rect: recovery.config.layout.search, rgbaSha256: 'c'.repeat(64) }],
+    ...(popup && {
+      popup: {
+        hwnd: '456',
+        surfaceId: 'search',
+        kind: 'search',
+        ownerRelation: 'root-owned',
+        stableObservations: 2,
+        geometryMode: 'observed-v1',
+        dpi: 120,
+        clientRect: rect(0, 0, 200, 120),
+        clientRectInRoot: rect(82, 44, 282, 164),
+        windowRect: rect(92, 54, 292, 174),
+      },
+    }),
+  });
+  recovery.accountProbe = async ({ binding: observed }) => assert.equal(observed.hwnd, binding.hwnd);
+  const prepareJob = { id: 'fixture-job', account: f.account.accountWxid, target: 'wxid_fixture' };
+  await recoverConversationBySearch({
+    root: f.root,
+    recovery,
+    job: prepareJob,
+    resolveTarget: async () => ({
+      wechatId: prepareJob.target,
+      name: 'Fixture target',
+      alias: query,
+      ambiguous: false,
+    }),
+    canInput: () => true,
+    createClient: ({ searchOnly, canNavigate }) => {
+      assert.equal(searchOnly, true);
+      assert.equal(canNavigate(), true);
+      return {
+        request: async (action, values) => {
+          actions.push(action);
+          switch (action) {
+            case 'inspectFocusHandoff':
+              return {
+                ready: false,
+                reason: 'QT_FOCUS_RETURN_WINDOW_REQUIRED',
+                inputSent: false,
+                clipboardAccessed: false,
+                focusChanged: false,
+              };
+            case 'capture':
+              return values.surface === 'main' ? frame('2') : frame('3', true);
+            case 'chord':
+              assert.equal(values.key, 'Control+F');
+              assert.equal(values.token, '2'.repeat(32));
+              return { performed: true, attempted: true, revision: 1 };
+            case 'paste':
+              assert.equal(values.scope, 'search');
+              assert.equal(values.expectedText, query);
+              return {
+                performed: true,
+                attempted: true,
+                pasteApplied: true,
+                readbackPerformed: false,
+                intendedText: query,
+                clipboardRestored: true,
+                clipboardConsumerConfirmed: true,
+                interrupted: false,
+                revision: 1,
+                postPasteFrame: frame('4', true),
+                searchEnterProof: { version: 1, id: '5'.repeat(32), querySha256 },
+              };
+            case 'searchEnter':
+              assert.equal(values.searchEnterProofId, '5'.repeat(32));
+              assert.equal(values.querySha256, querySha256);
+              return { performed: true, attempted: true, searchAccepted: true, revision: 1 };
+            default:
+              assert.fail('unexpected recovery action: ' + action);
+          }
+        },
+        close: async () => {
+          actions.push('close');
+        },
+      };
+    },
+  });
+  assert.deepEqual(actions, ['inspectFocusHandoff', 'capture', 'chord', 'capture', 'paste', 'searchEnter', 'close']);
+});
+
+test('a search-only native client rejects editor actions and revoked navigation before spawning', async t => {
+  const f = fixture(t);
+  let approved = true;
+  const client = new QtActionsClient({
+    root: f.root,
+    config: searchRecovery(f).config,
+    enableInput: true,
+    searchOnly: true,
+    canNavigate: () => approved,
+    spawnImpl: () => assert.fail('rejected requests cannot start a native process'),
+  });
+  try {
+    await assert.rejects(client.request('paste', { scope: 'editor' }), /UI_QT_SEARCH_INPUT_NOT_AUTHORIZED/);
+    await assert.rejects(client.request('submitTextEnter'), /UI_QT_SEARCH_INPUT_NOT_AUTHORIZED/);
+    approved = false;
+    await assert.rejects(client.request('chord', { key: 'Control+F' }), /UI_QT_SEARCH_INPUT_NOT_AUTHORIZED/);
+  } finally {
+    await client.close();
+  }
+});
+
 test('OCR health does not acquire focus or require an unobscured screenshot', async t => {
   const f = fixture(t);
   let bootstraps = 0,
@@ -252,31 +496,80 @@ test('File Transfer voice uses authorized preparation like private and group tar
   assert.deepEqual(prepared, ['filehelper', 'wxid_friend', 'room@chatroom']);
   await driver.close();
 });
-test('layout visibility fallback requires a proven no-input, unborrowed API refusal', () => {
-  const error = {
-    code: 'QT_FOCUS_ACQUIRE_UNCONFIRMED',
-    attempted: false,
-    focusConfirmation: { attempted: true, accepted: false, confirmed: false, reason: 'request-rejected' },
-    focusRestoreOutcome: {
-      reason: 'foreground-not-wechat',
-      foregroundOwnedByWechat: false,
-      restored: false,
-      skipped: true,
-      identitiesUnchanged: true,
-      activityUnchanged: true,
-      keysReleased: true,
-    },
+test('an obscured OCR layout is exposed without a foreground handoff', async t => {
+  const { root, account } = fixture(t);
+  const logs = path.join(root, 'state/logs');
+  fs.mkdirSync(logs);
+  const { executable, executableVersion, binding, accountRef } = account;
+  const executableSha256 = crypto.createHash('sha256').update(fs.readFileSync(executable)).digest('hex');
+  const config = { executable, executableSha256, executableVersion, accountRef, sharedDesktop: true, idleMs: 1000 };
+  const inspection = {
+    version: 1,
+    readOnly: true,
+    focusChanged: false,
+    inputSent: false,
+    clipboardAccessed: false,
+    executableVersion,
+    executableSha256,
+    binding,
   };
-  assert.equal(unborrowedLayoutRefusal(error), true);
-  for (const changed of [
-    { attempted: true },
-    { code: 'QT_HUMAN_ACTIVITY_CHANGED' },
-    { focusConfirmation: { ...error.focusConfirmation, accepted: true } },
-    { focusRestoreOutcome: { ...error.focusRestoreOutcome, activityUnchanged: false } },
-    { focusRestoreOutcome: { ...error.focusRestoreOutcome, identitiesUnchanged: false } },
-    { focusRestoreOutcome: { ...error.focusRestoreOutcome, restored: true } },
-  ])
-    assert.equal(unborrowedLayoutRefusal({ ...error, ...changed }), false);
+  const actions = [];
+  const client = new QtActionsClient({
+    root,
+    config: { executable, executableSha256, hwnd: 'auto' },
+    calibration: true,
+    enableInput: false,
+    layoutOnlyFocus: true,
+    canCapture: () => true,
+    spawnImpl: () => {
+      const child = Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+      });
+      child.stdin.on('data', data => {
+        const { id, action } = JSON.parse(data);
+        actions.push(action);
+        queueMicrotask(() => {
+          if (action === 'stop') {
+            child.stdout.write(JSON.stringify({ id, ok: true, result: { stopped: true } }) + '\n');
+            child.emit('close', 0, null);
+          } else {
+            const code = action === 'captureLayout' ? 'QT_WINDOW_OBSCURED' : 'QT_LAYOUT_SOURCE_ORDER_UNAVAILABLE';
+            child.stdout.write(JSON.stringify({ id, ok: false, error: { code, attempted: false } }) + '\n');
+          }
+        });
+      });
+      return child;
+    },
+  });
+  try {
+    await assert.rejects(resolveQtBootstrapLayout({ root, config, inspection, client, allowFocusCapture: true }), {
+      code: 'QT_LAYOUT_SOURCE_ORDER_UNAVAILABLE',
+    });
+  } finally {
+    await client.close();
+  }
+  assert.deepEqual(actions, ['captureLayout', 'captureLayoutRaised', 'stop']);
+  const diagnostic = path.join(logs, 'wechat-foreground.log');
+  let rows = [];
+  for (let n = 0; n < 100 && rows.length < 2; n++) {
+    await delay(15);
+    if (fs.existsSync(diagnostic))
+      rows = fs
+        .readFileSync(diagnostic, 'utf8')
+        .trimEnd()
+        .split('\n')
+        .map(line => JSON.parse(line));
+  }
+  assert.deepEqual(
+    rows.map(row => [row.action, row.code]),
+    [
+      ['captureLayout', 'QT_WINDOW_OBSCURED'],
+      ['captureLayoutRaised', 'QT_LAYOUT_SOURCE_ORDER_UNAVAILABLE'],
+    ],
+  );
+  assert.equal(rows[0].client, rows[1].client);
 });
 
 test('explicit settings apply parks only a fresh UIA executor; health and lazy OCR do not acquire input', async t => {

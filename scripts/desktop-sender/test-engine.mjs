@@ -12,6 +12,7 @@ import { beginQuoteDraft, readQuoteDraft } from './quote-draft-state.mjs';
 import { DesktopSender } from '../desktop-sender.mjs';
 import { DESKTOP_WECHAT_VERSION } from '../desktop-settings.mjs';
 import { DesktopReceipts } from '../desktop-receipts.mjs';
+import { desktopProcessIdentity } from './account-probe.mjs';
 import { NativeVoiceTransport } from './native-voice-transport.mjs';
 import { installVoice, voiceRequest } from './engine-voice.mjs';
 import { deliverDesktopMessage } from '../desktop-message-delivery.mjs';
@@ -110,7 +111,7 @@ function fixture(
     root,
     config,
     now,
-    probeAccount: async () => account,
+    probeAccount: async () => structuredClone(account),
     authorize: async (job, { preparing } = {}) => ({
       allowed: targets.has(job.target),
       grantId: hex('b'),
@@ -143,6 +144,11 @@ function fixture(
         },
         prepare: async job => {
           await factory.resolveTarget(job);
+          if (state.refusePrepareText && job.text === state.refusePrepareText)
+            throw Object.assign(Error('QT_UIA_CAPTION_OBSCURED'), {
+              code: 'QT_UIA_CAPTION_OBSCURED',
+              attempted: false,
+            });
           state.prepared = job;
           state.draft = '';
           if (state.failQuote && job.quote) {
@@ -162,6 +168,7 @@ function fixture(
                 draft: state.draft,
                 editorToken: 'editor',
                 activityRevision: 'activity',
+                inputProcess: desktopProcessIdentity(factory.account.binding),
               }
             : { ready: false, reason: 'UI_QT_PREPARATION_REQUIRED' },
         typeGrapheme: async (job, guard, local) => {
@@ -178,6 +185,8 @@ function fixture(
         },
         submit: async (job, guard, local) => {
           assert.ok(local.canSubmit());
+          if (state.revokeSubmit && job.target === targetWxid)
+            return { performed: false, attempted: false, reason: 'QT_TEXT_STEP_REVOKED', inputReleased: true };
           if (state.refuseSubmit-- > 0)
             return { performed: false, attempted: false, reason: 'QT_HUMAN_ACTIVITY_CHANGED' };
           state.submits.push(job.id);
@@ -2069,6 +2078,97 @@ async function until(check) {
   }
   throw Error('control fixture timeout');
 }
+test('a revoked text proof keeps only its own chat on hold after confirmed cleanup', async t => {
+  const f = fixture(t, { additionalTargets: ['wxid_other'] });
+  f.state.revokeSubmit = true;
+  const isolated = await finalDelivery(f.engine, f.engine.sendText(f.payload));
+  assert.equal(isolated.state, 'conflict');
+  assert.equal(isolated.inputReleased, true);
+  assert.equal(isolated.reason, 'QT_TEXT_STEP_REVOKED');
+  assert.ok(isolated.recovery);
+  assert.equal(f.state.draft, f.payload.text);
+
+  const sameChat = await f.engine.send('text', { ...f.payload, deliveryId: 'same-chat' }, { admissionOnly: true });
+  const other = await finalDelivery(
+    f.engine,
+    f.engine.sendText({
+      ...f.payload,
+      deliveryId: 'other-chat',
+      target: 'wxid_other',
+    }),
+  );
+  assert.equal(other.confirmed, true);
+  assert.equal((await f.engine.query(sameChat.deliveryId, true)).inputStarted, false);
+  assert.deepEqual(f.state.submits, [(await f.engine.find(other.deliveryId)).row.job.id]);
+});
+
+test('a newly verified WeChat process detaches an old draft even after the sender service restarts', async t => {
+  const f = fixture(t, { additionalTargets: ['wxid_other'] });
+  f.account.binding = { pid: 10, processCreatedFileTimeUtc: '134000000000000000' };
+  f.state.holdAfterType = true;
+  const first = await f.engine.send('text', f.payload, { admissionOnly: true });
+  await until(async () => (await f.engine.query(first.deliveryId, true)).inputStarted);
+  assert.deepEqual(f.state.submits, []);
+  await f.restart();
+
+  await f.engine.health();
+  const unchanged = await f.engine.query(first.deliveryId, true);
+  assert.notEqual(unchanged.inputReleased, true);
+
+  f.account.binding = { pid: 11, processCreatedFileTimeUtc: '134000000100000000' };
+  await f.engine.health();
+  const detached = await f.engine.query(first.deliveryId, true);
+  assert.equal(detached.state, 'conflict');
+  assert.equal(detached.inputReleased, true);
+  assert.equal(detached.reason, 'UI_WECHAT_PROCESS_RESTARTED');
+  assert.ok(detached.recovery);
+  f.state.holdAfterType = false;
+  const next = await finalDelivery(
+    f.engine,
+    f.engine.sendText({
+      ...f.payload,
+      deliveryId: 'next-after-restart',
+      target: 'wxid_other',
+    }),
+  );
+  assert.equal(next.confirmed, true);
+  assert.deepEqual(f.state.submits, [(await f.engine.find(next.deliveryId)).row.job.id]);
+});
+test('a client restart releases an uncertain submit while allowing a late receipt for its original ID', async t => {
+  const f = fixture(t, { additionalTargets: ['wxid_other'], submitThrows: true });
+  f.account.binding = { pid: 10, processCreatedFileTimeUtc: '134000000000000000' };
+  f.state.missingReceipt = true;
+  const first = await finalDelivery(f.engine, f.engine.sendText(f.payload));
+  assert.equal(first.state, 'unconfirmed');
+  assert.ok(first.recovery);
+  f.account.binding = { pid: 11, processCreatedFileTimeUtc: '134000000100000000' };
+  await f.engine.health();
+  const waiting = await f.engine.query(first.deliveryId, true);
+  assert.equal(waiting.state, 'unconfirmed');
+  assert.equal(waiting.inputReleased, true);
+  assert.equal(waiting.recovery, undefined);
+  assert.notEqual(waiting.reviewed, true);
+  assert.equal(f.state.submits.length, 1);
+
+  f.state.missingReceipt = false;
+  f.state.submitThrows = false;
+  const next = await finalDelivery(
+    f.engine,
+    f.engine.sendText({
+      ...f.payload,
+      deliveryId: 'continues',
+      target: 'wxid_other',
+    }),
+  );
+  const late = await f.engine.query(first.deliveryId, true);
+  assert.equal(next.confirmed, true);
+  assert.equal(late.confirmed, true);
+  assert.equal(late.deliveryId, first.deliveryId);
+  assert.deepEqual(f.state.submits, [
+    (await f.engine.find(first.deliveryId)).row.job.id,
+    (await f.engine.find(next.deliveryId)).row.job.id,
+  ]);
+});
 test('mode and offscreen changes replace an idle context without any input and typing preference needs no rebuild', async t => {
   const f = fixture(t);
   await f.engine.health();
@@ -3163,6 +3263,34 @@ function savedReplyControls(f) {
   fs.writeFileSync(configFile, JSON.stringify({ wechat: { whitelist: { private: [f.payload.target], groups: [] } } }));
   return new ReplyDeliveryControls(f.root, f.account.accountRef);
 }
+
+test('a saved foreground refusal ends the untouched automatic reply and releases later input', async t => {
+  const f = fixture(t),
+    controls = savedReplyControls(f),
+    key = 'wechat:private:' + f.payload.target,
+    parentId = hex('f');
+  f.state.refusePrepareText = f.payload.text;
+  const paused = await f.engine.sendText({ ...f.payload, parentId, rosterGrant: 'legacy' });
+  assert.equal(paused.state, 'paused');
+  assert.equal(paused.inputStarted, false);
+  assert.equal(paused.reason, 'QT_UIA_CAPTION_OBSCURED');
+  assert.deepEqual(f.state.pastes, []);
+
+  controls.register(key, 'legacy', [{ deliveryId: parentId, text: f.payload.text, state: 'queued' }]);
+  assert.equal(controls.claim(key, 'legacy', parentId), 'send');
+  await f.restart();
+  const stopped = await finalDelivery(f.engine, f.engine.query(f.payload.deliveryId));
+  assert.equal(stopped.state, 'cancelled');
+  assert.equal(stopped.reason, 'QT_UIA_CAPTION_OBSCURED');
+  assert.equal(stopped.submission, 'not-started');
+  assert.equal(stopped.inputStarted, false);
+  const next = await finalDelivery(
+    f.engine,
+    f.engine.sendText({ ...f.payload, deliveryId: 'new-reply', text: 'next' }),
+  );
+  assert.equal(next.state, 'confirmed');
+  assert.deepEqual(f.state.pastes, ['next']);
+});
 
 test('stop split withdraws a text segment already queued in the paused desktop', async t => {
   const f = fixture(t);

@@ -17,6 +17,8 @@ import crypto from 'node:crypto';
 import { clipboardOutcome, pixelMismatchDiagnostic } from './qt-diagnostics.mjs';
 import { isDeepStrictEqual } from 'node:util';
 
+const digest = text => crypto.createHash('sha256').update(text).digest('hex');
+
 // Navigation owns search observations; the driver owns the active surface and input session.
 class QtNavigationSession {
   #uiaWarmHint = null;
@@ -59,7 +61,6 @@ class QtNavigationSession {
       throw fault(group ? 'UI_QT_GROUP_SEARCH_NAME_REQUIRED' : 'UI_QT_TARGET_SEARCH_NAME_REQUIRED');
     if (group && (contact.kind !== 'group' || contact.groupName !== title || query !== title || !contact.uniqueTitle))
       throw fault('UI_QT_GROUP_SEARCH_NAME_REQUIRED');
-    const digest = text => crypto.createHash('sha256').update(text).digest('hex');
     const lookup = {
       account,
       target,
@@ -82,8 +83,39 @@ class QtNavigationSession {
         titleSha256: digest(title),
         querySha256: digest(query),
       });
-    }
+    } else if (this.#frames.config.layoutMode === 'adaptive-v1' && contact.uniqueTitle === true && validName(title))
+      lookup.currentTitleSha256 = digest(title);
     return Object.freeze(lookup);
+  }
+  async currentOcrChat(job, baseline, lookup) {
+    if (this.#frames.config.layoutMode !== 'adaptive-v1' || !hash(lookup?.currentTitleSha256)) return null;
+    if (
+      lookup.account !== job.account ||
+      lookup.target !== job.target ||
+      lookup.accountRef !== this.#frames.config.accountRef
+    )
+      throw fault('UI_QT_TARGET_CHANGED');
+    this.#frames.assertTransaction(baseline);
+    const { token, epoch, revision } = baseline;
+    const result = await this.#input.requestNative('verifyOpenChatTitle', {
+      token,
+      epoch,
+      revision,
+      idleMs: this.#frames.config.idleMs,
+      titleSha256: lookup.currentTitleSha256,
+    });
+    this.#frames.assertTransaction(baseline);
+    if (typeof result?.matches !== 'boolean') throw fault('UI_QT_TARGET_CHANGED');
+    if (!result.matches) return null;
+    return Object.freeze({
+      kind: 'uia-database-title-v1',
+      account: job.account,
+      target: job.target,
+      querySha256: digest(lookup.displayedId),
+      titleSha256: lookup.currentTitleSha256,
+      header: this.#frames.regionDigest(baseline, 0),
+      searchKind: lookup.searchKind,
+    });
   }
   popupTransition(surface) {
     const calibration = this.#frames.popupCalibration(surface),
@@ -426,10 +458,11 @@ class QtNavigationSession {
     )
       throw fault('UI_QT_OBSERVATION_INVALID');
     const layout = this.#frames.config.layout,
-      mainHeader = baseline?.regions?.find(entry => sameRect(entry.rect, layout.header));
+      anchor = layout.header ?? layout.search,
+      mainAnchor = baseline?.regions?.find(entry => sameRect(entry.rect, anchor));
     if (
-      !mainHeader ||
-      !hash(mainHeader.rgbaSha256) ||
+      !mainAnchor ||
+      !hash(mainAnchor.rgbaSha256) ||
       baseline.epoch !== this.#frames.transaction.epoch ||
       baseline.revision !== this.#frames.transaction.revision ||
       baseline.binding?.pid !== this.#frames.transaction.pid ||
@@ -459,7 +492,8 @@ class QtNavigationSession {
   }
   async observeMainAfterSearchEscape(baseline) {
     const layout = this.#frames.config.layout,
-      mainHeader = baseline.regions.find(entry => sameRect(entry.rect, layout.header));
+      names = layout.header ? ['header', 'editor'] : ['search'],
+      mainAnchor = baseline.regions.find(entry => sameRect(entry.rect, layout[names[0]]));
     // The successful key reply is not completion evidence. Two fresh native
     // main-window observations replace only the old fixed post-Escape wait.
     // Full header/editor pixels, original identity/geometry and activity stay
@@ -481,7 +515,7 @@ class QtNavigationSession {
       if (elapsed() > 400) break;
       let current;
       try {
-        current = await this.#frames.capture(['header', 'editor'], false, {
+        current = await this.#frames.capture(names, false, {
           retryPixelChanges: false,
         });
       } catch (error) {
@@ -508,15 +542,13 @@ class QtNavigationSession {
       )
         throw fault('UI_QT_OBSERVATION_CHANGED');
       if (
-        current.regions.length !== 2 ||
-        !sameRect(current.regions[0].rect, layout.header) ||
-        !sameRect(current.regions[1].rect, layout.editor)
+        current.regions.length !== names.length ||
+        !current.regions.every((entry, index) => sameRect(entry.rect, layout[names[index]]))
       )
         throw fault('UI_QT_OBSERVATION_INVALID');
-      if (current.regions[0].rgbaSha256 !== mainHeader.rgbaSha256) throw fault('UI_QT_HEADER_CHANGED');
-      if (previous) {
-        if (current.regions[1].rgbaSha256 === previous.regions[1].rgbaSha256) return current;
-      }
+      if (current.regions[0].rgbaSha256 !== mainAnchor.rgbaSha256) throw fault('UI_QT_HEADER_CHANGED');
+      if (previous && current.regions.every((entry, index) => entry.rgbaSha256 === previous.regions[index].rgbaSha256))
+        return current;
       previous = current;
     }
     throw lastFocusFailure ?? fault('UI_QT_SEARCH_CLOSE_UNVERIFIED');
@@ -916,6 +948,45 @@ class QtNavigationSession {
         ['header'],
         baseline,
       );
+    const { frame, entered, querySha256 } = await this.enterSharedSearch(displayedId, {
+      baseline,
+      searchKind,
+      uiaNavigation,
+    });
+    voicePreparation?.start(baseline);
+    const uiaReady =
+      this.#frames.config.layoutMode === 'uia-v1' && uiaNavigation && uiaTargetEvidence(targetLookup)
+        ? await this.waitForUiaSearchTransition(
+            job,
+            baseline,
+            targetLookup,
+            frame.popup?.hwnd,
+            entered.searchGeneration,
+          )
+        : null;
+    const opened = uiaReady?.frame ?? (await this.waitForSearchEnterTransition(baseline));
+    if (voicePreparation) voicePreparation.readyFrame = opened;
+    return Object.freeze({
+      kind: 'database-query-search-enter-v1',
+      account: job.account,
+      target: job.target,
+      querySha256,
+      header: this.#frames.regionDigest(opened, 0),
+      ...(uiaReady
+        ? {
+            uiaConversationFingerprint: uiaReady.fingerprint,
+            titleSha256: targetLookup.uiaTarget.titleSha256,
+            editorFocused: true,
+          }
+        : {}),
+      ...(searchKind
+        ? {
+            searchKind,
+          }
+        : {}),
+    });
+  }
+  async enterSharedSearch(displayedId, { baseline, searchKind, uiaNavigation } = {}) {
     this.#frames.invalidateFrame('search');
     const before = await this.waitForSharedSearchQuery();
     this.#input.active();
@@ -954,6 +1025,7 @@ class QtNavigationSession {
         error.attempted === false &&
         error.clipboardRestored === true &&
         this.#focus.preparationLease() &&
+        baseline &&
         !uiaNavigation &&
         observedLayout(this.#frames.config)
       ) {
@@ -1003,38 +1075,7 @@ class QtNavigationSession {
     )
       throw fault('UI_QT_SEARCH_ENTER_UNCERTAIN');
     this.#frames.invalidateFrame('main');
-    voicePreparation?.start(baseline);
-    const uiaReady =
-      this.#frames.config.layoutMode === 'uia-v1' && uiaNavigation && uiaTargetEvidence(targetLookup)
-        ? await this.waitForUiaSearchTransition(
-            job,
-            baseline,
-            targetLookup,
-            frame.popup?.hwnd,
-            entered.searchGeneration,
-          )
-        : null;
-    const opened = uiaReady?.frame ?? (await this.waitForSearchEnterTransition(baseline));
-    if (voicePreparation) voicePreparation.readyFrame = opened;
-    return Object.freeze({
-      kind: 'database-query-search-enter-v1',
-      account: job.account,
-      target: job.target,
-      querySha256,
-      header: this.#frames.regionDigest(opened, 0),
-      ...(uiaReady
-        ? {
-            uiaConversationFingerprint: uiaReady.fingerprint,
-            titleSha256: targetLookup.uiaTarget.titleSha256,
-            editorFocused: true,
-          }
-        : {}),
-      ...(searchKind
-        ? {
-            searchKind,
-          }
-        : {}),
-    });
+    return { frame, entered, querySha256 };
   }
 }
 export { QtNavigationSession };

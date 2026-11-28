@@ -469,9 +469,27 @@ internal static partial class WechatDraftProbe
                     "normalizedRgbaSha256", Text(pixels, "normalizedRgbaSha256"), "caretRemoved",
                     Get(pixels, "caretRemoved"), "revision", frame.Revision, "readOnly", true, "inputSent", false);
     }
+    static QtEnterProof QtRequireDraftReadbackProof(Dictionary<string, object> request, QtFrame frame, Rect header,
+                                                    Rect editor, QtTextStepBinding step)
+    {
+        var proof = QtPendingEnter;
+        Need(proof != null && !proof.Consumed, "QT_TEXT_STEP_UNAVAILABLE");
+        QtRequireCurrentEnterProof(proof);
+        var source = proof.Frame;
+        long now = UtcMs();
+        Need(proof.Kind == "text" && proof.Popup == null && proof.Epoch == QtEpoch &&
+                 proof.Id == Text(request, "textEnterProofId") && proof.Digest == Text(request, "textSha256") &&
+                 step != null && QtSameTextStep(proof.Step, step) && source != null && !source.UiaControlFrame &&
+                 !frame.UiaControlFrame && now >= source.Issued && now - source.Issued <= 30000 &&
+                 source.Revision == frame.Revision && source.Binding.Thread == frame.Binding.Thread &&
+                 QtSameBinding(source.Binding, frame.Binding) && source.Anchors.Count == 2 &&
+                 Same(source.Anchors[0].Rect, header) && Same(source.Anchors[1].Rect, editor) &&
+                 source.Anchors[0].Hash == frame.Anchors[0].Hash,
+             "QT_TEXT_STEP_CHANGED");
+        return proof;
+    }
     static object QtReadDraft(QtClipboardOperation clipboard, Dictionary<string, object> request, IntPtr owner)
     {
-        QtRevokeEnter();
         QtEmptyPhaseProof = null;
         QtRevokeQueryClick(QtPopup);
         long measureStart = Now(), measureClipboard = 0, measureCopyStart = 0, measureCopyEnd = 0, measureReadEnd = 0;
@@ -483,10 +501,16 @@ internal static partial class WechatDraftProbe
         QtFrame frame = QtGuard(request, true);
         Rect editor = ParseRect(Get(request, "editorRect"));
         Need(Contains(frame.Binding.Client, editor), "QT_REGION_INVALID");
-        HashSet<string> emptyTemplates = QtEmptyTemplates(request);
+        bool verifyTyped = request.ContainsKey("textEnterProofId");
+        HashSet<string> emptyTemplates = verifyTyped ? null : QtEmptyTemplates(request);
         var textStep = QtParseTextStep(Get(request, "stepBinding"));
-        if (request.ContainsKey("headerRect"))
-            QtNeedDraftSource(frame, ParseRect(Get(request, "headerRect")), editor);
+        Rect header = new Rect();
+        if (request.ContainsKey("headerRect") || verifyTyped)
+        {
+            header = ParseRect(Get(request, "headerRect"));
+            QtNeedDraftSource(frame, header, editor);
+        }
+        var readbackProof = verifyTyped ? QtRequireDraftReadbackProof(request, frame, header, editor, textStep) : null;
         QtCurrent = null;
         ClipboardState original = QtReadOriginalClipboard(owner);
         uint copied = 0;
@@ -524,6 +548,7 @@ internal static partial class WechatDraftProbe
                 long emptyDeadline = Now() + 650;
                 QtPause(frame, 50);
                 selected = false;
+                Need(!verifyTyped, "QT_TYPED_TEXT_READBACK_UNVERIFIED");
                 long emptySettleMs = Now() - (emptyDeadline - 650);
                 emptyTiming = new QtEmptyWaitTiming(Now);
                 emptyTiming.SettleMs = emptySettleMs;
@@ -669,10 +694,21 @@ internal static partial class WechatDraftProbe
         }
         if (!empty && restored && draft != "" && request.ContainsKey("headerRect"))
         {
-            Rect header = ParseRect(Get(request, "headerRect"));
-            QtAttachEnterProof(outcome, "text", QtNormalizeText(draft), frame,
+            string normalized = QtNormalizeText(draft);
+            if (readbackProof != null)
+            {
+                QtRequireCurrentEnterProof(readbackProof);
+                if (readbackProof.Digest != QtHash(Encoding.UTF8.GetBytes(normalized)))
+                {
+                    QtRevokeEnter();
+                    throw new Fault("UI_QT_TYPED_TEXT_MISMATCH");
+                }
+            }
+            // Upgrade the original proof only after the full readback and
+            // clipboard restoration. An interrupted read leaves it intact.
+            QtAttachEnterProof(outcome, "text", normalized, frame,
                                new List<QtAnchor> { new QtAnchor { Rect = header }, new QtAnchor { Rect = editor } },
-                               textStep);
+                               textStep, false, readbackProof);
         }
         return outcome;
     }

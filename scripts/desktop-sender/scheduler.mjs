@@ -1,6 +1,7 @@
 // The desktop is exclusive only while input or recovery owns it. An untouched
 // paused job holds its chat's FIFO position, not every other conversation.
 export function ownsDesktop(state) {
+  if (state.inputReleased && !state.focusRecoveryRequired) return false;
   if (state.recovery || state.state === 'conflict') return true;
   if (state.operation !== 'voice') return state.inputStarted && !state.inputReleased;
   // Confirmed bubbles retain their receipts, but own no draft or recording.
@@ -25,7 +26,8 @@ export function selectDelivery(candidates, waiting = new Set(), inputPaused = fa
     const { row, state, revoked } = candidate;
     if (revoked) return candidate; // Retire withdrawn grants even while a chat is paused.
     const chat = JSON.stringify([row.job.accountRef, row.job.kind, row.job.target]);
-    if (waiting.has(row.job.id) || candidate.holdReason || row.paused || state.state === 'paused') held.add(chat);
+    if (waiting.has(row.job.id) || candidate.holdReason || row.paused || ['paused', 'conflict'].includes(state.state))
+      held.add(chat);
     else if (!held.has(chat)) return candidate;
   }
   return null;

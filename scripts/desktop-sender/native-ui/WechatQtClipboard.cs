@@ -168,7 +168,7 @@ internal static partial class WechatDraftProbe
                 Array.Clear(format.Bytes, 0, format.Bytes.Length);
             }
             return Data("version", 1, "readOnly", true, "inputSent", false, "clipboardModified", false,
-                        "backupComplete", true, "byteLength", bytes, "clipboardBackup", trace.Report());
+                        "backupComplete", trace.Complete, "byteLength", bytes, "clipboardBackup", trace.Report());
         }
         catch (Fault error)
         {
@@ -216,6 +216,53 @@ internal static partial class WechatDraftProbe
         Need(canReplace, "DRAFT_CLIPBOARD_COMPLEX_FORMAT");
         original.ReplaceOnPaste = true;
     }
+    static bool QtIsImageClipboard(List<uint> formats, Dictionary<uint, Dictionary<string, object>> descriptions)
+    {
+        bool hasImage = false;
+        foreach (uint id in formats)
+        {
+            string name = Text(descriptions[id], "registeredName");
+            if (ClipboardFormats.IsImageFormat(id, name))
+                hasImage = true;
+            else if (!ClipboardFormats.IsClipboardPolicyFormat(id, name) && !ClipboardFormats.IsOleCompanion(id, name))
+                return false;
+        }
+        return hasImage;
+    }
+    static List<uint> QtSelectClipboardBackupFormats(ClipboardState original, List<uint> formats,
+                                                     Dictionary<uint, Dictionary<string, object>> descriptions,
+                                                     bool restoring, bool canReplace)
+    {
+        // For an image-only clipboard, the raster formats can be published again
+        // without recreating the source application's OLE object. Keep every
+        // raster representation and clipboard policy flag in the backup.
+        bool restoreImage = !restoring && QtIsImageClipboard(formats, descriptions);
+        var selected = new List<uint>();
+        foreach (uint id in formats)
+        {
+            var row = descriptions[id];
+            string name = Text(row, "registeredName");
+            if (restoreImage && ClipboardFormats.IsOleCompanion(id, name))
+            {
+                original.OmittedOleImageCompanions = true;
+                row["state"] = "companion";
+                continue;
+            }
+            try
+            {
+                QtSelectBackupFormat(original, selected, id, name, canReplace);
+                if (!selected.Contains(id))
+                    row["state"] = "omitted";
+            }
+            catch (Fault error)
+            {
+                row["state"] = "unsupported";
+                row["error"] = error.Message;
+                throw;
+            }
+        }
+        return selected;
+    }
     static ClipboardState QtReadOriginalClipboard(IntPtr owner, bool restoring = false, bool allowReplacement = false,
                                                   QtClipboardBackupTrace trace = null)
     {
@@ -261,23 +308,7 @@ internal static partial class WechatDraftProbe
             }
             Need(seen == count, "DRAFT_CLIPBOARD_CHANGED");
             Need(count > 0 && (count <= QtMaxClipboardBackupFormats || canReplace), "DRAFT_CLIPBOARD_COMPLEX_FORMAT");
-            var selected = new List<uint>();
-            foreach (uint id in formats)
-            {
-                var row = descriptions[id];
-                try
-                {
-                    QtSelectBackupFormat(result, selected, id, Text(row, "registeredName"), canReplace);
-                    if (!selected.Contains(id))
-                        row["state"] = "omitted";
-                }
-                catch (Fault error)
-                {
-                    row["state"] = "unsupported";
-                    row["error"] = error.Message;
-                    throw;
-                }
-            }
+            var selected = QtSelectClipboardBackupFormats(result, formats, descriptions, restoring, canReplace);
             trace.Stage = "read";
             int remaining = 64 * 1024 * 1024;
             foreach (uint id in selected)
@@ -307,7 +338,7 @@ internal static partial class WechatDraftProbe
             // process still holds the clipboard lock; no other writer can enter.
             result.Sequence = GetClipboardSequenceNumber();
             trace.After = result.Sequence;
-            trace.Complete = !result.ReplaceOnPaste;
+            trace.Complete = !result.ReplaceOnPaste && !result.OmittedOleImageCompanions;
             trace.Stage = "complete";
             return result;
         }
@@ -403,7 +434,8 @@ internal static partial class WechatDraftProbe
             formats.Add(Data("id", item.Id, "byteLength", item.Bytes.Length, "restoredByteLength",
                              other == null ? (object)null : other.Bytes.Length, "exactMatched", same));
         }
-        return Data("version", 1, "lossless", !original.ReplaceOnPaste && exact && order, "formatCount",
+        return Data("version", 1, "lossless",
+                    !original.ReplaceOnPaste && !original.OmittedOleImageCompanions && exact && order, "formatCount",
                     original.Formats.Count, "byteLength", bytes, "restoredFormatCount", restored.Formats.Count,
                     "restoredByteLength", restoredBytes, "exactPayloadMatched", exact, "formatOrderMatched", order,
                     "formats", formats);

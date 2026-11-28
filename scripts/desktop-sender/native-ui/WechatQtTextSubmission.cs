@@ -33,6 +33,23 @@ internal static partial class WechatDraftProbe
             QtPendingEnter.Consumed = true;
         QtPendingEnter = null;
     }
+    static void QtRequireCurrentEnterProof(QtEnterProof proof)
+    {
+        Need(Object.ReferenceEquals(QtPendingEnter, proof) && !proof.Consumed, "QT_TEXT_STEP_REVOKED");
+        Need(!proof.Paused, "QT_TEXT_STEP_CHANGED");
+    }
+    static void QtPublishEnterProof(QtEnterProof proof, QtEnterProof expected = null)
+    {
+        if (expected != null)
+        {
+            QtRequireCurrentEnterProof(expected);
+            Need(proof.Id == expected.Id && proof.Kind == expected.Kind && proof.Digest == expected.Digest &&
+                     proof.Epoch == expected.Epoch && QtSameTextStep(proof.Step, expected.Step),
+                 "QT_TEXT_STEP_CHANGED");
+        }
+        QtRevokeEnter();
+        QtPendingEnter = proof;
+    }
     static void QtPauseTextEnter()
     {
         if (QtPendingEnter != null && QtPendingEnter.Kind == "text" && QtPendingEnter.Step != null &&
@@ -94,7 +111,8 @@ internal static partial class WechatDraftProbe
     // A one-use continuation binds either a completed readback or the explicit
     // unchecked paste intent. Neither permits repeating an attempted Enter.
     static void QtAttachEnterProof(Dictionary<string, object> report, string kind, string text, QtFrame source,
-                                   List<QtAnchor> anchors, QtTextStepBinding step = null, bool inputOnly = false)
+                                   List<QtAnchor> anchors, QtTextStepBinding step = null, bool inputOnly = false,
+                                   QtEnterProof readbackProof = null)
     {
         QtCheckUiaControlLease(source);
         bool uiaHeader = QtUiaInputHeader(source, kind, inputOnly, QtFocus.Active);
@@ -117,7 +135,7 @@ internal static partial class WechatDraftProbe
             Need(QtAttachTextHeaderMatches(source, current, inputOnly, QtFocus.Active), "QT_TEXT_ENTER_HEADER_CHANGED");
         if (uiaHeader)
             QtMarkUiaControlFrame(current, source.UiaControlLease, captured);
-        var proof = new QtEnterProof { Id = Guid.NewGuid().ToString("N"),
+        var proof = new QtEnterProof { Id = readbackProof == null ? Guid.NewGuid().ToString("N") : readbackProof.Id,
                                        Kind = kind,
                                        Digest = QtHash(Encoding.UTF8.GetBytes(text)),
                                        Epoch = QtEpoch,
@@ -125,7 +143,9 @@ internal static partial class WechatDraftProbe
                                        Popup = QtPopup,
                                        Step = kind == "text" ? step : null,
                                        InputOnly = inputOnly };
-        QtPendingEnter = proof;
+        if (readbackProof != null)
+            QtStable(current);
+        QtPublishEnterProof(proof, readbackProof);
         report.Add("postPasteFrame", captured);
         report.Add(kind == "search" ? "searchEnterProof" : "textEnterProof",
                    Data("version", 1, "id", proof.Id, kind == "search" ? "querySha256" : "textSha256", proof.Digest));
@@ -213,13 +233,13 @@ internal static partial class WechatDraftProbe
     static object QtDedicatedEnter(Dictionary<string, object> request, string kind)
     {
         var proof = QtPendingEnter;
-        QtPendingEnter = null;
         QtEmptyPhaseProof = null;
         QtRevokeQueryClick(QtPopup);
         bool retain = false;
         try
         {
             var step = QtParseTextStep(Get(request, "stepBinding"));
+            Need(kind != "text" || proof != null && !proof.Consumed, "QT_TEXT_STEP_UNAVAILABLE");
             Need(kind != "text" || proof != null && QtSameTextStep(proof.Step, step), "QT_TEXT_STEP_CHANGED");
             retain = kind == "text" && proof != null && proof.Step != null && !proof.Consumed &&
                      proof.Id == Text(request, "textEnterProofId") && proof.Digest == Text(request, "textSha256") &&
@@ -249,13 +269,12 @@ internal static partial class WechatDraftProbe
                 QtVerifyQuote(request, frame);
             NoKeysHeld();
             Need(frame.Revision == Interlocked.Read(ref Revision), "QT_HUMAN_ACTIVITY_CHANGED");
-            retain = false;
-            proof.Consumed = true;
-            QtCurrent = null;
             string sendKey = kind == "text" ? Text(request, "sendKey") : null;
             Need(sendKey == null || sendKey == "enter" || sendKey == "ctrl-enter", "QT_SEND_KEY_INVALID");
             Input[] inputs = sendKey == "ctrl-enter" ? new[] { Key(0x11, 0), Key(0x0d, 0), Key(0x0d, 2), Key(0x11, 2) }
                                                      : new[] { Key(0x0d, 0), Key(0x0d, 2) };
+            QtRevokeEnter();
+            QtCurrent = null;
             InputAttempted = true;
             uint accepted = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));
             if (accepted != inputs.Length)
@@ -282,7 +301,10 @@ internal static partial class WechatDraftProbe
         }
         finally
         {
-            QtFinishEnterAttempt(proof, retain, InputAttempted);
+            if (retain && !proof.Consumed)
+                QtFinishEnterAttempt(proof, true, InputAttempted);
+            if (kind == "search" && proof != null && proof.Kind == "search" && !proof.Consumed)
+                QtRevokeEnter();
         }
     }
     static bool QtTextResumeMatches(QtEnterProof proof, QtTextStepBinding step, string id, string digest, QtFrame frame,
@@ -361,13 +383,8 @@ internal static partial class WechatDraftProbe
         if (QtUiaInputHeader(frame, "text", proof.InputOnly, QtFocus.Active))
             QtMarkUiaControlFrame(current, frame.UiaControlLease, captured);
         proof.Consumed = true;
-        var next = new QtEnterProof { Id = Guid.NewGuid().ToString("N"),
-                                      Kind = "text",
-                                      Digest = proof.Digest,
-                                      Epoch = QtEpoch,
-                                      Frame = current,
-                                      Step = proof.Step,
-                                      InputOnly = proof.InputOnly };
+        var next = new QtEnterProof { Id = proof.Id,   Kind = "text",     Digest = proof.Digest,      Epoch = QtEpoch,
+                                      Frame = current, Step = proof.Step, InputOnly = proof.InputOnly };
         QtPendingEnter = next;
         return Data("performed", true, "attempted", true, "resumed", true, "revision", current.Revision,
                     "postPasteFrame", captured, "textEnterProof",

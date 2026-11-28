@@ -406,7 +406,11 @@ export class WechatOneBot {
       ocr: 'UI_QT_LAYOUT_WINDOW_OBSCURED',
       uia: 'DESKTOP_UIA_ACCESSIBILITY_PROVIDER_REQUIRED',
     }[this.status.controlMode];
-    if (!startup || layout?.verified !== false || !pendingReason || layout.reason !== pendingReason)
+    if (
+      !startup ||
+      layout?.verified !== false ||
+      (layout.reason !== pendingReason && layout.reason !== 'UI_QT_CONVERSATION_LAYOUT_REQUIRED')
+    )
       fail(layout?.reason ?? 'DESKTOP_LAYOUT_UNVERIFIED');
     return identity;
   }

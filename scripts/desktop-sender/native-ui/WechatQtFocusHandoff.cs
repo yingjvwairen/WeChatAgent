@@ -917,6 +917,13 @@ internal static partial class WechatDraftProbe
         try
         {
             foreground = QtOwnedPopup(GetForegroundWindow(), lease.Wechat.Window);
+            uint currentPid;
+            if (!foreground.Value &&
+                (GetWindowThreadProcessId(lease.Wechat.Window, out currentPid) == 0 || currentPid != lease.Wechat.Pid))
+                return QtFocusRestoreReport(
+                    Data("restored", false, "skipped", true, "focusRestoreOutcome",
+                         QtRestoreOutcome("foreground-not-wechat", false, true, false, false, unchanged, null)),
+                    lease, false);
             stage = "identity-check-failed";
             identities = WindowIdentity.Same(lease.Return, QtFocusWindow(lease.Return.Window)) &&
                          WindowIdentity.Same(lease.Wechat, QtFocusWindow(lease.Wechat.Window, QtExecutable, true));
@@ -1354,11 +1361,12 @@ internal static partial class WechatDraftProbe
         QtFocus.Acquire(candidateLease);
         try
         {
+            Action finishExposure = null;
             var confirmation = ConfirmFocusOnce(
                 prior.Window, target.Window,
                 delegate {
                     if (uiaCaption)
-                        return QtActivateUiaCaptionOnce(QtFocus.Active);
+                        return QtActivateUiaCaptionOnce(QtFocus.Active, action => finishExposure = action);
                     bool accepted = ActivateForegroundOnce(prior.Window, target.Window, delegate {
                         QtFocusTransitionGuard(QtFocus.Active, revision, false);
                     }, QtFocus.Active.Activation);
@@ -1369,7 +1377,11 @@ internal static partial class WechatDraftProbe
                                });
                 },
                 delegate { QtFocusTransitionGuard(QtFocus.Active, revision, false); }, GetForegroundWindow, Now,
-                Thread.Sleep);
+                Thread.Sleep,
+                delegate {
+                    if (finishExposure != null)
+                        finishExposure();
+                });
             NeedFocusConfirmed(confirmation, "QT_FOCUS_ACQUIRE_UNCONFIRMED");
             Need(revision == Interlocked.Read(ref Revision), "QT_HUMAN_ACTIVITY_CHANGED");
             Binding bound = Snapshot(target.Window, QtExecutable);

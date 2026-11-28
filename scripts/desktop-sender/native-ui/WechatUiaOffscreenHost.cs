@@ -13,6 +13,7 @@ using System.Windows.Forms;
 
 internal static class WechatUiaOffscreenHost
 {
+    const uint WpfSetMinPosition = 0x0001;
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 262144 };
     [StructLayout(LayoutKind.Sequential)]
     struct Point
@@ -221,6 +222,16 @@ internal static class WechatUiaOffscreenHost
     {
         return a.Length == b.Length && a.Flags == b.Flags && a.Show == b.Show && Same(a.Normal, b.Normal);
     }
+    static bool SameMinimizedPosition(Placement current, Placement expected)
+    {
+        // Windows can update ptMinPosition even when no minimized position was requested.
+        return (expected.Flags & WpfSetMinPosition) == 0 || Same(current.Min, expected.Min);
+    }
+    static bool SameEffectivePlacement(Placement current, Placement expected)
+    {
+        return SamePlacementIntent(current, expected) && SameMinimizedPosition(current, expected) &&
+               Same(current.Max, expected.Max);
+    }
     static bool SameGeometry(State a, State b)
     {
         return Same(a.Outer, b.Outer) && Same(a.Client, b.Client) && Same(a.ClientScreen, b.ClientScreen) &&
@@ -228,14 +239,9 @@ internal static class WechatUiaOffscreenHost
     }
     static bool SameWindowState(State a, State b)
     {
-        return Same(a.Outer, b.Outer) && Same(a.Client, b.Client) && Same(a.ClientScreen, b.ClientScreen) &&
-               a.Dpi == b.Dpi && Same(a.Placement, b.Placement);
+        return SameGeometry(a, b) && SameEffectivePlacement(a.Placement, b.Placement);
     }
-    // Keep byte-exact comparisons for ownership leases. Only restoration may
-    // accept Windows-normalized position caches, with real geometry unchanged.
-    // WPF_SETMINPOSITION governs whether ptMinPosition is a requested position:
-    // https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-windowplacement
-    // The max-position exception is deliberately narrower than general Win32:
+    // Only completed restoration may also accept a changed max-position cache:
     // a previously unspecified (-1,-1) cache, currently maximized, with its
     // client exactly filling the same monitor work area, may become the actual
     // monitor-relative outer origin. Ambiguous taskbar-origin/custom layouts
@@ -244,9 +250,7 @@ internal static class WechatUiaOffscreenHost
     {
         var a = current.Placement;
         var b = original.Placement;
-        if (!SamePlacementIntent(a, b))
-            return false;
-        if (!Same(a.Min, b.Min) && (b.Flags & 1) != 0)
+        if (!SamePlacementIntent(a, b) || !SameMinimizedPosition(a, b))
             return false;
         if (Same(a.Max, b.Max))
             return true;
@@ -541,7 +545,8 @@ internal static class WechatUiaOffscreenHost
             dy = lease.Original.Outer.Top - lease.Owned.Outer.Top;
         expected.Normal = new Rect(checked(expected.Normal.Left + dx), checked(expected.Normal.Top + dy),
                                    checked(expected.Normal.Right + dx), checked(expected.Normal.Bottom + dy));
-        return Same(state.Placement, expected) || Same(state.Placement, lease.Original.Placement);
+        return SameEffectivePlacement(state.Placement, expected) ||
+               SameEffectivePlacement(state.Placement, lease.Original.Placement);
     }
     static object BindingReport(Bound b, State state)
     {
@@ -873,7 +878,8 @@ internal static class WechatUiaOffscreenHost
                                    checked(expected.Normal.Right + dx), checked(expected.Normal.Bottom + dy));
         return Same(current.Outer, destination) && Same(current.Client, original.Client) &&
                current.Dpi == original.Dpi &&
-               (Same(current.Placement, original.Placement) || Same(current.Placement, expected));
+               (SameEffectivePlacement(current.Placement, original.Placement) ||
+                SameEffectivePlacement(current.Placement, expected));
     }
     static object Restore(Bound b, State original, State owned, Rect destination, bool recovery)
     {
@@ -890,7 +896,7 @@ internal static class WechatUiaOffscreenHost
         if (SemanticWindowState(current, original))
             return D("restored", true, "semanticRestored", true, "exactMetadataMatched",
                      Same(current.Placement, original.Placement), "reason",
-                     SameWindowState(current, original) ? "already-restored" : "already-semantically-restored",
+                     Same(current.Placement, original.Placement) ? "already-restored" : "already-semantically-restored",
                      "placementRestored", true, "positionApplied", false, "placementApplied", false,
                      "foregroundRestoreRequested", false, "after", current.Report());
         if (!(owned != null ? SameWindowState(current, owned) : PreparedLease(current, original, destination)))
@@ -1285,6 +1291,21 @@ internal static class WechatUiaOffscreenHost
         Need(OwnedAt(lease, owned) && RecoverPositionBoundary(lease, original),
              "OFFSCREEN_TEST_EXACT_ROLLBACK_BOUNDARY");
         n++;
+        owned.Placement.Min = new Point(-1, -1);
+        var parkedWithMinCache =
+            new State { Outer = owned.Outer, Client = owned.Client, ClientScreen = owned.ClientScreen, Dpi = owned.Dpi,
+                        Placement = owned.Placement };
+        parkedWithMinCache.Placement.Min = new Point(-32000, -32000);
+        Need(OwnedAt(lease, parkedWithMinCache) && PreparedLease(parkedWithMinCache, original, lease.Destination),
+             "OFFSCREEN_TEST_SYSTEM_MIN_CACHE_KEEPS_PARKED_WINDOW_OWNED");
+        n++;
+        parkedWithMinCache.Outer.Top++;
+        Need(!OwnedAt(lease, parkedWithMinCache), "OFFSCREEN_TEST_REAL_WINDOW_MOVE_RELEASES_OWNERSHIP");
+        parkedWithMinCache.Outer.Top--;
+        parkedWithMinCache.Placement.Flags = owned.Placement.Flags = 1;
+        Need(!OwnedAt(lease, parkedWithMinCache), "OFFSCREEN_TEST_EXPLICIT_MIN_POSITION_KEEPS_EXACT_OWNERSHIP");
+        owned.Placement.Flags = 0;
+        n += 2;
         var altered =
             new State { Outer = original.Outer, Client = original.Client, ClientScreen = original.ClientScreen,
                         Dpi = original.Dpi, Placement = original.Placement };

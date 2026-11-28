@@ -157,10 +157,12 @@ export class QtConversationPreparation {
       )
         throw fault('QT_BINDING_CHANGED');
       if (
-        settleUiaHeader &&
         this.#input.now() - Date.parse(backgroundAccount.proof.evidence.observedAtUtc) >
-          backgroundAccount.proof.evidence.maximumEvidenceAgeMs
+        backgroundAccount.proof.evidence.maximumEvidenceAgeMs
       ) {
+        // Activation and a verified frame can take longer than the account
+        // proof's lifetime in either mode. Refresh the read-only evidence for
+        // this exact window before releasing or attempting any input.
         backgroundAccount.proof = await this.#input.freshAccount({
           frame: initial,
           park: false,
@@ -251,6 +253,21 @@ export class QtConversationPreparation {
       : continuation || recovering
         ? previous.privateChatProof
         : null;
+    if (
+      !continuation &&
+      !recovering &&
+      this.#frames.config.layoutMode === 'adaptive-v1' &&
+      !(job.index > 0) &&
+      !job.pendingInput
+    ) {
+      targetLookup ??= await this.#navigation.lookupTarget(job, { signal });
+      privateChatProof = await this.#navigation.currentOcrChat(job, initial, targetLookup);
+      if (privateChatProof) {
+        continuation = true;
+        if (voicePreparation) voicePreparation.start(initial);
+        else await this.#input.sharedAction('click', { rect: this.#frames.config.layout.editor }, ['header'], initial);
+      }
+    }
     if (completedContinuation) {
       if (semanticContinuation) {
         const result = await this.#input.sharedAction(

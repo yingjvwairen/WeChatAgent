@@ -11,6 +11,22 @@ function clipboardSettled(report, allowReplacement) {
   if (report?.clipboardRestored === true) return report.clipboardReplaced !== true;
   return allowReplacement === true && report?.clipboardRestored === false && report.clipboardReplaced === true;
 }
+export function appliedPasteResult(result, text, revision, allowReplacement) {
+  if (
+    result?.performed !== true ||
+    result.attempted !== true ||
+    result.pasteApplied !== true ||
+    result.readbackPerformed !== false ||
+    result.intendedText !== text ||
+    !clipboardSettled(result, allowReplacement) ||
+    typeof result.interrupted !== 'boolean' ||
+    !Number.isSafeInteger(revision) ||
+    result.revision !== revision ||
+    result.clipboardConsumerConfirmed !== true
+  )
+    throw fault('UI_QT_PASTE_UNCONFIRMED');
+  return result;
+}
 const preparedTargetLookup = Symbol('qt-prepared-target-lookup');
 const observedLayout = config => config.layoutMode === 'adaptive-v1' || config.layoutMode === 'uia-v1';
 const sharedTargetProof = proof => ['database-query-search-enter-v1', 'uia-database-title-v1'].includes(proof?.kind);
@@ -524,7 +540,7 @@ const preparationWaits = new Set([
   'DRAFT_CLIPBOARD_CHANGED',
   'DRAFT_CLIPBOARD_BUSY',
 ]);
-function validateQtConfig(value) {
+function validateQtConfig(value, { searchOnly = false } = {}) {
   const uia = value?.layoutMode === 'uia-v1';
   if (
     !object(value) ||
@@ -559,6 +575,21 @@ function validateQtConfig(value) {
     !['windows', 'rapidocr'].includes(value.ocrBackend)
   )
     throw fault('UI_QT_CONFIG_INVALID');
+  if (searchOnly) {
+    const { width, height, search, pointerParkRect } = value.layout;
+    const client = { left: 0, top: 0, right: width, bottom: height };
+    if (
+      value.sharedDesktop !== true ||
+      !['adaptive-v1', 'uia-v1'].includes(value.layoutMode) ||
+      !rect(search) ||
+      !inside(client, search) ||
+      Object.keys(value.layout).some(key => !['width', 'height', 'dpi', 'search', 'pointerParkRect'].includes(key)) ||
+      (pointerParkRect !== undefined && !validPointerParkRect(pointerParkRect, width))
+    )
+      throw fault('UI_QT_SEARCH_LAYOUT_INVALID');
+    toObservedPopupCalibration(value.searchPopupCalibration, 'search');
+    return structuredClone(value);
+  }
   if (uia) {
     const client = { left: 0, top: 0, right: value.layout.width, bottom: value.layout.height };
     if (

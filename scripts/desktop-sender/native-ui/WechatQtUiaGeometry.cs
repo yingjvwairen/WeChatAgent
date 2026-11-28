@@ -252,7 +252,7 @@ internal static partial class WechatDraftProbe
     {
         return activate() || QtUiaCaptionFallbackReady(alreadyTarget, prepare);
     }
-    static bool QtActivateUiaCaptionOnce(QtFocusLease lease)
+    static bool QtActivateUiaCaptionOnce(QtFocusLease lease, Action<Action> finishExposure)
     {
         Need(lease != null && lease.UiaMode && Object.ReferenceEquals(lease, QtFocus.Active),
              "QT_UIA_CAPTION_UNAVAILABLE");
@@ -306,6 +306,8 @@ internal static partial class WechatDraftProbe
         IntPtr source = lease.Return.Window, target = lease.Wechat.Window;
         bool above = FocusWindowAbove(source, target), raised = false, clicked = false, applied = false;
         FocusOrderAnchor predecessor = null;
+        FocusOrderAnchor raisedTarget = null;
+        Dictionary<IntPtr, bool> ownedBeforeRaise = null;
         Rect desktop = QtDesktopRect();
         Point center = proof.Points[0], saved = lease.OriginalPointer;
         Rect sourceClient;
@@ -321,6 +323,20 @@ internal static partial class WechatDraftProbe
                      ClientToScreen(source, ref origin) && QtSamePoint(origin, sourceOrigin),
                  "QT_FOCUS_TARGET_CHANGED");
         };
+        Action restoreTopmost = delegate
+        {
+            if (raisedTarget == null)
+                return;
+            bool restored = FocusRemoveTemporaryTopmost(
+                delegate { return FocusOriginalWindowAlive(raisedTarget); },
+                delegate { return (FocusGetWindowLongPtr(target, -20).ToInt64() & 8) != 0; },
+                delegate { return FocusSetWindowPos(target, new IntPtr(-2), 0, 0, 0, 0, 0x4213); }, Now, Thread.Sleep);
+            restored = restored && (!FocusOriginalWindowAlive(raisedTarget) ||
+                                    QtLayoutFamilyMatches(ownedBeforeRaise, QtLayoutOwnedTopmost(lease.Wechat), false));
+            diagnostic["temporaryTopmostRestored"] = restored;
+            Need(restored, "DRAFT_FOCUS_TOPMOST_RESTORE_UNCONFIRMED");
+            raisedTarget = null;
+        };
         try
         {
             // Only the physical fallback needs a current caption tree. A
@@ -333,12 +349,20 @@ internal static partial class WechatDraftProbe
             if (!FocusAreaOwned(proof.ScreenRect, target, lease.Wechat.Pid))
             {
                 predecessor = FocusCapturePredecessor(target);
+                ownedBeforeRaise = QtLayoutOwnedTopmost(lease.Wechat);
+                Need(QtLayoutFamilyNotTopmost(ownedBeforeRaise), "QT_UIA_CAPTION_OBSCURED");
+                var anchor = FocusReadOrderAnchor(target);
                 if (FocusTargetBeforeClick(source, target, guard, GetForegroundWindow, diagnostic))
                     return true;
                 raised = true;
-                diagnostic["calibratedRaiseAttempted"] = true;
-                bool accepted = FocusSetWindowPos(target, IntPtr.Zero, 0, 0, 0, 0, 0x4213);
-                diagnostic["calibratedRaiseAccepted"] = accepted;
+                // An ordinary HWND_TOP request can leave the foreground
+                // window above us. Expose the verified caption once, within
+                // this handoff, and restore the original topmost flags.
+                raisedTarget = anchor;
+                finishExposure(restoreTopmost);
+                diagnostic["temporaryTopmostAttempted"] = true;
+                bool accepted = FocusSetWindowPos(target, new IntPtr(-1), 0, 0, 0, 0, 0x4213);
+                diagnostic["temporaryTopmostAccepted"] = accepted;
                 Need(accepted, "DRAFT_FOCUS_RAISE_FAILED");
             }
             long deadline = Now() + (proof.Title == null ? 200 : 700);
@@ -383,6 +407,7 @@ internal static partial class WechatDraftProbe
         }
         catch
         {
+            restoreTopmost();
             diagnostic["raiseCleanup"] =
                 FocusUndoCaptionRaise(target, source, predecessor, raised, clicked, above, cleanupGuard);
             throw;

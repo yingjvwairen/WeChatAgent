@@ -777,7 +777,6 @@ internal static partial class WechatDraftProbe
     static object QtAct(Dictionary<string, object> request, string action, bool uiaOpenSearch = false,
                         bool uiaEditor = false)
     {
-        QtRevokeEnter();
         QtEmptyPhaseProof = null;
         QtRevokeQueryClick(QtPopup);
         if (uiaOpenSearch)
@@ -797,7 +796,9 @@ internal static partial class WechatDraftProbe
                  "QT_UIA_NAVIGATION_UNAVAILABLE");
         }
         bool navigation = uiaOpenSearch || uiaEditor;
-        QtFrame frame = QtGuard(request, true, !navigation, navigation);
+        // Parking only moves the cursor. Its calibrated rectangle, hit test
+        // and window/activity guards still apply while the caption repaints.
+        QtFrame frame = QtGuard(request, true, !navigation && action != "movePointer", navigation);
         Input[] inputs;
         Point destination = new Point(0, 0);
         bool pointerAction = action == "click" || action == "movePointer";
@@ -808,7 +809,10 @@ internal static partial class WechatDraftProbe
         {
             var editorRole = QtUiaResolveRoles(frame.Binding, new[] { "editor" })["editor"];
             Need(Same(editorRole.Node.Rect, ParseRect(Get(request, "rect"))), "QT_UIA_CONTROL_RECT_CHANGED");
-            var delivery = QtUiaPointerClick(frame, editorRole, "editor-focus", delegate { QtCurrent = null; });
+            var delivery = QtUiaPointerClick(frame, editorRole, "editor-focus", delegate {
+                QtRevokeEnter();
+                QtCurrent = null;
+            });
             return Data("performed", true, "attempted", delivery != null, "revision", frame.Revision,
                         "editorFocusReused", delivery == null, "pointerDelivery", delivery);
         }
@@ -865,6 +869,8 @@ internal static partial class WechatDraftProbe
         QtStable(frame);
         if (frame.MetadataOnly && pointerAction)
             Need(Owned(WindowFromPoint(destination), frame.Binding.Window, frame.Binding.Pid), "QT_CLICK_OBSCURED");
+        if (action != "movePointer")
+            QtRevokeEnter();
         QtCurrent = null;
         InputAttempted = true;
         if (action == "click")
@@ -979,6 +985,8 @@ internal static partial class WechatDraftProbe
             return QtAttachQuote(request);
         case "checkClearMessageQuote":
             return QtCheckClearQuote(request);
+        case "verifyOpenChatTitle":
+            return QtVerifyOpenChatTitle(request);
         case "verifyMessageQuote": {
             var verifiedQuoteFrame = QtGuard(request, true, false);
             Need(Text(request, "quoteToken") != null, "QT_QUOTE_CHANGED");

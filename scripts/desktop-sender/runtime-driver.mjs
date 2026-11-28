@@ -2,16 +2,21 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { setTimeout as wait } from 'node:timers/promises';
 import { desktopSettings } from '../desktop-settings.mjs';
 import { bootstrapDesktopSender, bootstrapBinding } from './bootstrap.mjs';
 import { ocrPython } from './ocr-runtime.mjs';
 import { createLayoutAwareQtDriver } from './qt-layout-profiles.mjs';
 import { resolveQtAutoLayout } from './qt-auto-layout.mjs';
+import { recoverConversationBySearch } from './qt-search-recovery.mjs';
 import { NativeVoiceTransport } from './native-voice-transport.mjs';
 import { createUiaOffscreenManager, recoverUiaOffscreenWindow } from './uia-offscreen.mjs';
 const execute = promisify(execFile);
 const fault = code => Object.assign(Error(code), { code });
 const failureCode = (error, fallback) => (/^[A-Z][A-Z0-9_]{1,79}$/.test(error.code ?? '') ? error.code : fallback);
+const canRecoverLayout = error => error?.code === 'UI_QT_CONVERSATION_LAYOUT_REQUIRED' && Boolean(error.searchRecovery);
+const inputAllowed = options =>
+  !options.signal?.aborted && typeof options.canInput === 'function' && options.canInput() === true;
 
 export async function inspectCableEndpoints(root, { executeImpl = execute } = {}) {
   const result = await executeImpl(path.join(root, 'state/ui-host/AudioRouteProbe.exe'), ['--list'], {
@@ -64,6 +69,7 @@ export async function createDesktopRuntimeDriver({
   ensureAccessibility,
   probeAccount,
   bootstrap = bootstrapDesktopSender,
+  recoverSearch = recoverConversationBySearch,
   createDriver = createLayoutAwareQtDriver,
   createOffscreen = createUiaOffscreenManager,
   recoverOffscreen = recoverUiaOffscreenWindow,
@@ -73,17 +79,15 @@ export async function createDesktopRuntimeDriver({
   const binding = bootstrapBinding(account);
   const offscreen = createOffscreen({ root });
   let offscreenEnabled = normalized.offscreen;
+  let offscreenDeferred = false;
   let active,
     closed = false;
   const instances = new Map();
-  const make = async (mode, options = {}) => {
-    if (instances.has(mode)) return instances.get(mode);
-    if (mode === 'ocr' && (typeof options.canInput !== 'function' || options.canInput() !== true))
-      throw fault('DESKTOP_BOOTSTRAP_CAPTURE_NOT_ALLOWED');
+  const loadLayout = async (mode, options) => {
     const currentAccount = typeof probeAccount === 'function' ? await probeAccount({ root }) : account;
     if (currentAccount.accountRef !== account.accountRef || currentAccount.accountWxid !== account.accountWxid)
       throw fault('DESKTOP_ACCOUNT_CHANGED');
-    const boot = await bootstrap({
+    return bootstrap({
       root,
       settings: { ...normalized, controlMode: mode },
       account: currentAccount,
@@ -91,6 +95,53 @@ export async function createDesktopRuntimeDriver({
       signal: options.signal,
       ...(mode === 'ocr' ? { allowFocusCapture: true, canCapture: options.canInput } : {}),
     });
+  };
+  const resolveContact = async native => {
+    const contact = await resolveTarget(native);
+    if (!contact?.wxid || contact.wxid !== native.target) throw fault('DESKTOP_TARGET_CHANGED');
+    const name = contact.name ?? contact.searchName;
+    return {
+      ...contact,
+      wechatId: contact.wxid,
+      ambiguous: contact.ambiguous === true,
+      searchName: contact.searchName ?? name,
+      uniqueSearchName: contact.uniqueSearchName === true,
+      ...(contact.kind === 'group' ? { groupName: contact.groupName ?? name } : {}),
+    };
+  };
+  const make = async (mode, job, options = {}) => {
+    if (instances.has(mode)) return instances.get(mode);
+    if (mode === 'ocr' && !inputAllowed(options)) throw fault('DESKTOP_BOOTSTRAP_CAPTURE_NOT_ALLOWED');
+    let boot;
+    try {
+      boot = await loadLayout(mode, options);
+    } catch (error) {
+      if (!canRecoverLayout(error) || !job || !inputAllowed(options)) throw error;
+      if (job.index > 0 || job.pendingInput || job.inputStarted || job.inputPending || job.imageDraftPresent)
+        throw fault('UI_QT_LAYOUT_CHANGED_WITH_DRAFT');
+      await recoverSearch({
+        root,
+        recovery: error.searchRecovery,
+        job,
+        resolveTarget: resolveContact,
+        canInput: options.canInput,
+        signal: options.signal,
+        allowClipboardReplacement: normalized.allowClipboardReplacement,
+      });
+      // Search Enter is asynchronous. Only repeat layout inspection while
+      // the conversation is being painted. The search is issued once.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await wait(150);
+        if (!inputAllowed(options)) throw fault('UI_QT_CANCELLED');
+        try {
+          boot = await loadLayout(mode, options);
+          break;
+        } catch (settling) {
+          if (!canRecoverLayout(settling)) throw settling;
+        }
+      }
+      if (!boot) throw fault('UI_QT_SEARCH_TRANSITION_UNCONFIRMED');
+    }
     boot.config.sendKey = normalized.sendKey;
     const provider = boot.provider;
     const driver = createDriver({
@@ -102,19 +153,7 @@ export async function createDesktopRuntimeDriver({
       receipt: async () => ({ confirmed: false, reason: 'DESKTOP_PLATFORM_RECEIPT_REQUIRED' }),
       allowClipboardReplacement: normalized.allowClipboardReplacement,
       probeAccount: boot.accountProbe,
-      resolveTarget: async native => {
-        const contact = await resolveTarget(native);
-        if (!contact?.wxid || contact.wxid !== native.target) throw fault('DESKTOP_TARGET_CHANGED');
-        const name = contact.name ?? contact.searchName;
-        return {
-          ...contact,
-          wechatId: contact.wxid,
-          ambiguous: contact.ambiguous === true,
-          searchName: contact.searchName ?? name,
-          uniqueSearchName: contact.uniqueSearchName === true,
-          ...(contact.kind === 'group' ? { groupName: contact.groupName ?? name } : {}),
-        };
-      },
+      resolveTarget: resolveContact,
       ...(provider
         ? {
             resolveControls: request => provider.resolveControls(request),
@@ -132,7 +171,12 @@ export async function createDesktopRuntimeDriver({
   const choose = async (job, options = {}) => {
     if (closed) throw fault('DESKTOP_DRIVER_CLOSED');
     const mode = normalized.controlMode;
-    const selected = await make(mode, options);
+    const selected = await make(mode, job, options);
+    if (offscreenDeferred && inputAllowed(options)) {
+      await offscreen.setEnabled({ enabled: true, config: selected.boot.config });
+      offscreenEnabled = true;
+      offscreenDeferred = false;
+    }
     if (active && active !== selected) await active.driver.releaseTextFocus();
     active = selected;
     return selected.driver;
@@ -144,9 +188,20 @@ export async function createDesktopRuntimeDriver({
       // A live Qt input process owns its mutex/checkpoint until engine drains it.
       if (active?.driver.nativeRunning) throw fault('DESKTOP_CONFIGURATION_BUSY');
       await recoverOffscreen({ root });
-      if (normalized.controlMode === 'uia') active = await make('uia');
+      if (normalized.controlMode === 'uia') {
+        try {
+          active = await make('uia');
+        } catch (error) {
+          if (!canRecoverLayout(error)) throw error;
+          // A settings apply has no authorized conversation to open.
+          offscreenDeferred = normalized.offscreen;
+          offscreenEnabled = false;
+          return { applied: true, windowState: await offscreen.setEnabled({ enabled: false }) };
+        }
+      }
       const windowState = await offscreen.setEnabled({ enabled: normalized.offscreen, config: active?.boot.config });
       offscreenEnabled = normalized.offscreen;
+      offscreenDeferred = false;
       return { applied: true, windowState };
     },
     health: async ({ verifyLayout = false } = {}) => {
@@ -199,6 +254,7 @@ export async function createDesktopRuntimeDriver({
       };
     },
     restoreWindow: async () => {
+      offscreenDeferred = false;
       offscreenEnabled = false;
       await active?.driver.releaseTextFocus();
       return offscreen.setEnabled({ enabled: false, config: active?.boot.config });

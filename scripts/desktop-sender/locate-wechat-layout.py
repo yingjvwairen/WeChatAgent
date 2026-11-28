@@ -847,6 +847,70 @@ def locate_contact_panel(
     }
 
 
+def search_control_geometry(gray, nav_x, chat_x, chrome_y, bottom, scale):
+    area = rect(nav_x + round(7 * scale), chrome_y, chat_x - round(30 * scale), bottom)
+    candidates = rectangle_candidates(gray, area, 130 * scale, 350 * scale, 23 * scale, 45 * scale)
+    need(len(candidates) == 1, 'SEARCH_CONTROL_BOUNDARY_UNCERTAIN')
+    search = candidates[0]
+    # The magnifier sits beside the placeholder. Keep OCR inside its control.
+    text = rect(
+        search['left'] + round(26 * scale),
+        max(chrome_y, search['top'] - round(5 * scale)),
+        search['right'] - round(3 * scale),
+        min(bottom, search['bottom'] + round(8 * scale)),
+    )
+    return area, search, text
+
+
+def locate_search_only(
+    gray, digest, dpi, version, nav_x, chat_x, chrome_y, recognize, recognize_scaled, recognize_padded
+):
+    scale = dpi / 120
+    height, width = gray.shape
+    bottom = min(height, chrome_y + round(80 * scale))
+    area, search, text = search_control_geometry(gray, nav_x, chat_x, chrome_y, bottom, scale)
+    padded = dpi == 96 and callable(recognize_padded)
+    observation = recognize_padded(text) if padded else recognize(text)
+    need(
+        observation.get('imageSha256') == digest
+        and observation.get('width') == width
+        and observation.get('height') == height,
+        'OCR_BINDING_INVALID',
+    )
+    if padded:
+        need(
+            observation.get('region') == text and observation.get('layoutPreprocess') == 'control-border-16',
+            'OCR_BINDING_INVALID',
+        )
+    label, confidence, _ = search_anchor(
+        observation,
+        area,
+        search,
+        (lambda: recognize_scaled(text)) if callable(recognize_scaled) and not padded else None,
+        text,
+    )
+    need(label_in_control(search, label), 'LABEL_CONTROL_BOUNDARY_UNCERTAIN')
+    return {
+        'version': 1,
+        'ok': True,
+        'searchOnly': True,
+        'executableVersion': version,
+        'imageSha256': digest,
+        'width': width,
+        'height': height,
+        'dpi': dpi,
+        'readOnly': True,
+        'inputSent': False,
+        'emptyDraftAuthorized': False,
+        'identityVerified': False,
+        'layout': {
+            'search': search,
+            'pointerParkRect': blank_caption_region(gray, chat_x, chrome_y, dpi),
+        },
+        'confidence': round(confidence, 6),
+    }
+
+
 def locate(
     pixels,
     digest,
@@ -856,6 +920,7 @@ def locate(
     *,
     recording_state=False,
     contact_panel=False,
+    search_only=False,
     templates=None,
     recognize_scaled=None,
     recognize_padded=None,
@@ -913,8 +978,13 @@ def locate(
     separators = groups(np.where(horizontal > 0.95)[0] + 1)
     top = [v for v in separators if 20 * s <= v[0] <= 60 * s]
     bottom = [v for v in separators if 70 * s <= v[0] <= 125 * s]
-    need(len(top) == 1 and len(bottom) <= 1, 'HEADER_BOUNDARY_UNCERTAIN')
+    need(len(top) == 1, 'HEADER_BOUNDARY_UNCERTAIN')
     chrome_y = top[0][-1]
+    if search_only:
+        return locate_search_only(
+            gray, digest, dpi, version, nav_x, chat_x, chrome_y, recognize, recognize_scaled, recognize_padded
+        )
+    need(len(bottom) <= 1, 'HEADER_BOUNDARY_UNCERTAIN')
     header_banner = None
     if bottom:
         header_bottom = bottom[0][-1]
@@ -1023,20 +1093,8 @@ def locate(
         and record['right'] < frame['right'] - 40 * s,
         'RECORD_LOCATION_UNCERTAIN',
     )
-    search_area = rect(nav_x + round(7 * s), chrome_y, chat_x - round(30 * s), header_bottom)
+    search_area, search, search_text = search_control_geometry(gray, nav_x, chat_x, chrome_y, header_bottom, s)
     send_area = rect(record['right'] + round(4 * s), toolbar['top'], frame['right'], toolbar['bottom'])
-    searches = rectangle_candidates(gray, search_area, 130 * s, 350 * s, 23 * s, 45 * s)
-    need(len(searches) == 1, 'SEARCH_CONTROL_BOUNDARY_UNCERTAIN')
-    search = searches[0]
-    # The magnifier is a separate glyph, not part of the placeholder. The
-    # button OCR gets surrounding vertical context; acceptance stays confined
-    # to the structurally found bottom-right control, never chat bubbles.
-    search_text = rect(
-        search['left'] + round(26 * s),
-        max(chrome_y, search['top'] - round(5 * s)),
-        search['right'] - round(3 * s),
-        min(header_bottom, search['bottom'] + round(8 * s)),
-    )
     send_context = rect(
         max(chat_x, record['left'] - round(8 * s)),
         max(frame['top'], toolbar['top'] - round(18 * s)),
@@ -1077,11 +1135,10 @@ def locate(
     title, title_score = title_anchor(
         title_ocr, title_area, (lambda: recognize_scaled(title_area)) if callable(recognize_scaled) else None
     )
-    searches = [r for r in searches if label_in_control(r, search_label)]
     buttons = rectangle_candidates(gray, send_area, 42 * s, 95 * s, 22 * s, 42 * s)
     buttons = [r for r in buttons if label_in_control(r, send_label)]
-    need(len(searches) == 1 and len(buttons) == 1, 'LABEL_CONTROL_BOUNDARY_UNCERTAIN')
-    search, send = searches[0], buttons[0]
+    need(label_in_control(search, search_label) and len(buttons) == 1, 'LABEL_CONTROL_BOUNDARY_UNCERTAIN')
+    send = buttons[0]
     need(
         abs((record['top'] + record['bottom']) / 2 - (send['top'] + send['bottom']) / 2) < 8 * s,
         'TOOLBAR_ALIGNMENT_UNCERTAIN',
@@ -1158,6 +1215,7 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--recording-state', action='store_true')
     modes.add_argument('--contact-panel', action='store_true')
+    modes.add_argument('--search-only', action='store_true')
     args = parser.parse_args()
     try:
         spec = importlib.util.spec_from_file_location('local_ocr', Path(__file__).with_name('local-ocr.py'))
@@ -1195,6 +1253,7 @@ def main():
             recognize,
             recording_state=args.recording_state,
             contact_panel=args.contact_panel,
+            search_only=args.search_only,
             recognize_scaled=recognize_scaled,
             recognize_padded=recognize_padded,
         )

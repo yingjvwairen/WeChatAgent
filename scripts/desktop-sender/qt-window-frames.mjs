@@ -27,8 +27,8 @@ export class QtWindowFrames {
   #active;
   #wait;
   #hasForegroundLease;
-  constructor({ config, navigationPolicy, request, active, wait, hasForegroundLease }) {
-    this.#config = validateQtConfig(config);
+  constructor({ config, navigationPolicy, request, active, wait, hasForegroundLease, searchOnly = false }) {
+    this.#config = validateQtConfig(config, { searchOnly });
     this.#navigationPolicy = navigationPolicy;
     this.#request = request;
     this.#active = active;

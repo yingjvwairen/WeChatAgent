@@ -375,7 +375,6 @@ internal static partial class WechatDraftProbe
         clipboard.ObserveRestore(true);
         try
         {
-            QtRevokeEnter();
             QtEmptyPhaseProof = null;
             QtRevokeQueryClick(QtPopup);
             clipboard.ObserveRestore(true);
@@ -448,6 +447,7 @@ internal static partial class WechatDraftProbe
                 QtInputStable(frame);
                 trace.Mark("before-input", owner);
                 renderer.Arm();
+                QtRevokeEnter();
                 QtCurrent = null;
                 SendEvents(events);
                 // A bound WeChat clipboard consumer proves handoff without reading
@@ -530,7 +530,6 @@ internal static partial class WechatDraftProbe
     {
         if (!QtPasteReadback(request))
             return QtPasteWithoutReadback(clipboard, request, owner);
-        QtRevokeEnter();
         QtEmptyPhaseProof = null;
         QtQueryClickProof queryClick = QtTakeQueryClick(QtPopup);
         clipboard.At("initial-guard");
@@ -571,6 +570,7 @@ internal static partial class WechatDraftProbe
             Need(GetClipboardSequenceNumber() == owned && ClipboardOwnerPid() == ownerPid, "DRAFT_CLIPBOARD_CHANGED");
             QtCurrent = null;
             clipboard.At("paste-settle");
+            QtRevokeEnter();
             SendEvents(pasteKeys);
             QtPasteCompletionPause(frame, completionSearch, 120);
             Need(GetClipboardSequenceNumber() == owned && ClipboardOwnerPid() == ownerPid, "DRAFT_CLIPBOARD_CHANGED");

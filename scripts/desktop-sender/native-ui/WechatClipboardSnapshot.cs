@@ -23,6 +23,7 @@ internal sealed class ClipboardState
     internal uint Sequence, OwnerPid;
     internal IntPtr OwnerWindow;
     internal bool ProjectionOnly, ReplaceOnPaste;
+    internal bool OmittedOleImageCompanions = false;
     internal readonly List<ClipFormat> Formats = new List<ClipFormat>();
     internal bool HasSamePayload(ClipboardState other)
     {

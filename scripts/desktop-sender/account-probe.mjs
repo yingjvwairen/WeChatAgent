@@ -13,6 +13,18 @@ const fault = code => Object.assign(new Error(code), { code });
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const stamp = value =>
   typeof value === 'string' && /^[1-9][0-9]{0,18}$/.test(value) && BigInt(value) <= 0x7fffffffffffffffn;
+export function desktopProcessIdentity(binding) {
+  const pid = binding?.pid,
+    created = binding?.processCreatedFileTimeUtc;
+  if (Number.isSafeInteger(pid) && pid > 0 && pid <= 0xffffffff && stamp(created)) return `${pid}:${created}`;
+}
+
+const processIdentity = /^([1-9]\d{0,9}):([1-9]\d{0,18})$/;
+export function desktopProcessPrecedes(previous, current) {
+  const before = processIdentity.exec(previous ?? ''),
+    after = processIdentity.exec(current ?? '');
+  return Boolean(before && after && BigInt(before[2]) < BigInt(after[2]));
+}
 const samePath = (a, b) =>
   typeof a === 'string' && typeof b === 'string' && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 const nativeDenialCodes = new Set([

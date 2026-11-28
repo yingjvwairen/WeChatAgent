@@ -273,7 +273,7 @@ function inputModeControls() {
     <div><label for="switch-input-uia">使用控件定位（UIA）${restartTag('input.controlMode')}</label><p>关闭后使用屏幕识别（OCR）。</p></div>
     <label class="switch-control"><input type="checkbox" role="switch" id="switch-input-uia" ${uia ? 'checked' : ''} ${active ? '' : 'disabled'} aria-label="使用控件定位（UIA）" aria-controls="input-mode-ocr input-mode-uia"><span class="switch-track"></span></label>
   </div><div class="switch-row" id="input-mode-ocr" ${uia ? 'hidden' : ''}>
-    <div><label for="switch-input-typeText">文字逐字输入${restartTag('input.typeText')}</label><p id="input-typeText-help">使用屏幕识别时，逐字输入消息正文。</p></div>
+    <div><label for="switch-input-typeText">文字逐字输入${restartTag('input.typeText')}</label><p id="input-typeText-help">使用屏幕识别时，模拟键盘逐字输入消息正文。</p></div>
     <label class="switch-control"><input type="checkbox" role="switch" id="switch-input-typeText" data-path="input.typeText" ${typed ? 'checked' : ''} ${active && !uia ? '' : 'disabled'} aria-label="文字逐字输入" aria-describedby="input-typeText-help"><span class="switch-track"></span></label>
   </div><div class="switch-row" id="input-mode-uia" ${uia ? '' : 'hidden'}>
     <div><label for="switch-input-offscreen">微信离屏</label><p>使用控件定位时，将微信窗口移出屏幕。</p></div>
