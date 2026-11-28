@@ -3,7 +3,9 @@
 import html
 import re
 import xml.etree.ElementTree as ET
+from wechat_identity import valid_chat_id, group_username
 from wechat_forwarded import safe_xml
+from wechat_extra_card import card_text, parse_extra_card
 
 QUOTE_TYPE = (57 << 32) | 49
 MAX_XML = 100_000
@@ -33,6 +35,20 @@ def _reference_text(kind, value, depth):
         if not value or value.lower() in ('null', '(null)'):
             return '[被引用文字不可用]', True, False
         return value[:MAX_REFERENCE], False, len(value) > MAX_REFERENCE
+    card_type = int(kind) if kind.isdigit() and len(kind) <= 16 else 0
+    if card_type in (42, 48) or card_type & 0xFFFFFFFF == 49:
+        # Some clients escape the embedded message separately from the outer XML.
+        for _ in range(3):
+            if value.startswith('<'):
+                break
+            decoded = html.unescape(value)
+            if decoded == value:
+                break
+            value = decoded
+        card = parse_extra_card(card_type, value)
+        if card:
+            shown = card_text(card)
+            return shown[:MAX_REFERENCE], False, len(shown) > MAX_REFERENCE
     labels = {
         '3': '图片，未提供图片内容',
         '34': '语音，未转写',
@@ -44,14 +60,6 @@ def _reference_text(kind, value, depth):
     if kind in labels:
         return '[' + labels[kind] + ']', True, False
     if kind == '49' or (kind.isdigit() and int(kind) & 0xFFFFFFFF == 49):
-        # References may contain an XML tree, CDATA, or doubly escaped XML.
-        for _ in range(3):
-            if value.startswith('<'):
-                break
-            decoded = html.unescape(value)
-            if decoded == value:
-                break
-            value = decoded
         try:
             app = _app(value)
             if app is not None:
@@ -91,11 +99,13 @@ def parse_quote_reply(value, depth=0):
             return None
         reply = _text(app, 'title')
         ref = app.find('refermsg')
-        source = _metadata(_text(ref, 'fromusr'), 128)
-        member = _metadata(_text(ref, 'chatusr'), 128)
+        source = _text(ref, 'fromusr')
+        member = _text(ref, 'chatusr')
         # In a group fromusr is the room; chatusr is the quoted speaker.
-        group = source.endswith('@chatroom')
+        group = group_username(source)
         sender = member if group else source or member
+        if not valid_chat_id('private', sender):
+            sender = ''
         kind = _text(ref, 'type')
         kind = kind if re.fullmatch(r'[0-9]{1,16}', kind) else ''
         content = ref.find('content') if ref is not None else None
@@ -121,5 +131,24 @@ def parse_quote_reply(value, depth=0):
                 'truncated': truncated,
             },
         }
+    except (ValueError, ET.ParseError, RecursionError):
+        return None
+
+
+def parse_quote_receipt(value):
+    """Match the original submitted body and the referenced server ID."""
+    try:
+        app = _app(value) if isinstance(value, str) else None
+        if app is None or _text(app, 'type') != '57':
+            return None
+        titles, references = app.findall('title'), app.findall('refermsg')
+        if len(titles) != 1 or len(references) != 1 or len(titles[0]):
+            return None
+        ids = references[0].findall('svrid')
+        sid = ids[0].text if len(ids) == 1 and not len(ids[0]) else None
+        body = titles[0].text
+        if not body or not re.fullmatch(r'[1-9][0-9]{0,19}', sid or '') or int(sid) >= 2**64:
+            return None
+        return {'body': body, 'sourceServerId': sid}
     except (ValueError, ET.ParseError, RecursionError):
         return None

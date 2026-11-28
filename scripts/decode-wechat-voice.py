@@ -30,11 +30,15 @@ def wasm_command():
     return None
 
 
-def run_wasm(command, blob=None):
+def run_wasm(command, blob=None, shape=None):
     try:
+        args = ['--probe'] if blob is None else ['--match-recording'] if shape is not None else []
+        payload = {} if blob is None else {'b64': base64.b64encode(blob).decode('ascii')}
+        if shape is not None:
+            payload['shape'] = shape
         process = subprocess.run(
-            command + (['--probe'] if blob is None else []),
-            input='' if blob is None else json.dumps({'b64': base64.b64encode(blob).decode('ascii')}),
+            command + args,
+            input='' if blob is None else json.dumps(payload),
             text=True,
             encoding='utf-8',
             capture_output=True,
@@ -118,7 +122,15 @@ if __name__ == '__main__':
         raw = sys.stdin.buffer.read(3 * 1024 * 1024 + 1)
         if len(raw) > 3 * 1024 * 1024:
             raise RuntimeError('VOICE_DECODE_LIMIT')
-        result = decode(base64.b64decode(json.loads(raw)['b64'], validate=True))
+        request = json.loads(raw)
+        blob = base64.b64decode(request['b64'], validate=True)
+        if sys.argv[1:] == ['--match-recording']:
+            command = wasm_command()
+            if not command:
+                raise RuntimeError('VOICE_DECODER_MISSING')
+            result = run_wasm(command, blob, request['shape'])
+        else:
+            result = decode(blob)
         print(json.dumps(result))
     except Exception as error:
         code = str(error) if str(error).startswith('VOICE_') else 'VOICE_DECODE_FAILED'

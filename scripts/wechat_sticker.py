@@ -2,11 +2,15 @@
 
 Cache layout and AES-CBC key=IV convention follow weflow-cli 3d56da9 (MIT).
 Original license: components/weflow-cli/LICENSE. Credentials stay in memory.
+Local account-key derivation follows weflow-cli 25e0908 (MIT).
+Cache lookups use filenames.
 """
 
 import hashlib
 import base64
 import io
+import os
+import stat
 import pathlib
 import re
 import subprocess
@@ -19,10 +23,65 @@ import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from PIL import Image
+from wechat_image_limits import MAX_BYTES
 
-MAX_BYTES = 8 * 1024 * 1024
 CDN_HOSTS = frozenset({'wxapp.tc.qq.com', 'vweixinf.tc.qq.com'})
 APPMSG_STICKER_TYPE = 8 * 2**32 + 49
+
+
+def ordinary_local_path(value, root=None):
+    """Reject links, including Windows junctions, before reading local caches."""
+    path = pathlib.Path(os.path.abspath(value))
+    if str(path).startswith(('\\\\', '//')):
+        raise RuntimeError('IMAGE_STICKER_LOCAL_PATH_INVALID')
+    for item in (path, *path.parents):
+        try:
+            attributes = item.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(attributes.st_mode) or getattr(attributes, 'st_file_attributes', 0) & getattr(
+            stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400
+        ):
+            raise RuntimeError('IMAGE_STICKER_LOCAL_LINK_REFUSED')
+    if root is not None and not path.is_relative_to(pathlib.Path(os.path.abspath(root))):
+        raise RuntimeError('IMAGE_STICKER_LOCAL_PATH_INVALID')
+    return path
+
+
+def local_emoticon_keys(account):
+    """Derive bounded candidates from existing local statistic filenames only.
+
+    AES-CBC account derivation follows weflow-cli's MIT wechat_emoticon.py.
+    Unlike its optional discovery routine, this never accesses process memory.
+    A candidate key is not authority: the caller must verify the complete
+    decrypted bytes against the exact message's MD5 before returning anything.
+    """
+    from wechat_media import clean_account_wxid
+
+    appdata = os.environ.get('APPDATA', '')
+    if not appdata or not pathlib.Path(appdata).is_absolute():
+        return []
+    directory = ordinary_local_path(pathlib.Path(appdata) / 'Tencent/xwechat/net/kvcomm')
+    if not directory.is_dir():
+        return []
+    account = ordinary_local_path(account)
+    wxid = clean_account_wxid(account.name)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', wxid):
+        raise RuntimeError('IMAGE_STICKER_LOCAL_ACCOUNT_INVALID')
+    seeds = set()
+    with os.scandir(directory) as entries:
+        for count, item in enumerate(entries, 1):
+            if count > 4096:
+                raise RuntimeError('IMAGE_STICKER_LOCAL_KEY_LIMIT')
+            match = re.fullmatch(r'key_(\d{5,20})_.{1,128}\.statistic', item.name, re.IGNORECASE)
+            if match:
+                candidate = ordinary_local_path(directory / item.name, directory)
+                if not candidate.is_file():
+                    continue
+                seeds.add(match[1])
+                if len(seeds) > 64:
+                    raise RuntimeError('IMAGE_STICKER_LOCAL_KEY_LIMIT')
+    return [hashlib.md5(f'{seed}{wxid}EMOTICON'.encode()).digest() for seed in sorted(seeds)]
 
 
 def emoji_info_attributes(value, md5):
@@ -286,33 +345,57 @@ def resolve_sticker_bytes(account, content, allow_cdn=False, allow_cdn_alias=Fal
             if re.fullmatch(r'[a-fA-F0-9]{32}', value := attrs.get(name, ''))
         )
     )
-    account = pathlib.Path(account).resolve()
+    account = ordinary_local_path(account)
+    local_keys = None
+    local_deadline = time.monotonic() + 4
 
     def decode(raw):
+        nonlocal local_keys
         for candidate in plain_candidates(raw, key):
             if hashlib.md5(candidate).hexdigest() not in hashes:
                 continue
             return candidate
+        if raw and len(raw) % 16 == 0:
+            if local_keys is None:
+                local_keys = local_emoticon_keys(account)
+            for local_key in local_keys:
+                if time.monotonic() > local_deadline:
+                    raise RuntimeError('IMAGE_STICKER_LOCAL_LOOKUP_LIMIT')
+                try:
+                    decoded = unpad(AES.new(local_key, AES.MODE_CBC, local_key).decrypt(raw), 16)
+                except ValueError:
+                    continue
+                if hashlib.md5(decoded).hexdigest() in hashes:
+                    return decoded
         return None
 
     bases = [account / 'business' / 'emoticon' / n for n in ('Persist', 'Thumb', 'Temp')]
-    cache = account / 'cache'
+    cache = ordinary_local_path(account / 'cache', account)
     if cache.is_dir():
-        bases.extend(
-            p / 'Emoticon' for p in sorted(cache.iterdir(), reverse=True) if re.fullmatch(r'\d{4}-\d{2}', p.name)
-        )
+        months = []
+        with os.scandir(cache) as entries:
+            for count, item in enumerate(entries, 1):
+                if count > 4096:
+                    raise RuntimeError('IMAGE_STICKER_LOCAL_CACHE_LIMIT')
+                if re.fullmatch(r'\d{4}-\d{2}', item.name):
+                    months.append(ordinary_local_path(cache / item.name, account))
+                    if len(months) > 256:
+                        raise RuntimeError('IMAGE_STICKER_LOCAL_CACHE_LIMIT')
+        bases.extend(p / 'Emoticon' for p in sorted(months, reverse=True))
     for base in bases:
         for digest in hashes:
             for folder in (base / digest[:2], base):
                 for suffix in ('', '.gif', '.png', '.webp', '.dat'):
-                    file = folder / (digest + suffix)
+                    if time.monotonic() > local_deadline:
+                        raise RuntimeError('IMAGE_STICKER_LOCAL_LOOKUP_LIMIT')
+                    file = ordinary_local_path(folder / (digest + suffix), account)
                     try:
-                        if (
-                            file.resolve().is_relative_to(account)
-                            and file.is_file()
-                            and file.stat().st_size <= MAX_BYTES
-                        ):
-                            result = decode(file.read_bytes())
+                        if file.is_file() and file.stat().st_size <= MAX_BYTES:
+                            with file.open('rb') as stream:
+                                raw = stream.read(MAX_BYTES + 1)
+                            if len(raw) > MAX_BYTES:
+                                continue
+                            result = decode(raw)
                             if result:
                                 return result
                     except OSError:

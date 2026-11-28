@@ -1,0 +1,109 @@
+{
+  "speechLimits": {
+    "maxReplyChars": 4000,
+    "maxAutomaticVoiceChars": 400,
+    "maxAudioSeconds": 1024,
+    "minBubbleMs": 1000,
+    "synthesisChunkChars": 90
+  },
+  "tts": [
+    {
+      "key": "name",
+      "label": "方案名称"
+    },
+    {
+      "key": "gptWeights",
+      "label": "GPT 权重（.ckpt）"
+    },
+    {
+      "key": "sovitsWeights",
+      "label": "SoVITS 权重（.pth）"
+    },
+    {
+      "key": "refAudio",
+      "label": "参考音频"
+    },
+    {
+      "key": "promptText",
+      "label": "参考音频文字",
+      "multiline": true
+    },
+    {
+      "key": "promptLang",
+      "label": "参考语言",
+      "default": "zh"
+    },
+    {
+      "key": "textLang",
+      "label": "合成语言",
+      "default": "zh"
+    },
+    {
+      "key": "speed",
+      "label": "默认语速",
+      "min": 0.5,
+      "max": 2,
+      "default": 1
+    },
+    {
+      "key": "temperature",
+      "label": "采样温度",
+      "min": 0.05,
+      "max": 2,
+      "default": 0.7
+    },
+    {
+      "key": "topK",
+      "label": "Top K",
+      "min": 1,
+      "max": 100,
+      "default": 10,
+      "integer": true
+    },
+    {
+      "key": "topP",
+      "label": "Top P",
+      "min": 0.05,
+      "max": 1,
+      "default": 0.9
+    },
+    {
+      "key": "repetitionPenalty",
+      "label": "重复惩罚",
+      "min": 1,
+      "max": 2,
+      "default": 1.35
+    },
+    {
+      "key": "fragmentInterval",
+      "label": "段落间隔（秒）",
+      "min": 0,
+      "max": 2,
+      "default": 0.4
+    },
+    {
+      "key": "textSplitMethod",
+      "label": "分句方式（cut0～cut5）",
+      "default": "cut2"
+    }
+  ],
+  "asr": [
+    {
+      "key": "name",
+      "label": "方案名称"
+    },
+    {
+      "key": "modelDirectory",
+      "label": "识别模型目录"
+    },
+    {
+      "key": "language",
+      "label": "识别语言（留空自动）"
+    },
+    {
+      "key": "initialPrompt",
+      "label": "识别提示词（可选）",
+      "multiline": true
+    }
+  ]
+}

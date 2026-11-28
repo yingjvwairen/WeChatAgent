@@ -1,6 +1,7 @@
 """Bounded local parser for WeChat appmsg/19 merged chat records."""
 
 import html
+import hashlib
 import re
 import xml.etree.ElementTree as ET
 
@@ -39,7 +40,72 @@ def record_root(node):
     return safe_xml(text)
 
 
-def parse_forwarded_record(value):
+MEDIA_TYPES = {'2': 'image', '3': 'audio', '4': 'video', '37': 'sticker'}
+QUOTED_MEDIA = {'3': 'image', '34': 'audio', '43': 'video', '62': 'video', '47': 'sticker'}
+CONTENT_DIGESTS = ('fullmd5', 'datamd5', 'md5', 'newmd5', 'rawmd5')
+THUMB_DIGESTS = ('thumbfullmd5', 'thumbmd5')
+
+
+def media_digests(nodes, fields):
+    values = []
+    for node in nodes:
+        for name in fields:
+            entries = [node.get(name, ''), *(child.text or '' for child in node.findall(name) if not len(child))]
+            for value in entries:
+                digest = value.strip().lower()
+                if re.fullmatch('[0-9a-f]{32}', digest) and digest not in values:
+                    values.append(digest)
+    return values
+
+
+def media_part(item, kind, ordinal):
+    media = MEDIA_TYPES.get(kind)
+    source = None
+    nodes = [item]
+    if kind == '1' and len(item.findall('refermsgitem')) == 1:
+        quoted = item.find('refermsgitem')
+        source_type = child_text(quoted, 'type', 16)
+        server_id = child_text(quoted, 'svrid', 24)
+        media = QUOTED_MEDIA.get(source_type)
+        if not media or not re.fullmatch('[1-9][0-9]{0,18}', server_id) or int(server_id) >= 2**63:
+            return None
+        content = quoted.find('content')
+        if content is None:
+            return None
+        try:
+            nodes = list(record_root(content).iter())
+        except (ValueError, ET.ParseError):
+            return None
+        source = {'reference': {'serverId': server_id, 'localType': int(source_type)}}
+    if not media:
+        return None
+    if kind == '37':
+        emojis = item.findall('emojiitem')
+        if len(emojis) != 1 or len(emojis[0].findall('md5')) != 1:
+            return None
+        digest = child_text(emojis[0], 'md5').lower()
+        hashes = [digest] if not len(emojis[0].find('md5')) and re.fullmatch('[0-9a-f]{32}', digest) else []
+    else:
+        hashes = media_digests(nodes, CONTENT_DIGESTS)
+    thumbs = media_digests(nodes, THUMB_DIGESTS) if media == 'image' else []
+    hashes = list(dict.fromkeys([*hashes, *thumbs]))
+    if not 1 <= len(hashes) <= 8:
+        return None
+    if source is None:
+        sid, lid, stamp = (child_text(item, field) for field in ('fromnewmsgid', 'srcMsgLocalid', 'srcMsgCreateTime'))
+        if all(re.fullmatch('[1-9][0-9]{0,18}', value) and int(value) < 2**63 for value in (sid, lid, stamp)):
+            source = {'sourceRow': {'serverId': sid, 'localId': int(lid), 'createTime': int(stamp)}}
+    return {
+        'kind': media,
+        'index': ordinal,
+        'hashes': hashes,
+        'itemSha256': hashlib.sha256(ET.tostring(item, encoding='utf-8')).hexdigest(),
+        **({'thumbnailHashes': thumbs} if thumbs else {}),
+        **(source or {}),
+    }
+
+
+def parse_forwarded_record(value, media=None):
     try:
         root = safe_xml(value)
         app = root if root.tag == 'appmsg' else root.find('appmsg') if root.tag == 'msg' else None
@@ -50,11 +116,10 @@ def parse_forwarded_record(value):
         if record is None:
             return {'version': 1, 'title': title, 'items': [], 'truncated': False, 'unavailable': True}
         container = record_root(record)
-        items, truncated = [], False
-        remaining = MAX_TEXT
+        entries, items, truncated = [], [], False
 
         def collect(current, depth):
-            nonlocal truncated, remaining
+            nonlocal truncated
             data_list = current if current.tag == 'datalist' else current.find('datalist')
             if data_list is None:
                 info = current.find('recordinfo')
@@ -62,10 +127,12 @@ def parse_forwarded_record(value):
             if data_list is None:
                 return
             for item in data_list.findall('dataitem'):
-                if len(items) >= MAX_ITEMS or remaining < 100:
+                if len(entries) >= MAX_ITEMS:
                     truncated = True
                     break
-                kind = str(item.get('datatype') or child_text(item, 'datatype', 8))
+                kind = item.get('datatype') or child_text(item, 'datatype', 8)
+                if not re.fullmatch(r'[0-9]{1,8}', kind):
+                    kind = '0'
                 name = re.sub(r'[\r\n\t]+', ' ', child_text(item, 'sourcename', 80)) or '未知发言人'
                 clock = re.sub(r'[\r\n\t]+', ' ', child_text(item, 'sourcetime', 64))
                 full_desc = child_text(item, 'datadesc', MAX_XML) or child_text(item, 'content', MAX_XML)
@@ -76,11 +143,14 @@ def parse_forwarded_record(value):
                 heading = child_text(item, 'datatitle', 200)
                 if kind == '1':
                     text = desc or heading or '[空文字消息]'
+                    if item.find('refermsgitem') is not None:
+                        text += '\n[此条包含对历史消息的引用；媒体内容以附带附件为准]'
                 elif kind == '14':
                     text = '[嵌套聊天记录]' + (' ' + heading if heading else '')
                 else:
                     label = {
                         '2': '图片，未提供图片内容',
+                        '37': '表情，未提供表情内容',
                         '3': '语音，未转写',
                         '4': '视频，未提供视频内容',
                         '5': '链接',
@@ -89,12 +159,11 @@ def parse_forwarded_record(value):
                         '7': '音乐',
                     }.get(kind, '未支持的消息')
                     text = '[' + label + ']' + (' ' + (heading or desc) if heading or desc else '')
-                cost = len(name) + len(clock) + len(text) + 12
-                if cost > remaining:
-                    text = text[: max(0, remaining - len(name) - len(clock) - 12)] + '…'
-                    truncated = True
-                items.append({'sender': name, 'time': clock, 'kind': kind, 'text': text, 'depth': depth})
-                remaining -= len(name) + len(clock) + len(text) + 12
+                entries.append((name, clock, kind, text, depth))
+                if media is not None:
+                    part = media_part(item, kind, len(entries) - 1)
+                    if part:
+                        media.append(part)
                 if kind == '14':
                     nested = item.find('recordxml')
                     if nested is None:
@@ -106,6 +175,23 @@ def parse_forwarded_record(value):
                             collect(record_root(nested), depth + 1)
 
         collect(container, 0)
+        # Leave a slot for each bounded record so text cannot hide later attachments.
+        compact = [(name[:40], clock[:32]) for name, clock, *_ in entries]
+        costs = [len(name) + len(clock) + 13 for name, clock in compact]
+        reserve = sum(costs)
+        remaining = MAX_TEXT
+        for (name, clock, kind, text, depth), short, cost in zip(entries, compact, costs):
+            reserve -= cost
+            available = remaining - reserve
+            if len(name) + len(clock) + 13 > available:
+                name, clock = short
+                truncated = True
+            capacity = min(801, available - len(name) - len(clock) - 12)
+            if len(text) > capacity:
+                text = text[: capacity - 1] + '…'
+                truncated = True
+            items.append({'sender': name, 'time': clock, 'kind': kind, 'text': text, 'depth': depth})
+            remaining -= len(name) + len(clock) + len(text) + 12
         return {'version': 1, 'title': title, 'items': items, 'truncated': truncated, 'unavailable': not items}
     except (ValueError, ET.ParseError, RecursionError):
         return None

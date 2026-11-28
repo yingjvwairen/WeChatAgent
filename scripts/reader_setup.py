@@ -1,4 +1,5 @@
 """Private first-run discovery, credential verification and Windows key capture."""
+
 import contextlib
 import ctypes
 from ctypes import wintypes
@@ -7,6 +8,7 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import sys
 import time
 
@@ -36,8 +38,12 @@ def discover_accounts(selected=''):
                 documents.append(pathlib.Path(os.environ[name]) / 'Documents')
         if os.name == 'nt':
             import winreg
-            for key, value in [('Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders', 'Personal'),
-                               ('Software\\Tencent\\WeChat', 'FileSavePath'), ('Software\\Tencent\\Weixin', 'FileSavePath')]:
+
+            for key, value in [
+                ('Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders', 'Personal'),
+                ('Software\\Tencent\\WeChat', 'FileSavePath'),
+                ('Software\\Tencent\\Weixin', 'FileSavePath'),
+            ]:
                 try:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as handle:
                         location = winreg.QueryValueEx(handle, value)[0]
@@ -57,9 +63,12 @@ def discover_accounts(selected=''):
                 if not (candidate / 'db_storage').is_dir():
                     continue
                 full = str(candidate.resolve())
-                accounts[os.path.normcase(full)] = {'dbPath': full, 'myWxid': candidate.name,
+                accounts[os.path.normcase(full)] = {
+                    'dbPath': full,
+                    'myWxid': candidate.name,
                     'ready': (candidate / 'db_storage' / 'message' / 'message_0.db').is_file()
-                        and (candidate / 'db_storage' / 'contact' / 'contact.db').is_file()}
+                    and (candidate / 'db_storage' / 'contact' / 'contact.db').is_file(),
+                }
         except OSError:
             continue
     return sorted(accounts.values(), key=lambda item: item['dbPath'].casefold())
@@ -71,6 +80,7 @@ class Blob(ctypes.Structure):
 
 def credential(value, protect=False):
     import base64
+
     if not protect and not value.startswith('userdpapi:'):
         if value.startswith('safe:'):
             raise SetupError('READER_SECRET_UNAVAILABLE')
@@ -86,8 +96,15 @@ def credential(value, protect=False):
         kernel.LocalFree.argtypes = [ctypes.c_void_p]
         kernel.LocalFree.restype = ctypes.c_void_p
         function = crypt.CryptProtectData if protect else crypt.CryptUnprotectData
-        function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                             ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
+        function.argtypes = [
+            ctypes.POINTER(Blob),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(Blob),
+        ]
         function.restype = wintypes.BOOL
         if not function(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(output)):
             raise SetupError('READER_SECRET_UNAVAILABLE')
@@ -102,6 +119,7 @@ def credential(value, protect=False):
 
 def verify_database(account, key):
     import nt_decrypt as nt
+
     message = pathlib.Path(account) / 'db_storage' / 'message' / 'message_0.db'
     contact = pathlib.Path(account) / 'db_storage' / 'contact' / 'contact.db'
     if not message.is_file() or not contact.is_file():
@@ -159,18 +177,33 @@ def main_process_pids(matches, parents):
 
 def wechat_pids(executable):
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+
     class ProcessEntry(ctypes.Structure):
-        _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD), ('th32ProcessID', wintypes.DWORD),
-                    ('th32DefaultHeapID', ctypes.c_size_t), ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
-                    ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', wintypes.LONG),
-                    ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260)]
+        _fields_ = [
+            ('dwSize', wintypes.DWORD),
+            ('cntUsage', wintypes.DWORD),
+            ('th32ProcessID', wintypes.DWORD),
+            ('th32DefaultHeapID', ctypes.c_size_t),
+            ('th32ModuleID', wintypes.DWORD),
+            ('cntThreads', wintypes.DWORD),
+            ('th32ParentProcessID', wintypes.DWORD),
+            ('pcPriClassBase', wintypes.LONG),
+            ('dwFlags', wintypes.DWORD),
+            ('szExeFile', wintypes.WCHAR * 260),
+        ]
+
     kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
     kernel.Process32FirstW.restype = kernel.Process32NextW.restype = wintypes.BOOL
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
-    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.restype = wintypes.BOOL
@@ -179,7 +212,8 @@ def wechat_pids(executable):
         raise SetupError('READER_KEY_ACCESS_DENIED')
     matches, parents, denied = [], {}, False
     try:
-        entry = ProcessEntry(); entry.dwSize = ctypes.sizeof(entry)
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
         exists = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
         while exists:
             parents[entry.th32ProcessID] = entry.th32ParentProcessID
@@ -187,9 +221,12 @@ def wechat_pids(executable):
                 process = kernel.OpenProcess(0x1000, False, entry.th32ProcessID)
                 if process:
                     try:
-                        size = wintypes.DWORD(32768); full = ctypes.create_unicode_buffer(size.value)
+                        size = wintypes.DWORD(32768)
+                        full = ctypes.create_unicode_buffer(size.value)
                         if kernel.QueryFullProcessImageNameW(process, 0, full, ctypes.byref(size)):
-                            if os.path.normcase(os.path.abspath(full.value)) == os.path.normcase(os.path.abspath(executable)):
+                            if os.path.normcase(os.path.abspath(full.value)) == os.path.normcase(
+                                os.path.abspath(executable)
+                            ):
                                 matches.append(entry.th32ProcessID)
                     finally:
                         kernel.CloseHandle(process)
@@ -203,21 +240,133 @@ def wechat_pids(executable):
     return main_process_pids(matches, parents)
 
 
-def capture_key(executable, account, timeout=180, clock=time.monotonic, sleep=time.sleep, pids=wechat_pids, library=None):
+def process_start_time(pid):
+    """Return the creation time of a live Windows process or None after exit."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    process = kernel.OpenProcess(0x1000 | 0x100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+    if not process:
+        if ctypes.get_last_error() == 87:  # No such PID.
+            return None
+        raise SetupError('WECHAT_PROCESS_IDENTITY_UNCLEAR')
+    try:
+        status = kernel.WaitForSingleObject(process, 0)
+        if status == 0:  # The process handle is signaled after exit.
+            return None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if status != 258 or not kernel.GetProcessTimes(process, *(ctypes.byref(item) for item in times)):
+            raise SetupError('WECHAT_PROCESS_IDENTITY_UNCLEAR')
+        created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        if not created:
+            raise SetupError('WECHAT_PROCESS_IDENTITY_UNCLEAR')
+        return created
+    finally:
+        kernel.CloseHandle(process)
+
+
+class ReaderConnection:
+    def __init__(self, db, process_start):
+        self.db = db
+        self.process_start = process_start
+
+    def record_attachment(self, pid):
+        created = self.process_start(pid)
+        if created is None:
+            return False
+        with self.db:
+            self.db.execute('INSERT INTO attachment VALUES(1,?,?)', (pid, created))
+        return True
+
+    def clear_attachment(self):
+        with self.db:
+            self.db.execute('DELETE FROM attachment')
+
+
+@contextlib.contextmanager
+def reader_connection(root, process_start=process_start_time):
+    file = root / 'state/weflow/reader-connection.sqlite'
+    if file.is_symlink() or not file.parent.resolve().is_relative_to(root.resolve()):
+        raise SetupError('READER_ACCOUNT_STATE_INVALID')
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(file, timeout=0)) as db:
+        try:
+            db.execute('PRAGMA locking_mode=EXCLUSIVE')
+            db.execute('BEGIN EXCLUSIVE')
+        except sqlite3.OperationalError as error:
+            if (error.sqlite_errorcode & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise SetupError('READER_SETUP_BUSY') from None
+            raise
+        with db:
+            db.execute(
+                'CREATE TABLE IF NOT EXISTS attachment(slot INTEGER PRIMARY KEY CHECK(slot=1),'
+                'pid INTEGER NOT NULL CHECK(pid>0), created INTEGER NOT NULL CHECK(created>0))'
+            )
+        connection = ReaderConnection(db, process_start)
+        previous = db.execute('SELECT pid,created FROM attachment').fetchone()
+        if previous:
+            pid, created = previous
+            if process_start(pid) == created:
+                raise SetupError('READER_SETUP_CLEANUP_UNCONFIRMED')
+            connection.clear_attachment()
+        # The actual Python worker owns the lock even if its launcher exits.
+        yield connection
+
+
+def capture_key(
+    executable,
+    account,
+    timeout=180,
+    clock=time.monotonic,
+    sleep=time.sleep,
+    pids=wechat_pids,
+    library=None,
+    connection=None,
+):
     dll = ROOT / 'components' / 'weflow-cli' / 'resources' / 'key' / 'win32' / 'x64' / 'wx_key.dll'
     if library is None:
         try:
             library = ctypes.CDLL(str(dll))
-            library.InitializeHook.argtypes = [wintypes.DWORD]; library.InitializeHook.restype = ctypes.c_bool
-            library.PollKeyData.argtypes = [ctypes.c_void_p, ctypes.c_int]; library.PollKeyData.restype = ctypes.c_bool
-            library.CleanupHook.argtypes = []; library.CleanupHook.restype = ctypes.c_bool
+            library.InitializeHook.argtypes = [wintypes.DWORD]
+            library.InitializeHook.restype = ctypes.c_bool
+            library.PollKeyData.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            library.PollKeyData.restype = ctypes.c_bool
+            library.CleanupHook.argtypes = []
+            library.CleanupHook.restype = ctypes.c_bool
             library.GetStatusMessage.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
             library.GetStatusMessage.restype = ctypes.c_bool
-            library.GetLastErrorMsg.argtypes = []; library.GetLastErrorMsg.restype = ctypes.c_char_p
+            library.GetLastErrorMsg.argtypes = []
+            library.GetLastErrorMsg.restype = ctypes.c_char_p
         except (OSError, AttributeError):
             raise SetupError('READER_KEY_COMPONENT_MISSING') from None
     deadline = clock() + timeout
-    attached = None; observed_process = False; seen = set(); buffer = ctypes.create_string_buffer(128)
+    attached = None
+    observed_process = False
+    candidates = {}
+    buffer = ctypes.create_string_buffer(128)
+    max_candidates, max_attempts, retry_interval = 32, 3, 1.0
+    cleanup_required = False
+
+    def cleanup():
+        nonlocal cleanup_required
+        if not cleanup_required:
+            return
+        # A failed/throwing cleanup must not be retried implicitly or hidden by
+        # a success result. In particular, do not attach a replacement process.
+        cleanup_required = False
+        try:
+            if not library.CleanupHook():
+                raise SetupError('READER_SETUP_CLEANUP_UNCONFIRMED')
+        except Exception:
+            raise SetupError('READER_SETUP_CLEANUP_UNCONFIRMED') from None
+        if connection is not None:
+            connection.clear_attachment()
+
     progress('正在连接匹配微信。请在微信中完成登录；已登录时可退出账号后重新登录，程序会等待。')
     try:
         while clock() < deadline:
@@ -226,35 +375,66 @@ def capture_key(executable, account, timeout=180, clock=time.monotonic, sleep=ti
                 raise SetupError('WECHAT_MULTIPLE_PROCESSES')
             pid = processes[0] if processes else None
             if attached and pid != attached:
-                library.CleanupHook(); attached = None
+                cleanup()
+                attached = None
+                # A new client process can initialize the same account after a
+                # temporary DB failure. Only confirmed cleanup releases the old
+                # process binding and its bounded candidate retry state.
+                candidates.clear()
             if not pid:
                 if not observed_process:
                     raise SetupError('WECHAT_NOT_RUNNING')
-                sleep(0.5); continue
+                sleep(0.5)
+                continue
             if attached is None:
+                if connection is not None and not connection.record_attachment(pid):
+                    observed_process = True
+                    sleep(0.12)
+                    continue
+                cleanup_required = True
                 if not library.InitializeHook(pid):
                     error = library.GetLastErrorMsg() or b''
-                    raise SetupError('READER_KEY_ACCESS_DENIED' if b'ACCESS_DENIED' in error or b'0xC0000022' in error else 'READER_SETUP_FAILED')
+                    raise SetupError(
+                        'READER_KEY_ACCESS_DENIED'
+                        if b'ACCESS_DENIED' in error or b'0xC0000022' in error
+                        else 'READER_SETUP_FAILED'
+                    )
                 attached = pid
                 observed_process = True
+                progress('读取组件已就绪，正在等待同一微信账号的数据库初始化。')
             if library.PollKeyData(buffer, len(buffer)):
-                key = buffer.value.decode('ascii', errors='ignore')
-                if re.fullmatch(r'[0-9a-fA-F]{64}', key) and key not in seen:
-                    seen.add(key)
-                    try:
-                        verify_database(account, key)
-                        return key
-                    except SetupError as error:
-                        if str(error) != 'READER_KEY_INVALID':
-                            raise
-                        progress('检测到的密钥与所选账号不匹配。请登录该目录对应的微信账号，或等待本次结束后重新选择账号。')
+                key = buffer.value.decode('ascii', errors='ignore').lower()
+                if re.fullmatch(r'[0-9a-f]{64}', key):
+                    if key not in candidates and len(candidates) < max_candidates:
+                        candidates[key] = {'attempts': 0, 'retry_at': 0.0}
+            # DLL events may be consumed once. Retry cached candidates without
+            # requiring the client to emit the same key again, one per loop.
+            for key, candidate in candidates.items():
+                if candidate['attempts'] >= max_attempts or clock() < candidate['retry_at']:
+                    continue
+                candidate['attempts'] += 1
+                try:
+                    verify_database(account, key)
+                    return key
+                except SetupError as error:
+                    if str(error) not in (
+                        'READER_KEY_INVALID',
+                        'READER_DATABASE_MISSING',
+                        'READER_DATABASE_UNREADABLE',
+                    ):
+                        raise
+                    candidate['retry_at'] = clock() + retry_interval
+                    if candidate['attempts'] == 1:
+                        progress('暂时无法验证所选账号的数据库。正在等待微信同步并重试。')
+                break
             for _ in range(8):
-                status = ctypes.create_string_buffer(512); level = ctypes.c_int()
+                status = ctypes.create_string_buffer(512)
+                level = ctypes.c_int()
                 if not library.GetStatusMessage(status, len(status), ctypes.byref(level)):
                     break
             sleep(0.12)
     finally:
-        library.CleanupHook()
+        cleanup()
     raise SetupError('READER_SETUP_TIMEOUT')
 
 
@@ -279,7 +459,8 @@ def connect(request):
     if not key:
         if not request.get('autoKey'):
             raise SetupError('READER_KEY_REQUIRED')
-        key = capture_key(request['wechatExecutable'], account['dbPath'])
+        with reader_connection(ROOT) as connection:
+            key = capture_key(request['wechatExecutable'], account['dbPath'], connection=connection)
     progress('数据库验证通过，正在安全保存读取凭据…')
     return {'type': 'result', 'ok': True, **account, 'protectedKey': credential(key, protect=True)}
 

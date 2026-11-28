@@ -1,6 +1,7 @@
 // Local codec only. No model, network, account data or plugin code is loaded.
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { sameRecordedVoice } from './recorded-voice-match.mjs';
 
 const MAX_BYTES = 2 * 1024 * 1024,
   MAX_PCM_BYTES = 16000 * 2 * 60.5;
@@ -55,11 +56,14 @@ async function codec() {
   }
 }
 
-export function voicePcm(wav) {
+export function voicePcm(wav, { maxSeconds = 60 } = {}) {
   const invalid = () => Object.assign(fault('VOICE_INVALID_WAV'), { code: 'VOICE_INVALID_WAV', status: 400 });
   if (
+    !Number.isFinite(maxSeconds) ||
+    maxSeconds <= 0 ||
+    maxSeconds > 1024 ||
     wav.length < 44 ||
-    wav.length > MAX_BYTES ||
+    wav.length > 32000 * maxSeconds + 65536 ||
     wav.toString('ascii', 0, 4) !== 'RIFF' ||
     wav.readUInt32LE(4) !== wav.length - 8 ||
     wav.toString('ascii', 8, 12) !== 'WAVE'
@@ -94,7 +98,7 @@ export function voicePcm(wav) {
     format.readUInt16LE(14) !== 16 ||
     !pcm?.length ||
     pcm.length % 2 ||
-    pcm.length > 32000 * 60
+    pcm.length > 32000 * maxSeconds
   )
     throw invalid();
   return pcm;
@@ -148,6 +152,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       )
         throw fault('VOICE_FORMAT_UNSUPPORTED');
       result = await decodeVoice(Buffer.from(value.b64, 'base64'));
+      if (process.argv[2] === '--match-recording') {
+        const pcm = voicePcm(Buffer.from(result.b64, 'base64'));
+        result = { matches: sameRecordedVoice(value.shape, pcm) };
+      }
     }
     process.stdout.write(JSON.stringify(result) + '\n');
   } catch (error) {
